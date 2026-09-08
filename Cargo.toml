@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/hxproto"]
+
+[workspace.package]
+# Debian trixie ships rustc 1.85. GtkHx supports that toolchain, so shared
+# crates keep the same floor even when another consumer can use a newer Rust.
+rust-version = "1.85"
