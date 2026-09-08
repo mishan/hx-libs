@@ -1,0 +1,1 @@
+hx-libs is a Cargo workspace holding the Hotline protocol pieces that don't belong to any one program. Right now that's hxproto, the wire format; hxcrypto, hxhfs, and hxfiles-xfer will move here as they're carved out of GtkHx. GtkHx and hxd-ng pull these in as git dependencies.
