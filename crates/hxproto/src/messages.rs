@@ -279,6 +279,10 @@ pub mod tag {
     pub const HISTORY_AFTER: u16 = 0x0f03;
     /// `0x0f04` — GET_CHAT_HISTORY max-results limit. u16 BE; omitted when zero.
     pub const HISTORY_LIMIT: u16 = 0x0f04;
+    /// `0x0f05` — one packed chat-history row in a transaction 700 reply.
+    pub const HISTORY_ENTRY: u16 = 0x0f05;
+    /// `0x0f06` — u8 boolean: more rows exist in the query direction.
+    pub const HISTORY_HAS_MORE: u16 = 0x0f06;
     /// `0x0f07` — chat-history retention hint: max message count (LOGIN reply).
     pub const HISTORY_MAX_MSGS: u16 = 0x0f07;
     /// `0x0f08` — chat-history retention hint: max age in days (LOGIN reply).
@@ -304,7 +308,11 @@ pub mod tag {
     /// The path component encoding is the responsibility of the
     /// caller (`path_to_hldir` on the C side).
     pub const NEWSPATH: u16 = 0x0145;
-    /// `0x0146` — 1.5 news thread id (u32 BE).
+    /// `0x0146` — 1.5 news article id (u32 BE). The SDK calls this
+    /// `myField_NewsArtID`. It identifies the article a request is
+    /// about: the one being fetched (GETTHREAD) or removed
+    /// (DELETETHREAD), and on POSTTHREAD the *parent* the new article
+    /// replies to (0 for a top-level post).
     pub const THREADID: u16 = 0x0146;
     /// `0x0147` — 1.5 news article MIME type (e.g. "text/plain").
     pub const NEWSTYPE: u16 = 0x0147;
@@ -318,9 +326,18 @@ pub mod tag {
     /// servers. (CR2LF is the *receive*-path inverse — applied in
     /// `parse_news_post` / `parse_news_file`, not here.)
     pub const NEWSDATA: u16 = 0x014d;
-    /// `0x014e` — 1.5 news "parent thread id" (u32 BE). Required by
-    /// the spec but not actually consulted by mhxd; gtkhx sends 0.
-    pub const PARENTTHREAD: u16 = 0x014e;
+    /// `0x014e` — 1.5 news article flags (u32 BE), the SDK's
+    /// `myField_NewsArtFlags`. Listed in the Post News Article
+    /// request; gtkhx sends 0 and no server in the matrix reads it
+    /// (mhxd doesn't define the number at all).
+    ///
+    /// Not the parent article — that is 335 (`0x014f`), and on a post
+    /// it is [`THREADID`] that carries the parent's id. This constant
+    /// was called `PARENTTHREAD` until the two were told apart.
+    pub const NEWSFLAGS: u16 = 0x014e;
+    /// Backwards-compatible name for [`NEWSFLAGS`]. The SDK field is article
+    /// flags, not a parent-thread id; new code should use the corrected name.
+    pub const PARENTTHREAD: u16 = NEWSFLAGS;
     /// `0x01f1` — Large-Files extension: 64-bit file size companion
     /// to `FILE_SIZE` on FILE_GETINFO replies (u64 BE, 8 bytes).
     /// When present, callers prefer this over the legacy 32-bit
