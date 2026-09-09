@@ -2530,7 +2530,7 @@ pub unsafe extern "C" fn gtkhx_proto_build_news_mkdir_chunks(
         path_len,
         chunks,
         chunks_cap,
-        build::build_news_catlist_chunks,
+        build::build_news_mkdir_path_only_chunks,
     )
 }
 

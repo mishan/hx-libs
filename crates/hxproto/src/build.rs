@@ -433,10 +433,18 @@ pub struct HistorySubfield<'a> {
     pub data: &'a [u8],
 }
 
-/// Build one `DATA_HISTORY_ENTRY` body, the exact inverse of
-/// [`crate::parse::parse_history_entry`]. Returns `None` when a text or
-/// subfield cannot be represented by its u16 length, or when the complete
-/// body would not fit in one Hotline data chunk.
+/// Build one `DATA_HISTORY_ENTRY` body: the encoder for what
+/// [`crate::parse::parse_history_entry`] reads.
+///
+/// Not quite an inverse, in the one place it matters: the parser walks
+/// past the mini-TLV trailer without surfacing it, so a body built with
+/// sub-fields and read back comes out with its fixed fields intact and
+/// its sub-fields gone. The trailer is written for the clients that will
+/// read it once the types are allocated, not for this crate's own parser.
+///
+/// Returns `None` when a text or subfield cannot be represented by its
+/// u16 length, or when the complete body would not fit in one Hotline
+/// data chunk.
 pub fn build_history_entry(
     message_id: u64,
     timestamp: i64,
@@ -858,7 +866,7 @@ pub fn build_news_post_chunks(body: &[u8], chunks: &mut [HxChunk]) -> usize {
     1
 }
 
-/// Internal helper for the four NEWSPATH-only 1.5 news opcodes. Each
+/// Internal helper for the NEWSPATH-only 1.5 news opcodes. Each
 /// public wrapper picks the matching header type when handing the
 /// chunks to `hlwrite_chunks`. Returns 1 on success, 0 on too-small
 /// `chunks` slice or `path.len() > u16::MAX`.
@@ -894,6 +902,20 @@ pub fn build_news_dirlist_chunks(path: &[u8], chunks: &mut [HxChunk]) -> usize {
 /// `HTLC_DATA_NEWSPATH` chunk. The same wire shape works for deleting
 /// either a category or a folder; mhxd inspects the path to decide.
 pub fn build_news_delete_chunks(path: &[u8], chunks: &mut [HxChunk]) -> usize {
+    build_newspath_only_chunks(path, chunks)
+}
+
+/// Build the *superseded* `HTLC_HDR_MAKENEWSDIR` shape — a single
+/// `HTLC_DATA_NEWSPATH` holding the whole destination path.
+///
+/// It does not work against the reference server; see
+/// [`build_news_mkdir_chunks`] for what does and why. This exists so the
+/// C symbol that used to emit it can keep emitting it for callers built
+/// against the old static library, and so that behavior does not ride on
+/// a builder for an unrelated opcode — NEWSCATLIST and MAKENEWSDIR agree
+/// on this shape by coincidence, not by contract, and one of them is
+/// wrong.
+pub fn build_news_mkdir_path_only_chunks(path: &[u8], chunks: &mut [HxChunk]) -> usize {
     build_newspath_only_chunks(path, chunks)
 }
 
