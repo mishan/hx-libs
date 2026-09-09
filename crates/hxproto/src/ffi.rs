@@ -2510,6 +2510,30 @@ pub unsafe extern "C" fn gtkhx_proto_build_news_delete_chunks(
     )
 }
 
+/// Build the legacy `HTLC_HDR_MAKENEWSDIR` shape: one NEWSPATH containing
+/// the complete destination path. Kept for C ABI compatibility with the
+/// original GtkHx-owned static library; new callers should use
+/// [`gtkhx_proto_build_news_mkdir_named_chunks`], whose wire shape works
+/// against the reference server.
+///
+/// # Safety
+/// As [`gtkhx_proto_build_news_catlist_chunks`].
+#[no_mangle]
+pub unsafe extern "C" fn gtkhx_proto_build_news_mkdir_chunks(
+    path_ptr: *const u8,
+    path_len: usize,
+    chunks: *mut HxChunk,
+    chunks_cap: usize,
+) -> i32 {
+    build_news_path_only_chunks(
+        path_ptr,
+        path_len,
+        chunks,
+        chunks_cap,
+        build::build_news_catlist_chunks,
+    )
+}
+
 /// Build `HTLC_HDR_MAKENEWSDIR` chunks: NEWSPATH (the parent) + FILE_NAME
 /// (the new folder). `chunks_cap >= 2`. Same shape and contract as
 /// [`gtkhx_proto_build_news_mkcat_chunks`].
@@ -2518,7 +2542,7 @@ pub unsafe extern "C" fn gtkhx_proto_build_news_delete_chunks(
 /// `chunks` valid for `chunks_cap` slots (or NULL); `path_ptr` /
 /// `name_ptr` valid for their lengths (or NULL).
 #[no_mangle]
-pub unsafe extern "C" fn gtkhx_proto_build_news_mkdir_chunks(
+pub unsafe extern "C" fn gtkhx_proto_build_news_mkdir_named_chunks(
     path_ptr: *const u8,
     path_len: usize,
     name_ptr: *const u8,
@@ -5558,6 +5582,51 @@ pub unsafe extern "C" fn gtkhx_proto_hl_date_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::tag;
+
+    #[test]
+    fn news_mkdir_ffi_keeps_the_old_abi_and_offers_the_correct_wire_shape() {
+        let destination = b"/Articles/2026";
+        let mut chunks = [HxChunk::EMPTY; 2];
+        let legacy_count = unsafe {
+            gtkhx_proto_build_news_mkdir_chunks(
+                destination.as_ptr(),
+                destination.len(),
+                chunks.as_mut_ptr(),
+                chunks.len(),
+            )
+        };
+        assert_eq!(legacy_count, 1);
+        assert_eq!(chunks[0].tag, tag::NEWSPATH);
+        assert_eq!(
+            unsafe { slice::from_raw_parts(chunks[0].data, chunks[0].len as usize) },
+            destination
+        );
+
+        let parent = b"/Articles";
+        let name = b"2026";
+        let named_count = unsafe {
+            gtkhx_proto_build_news_mkdir_named_chunks(
+                parent.as_ptr(),
+                parent.len(),
+                name.as_ptr(),
+                name.len(),
+                chunks.as_mut_ptr(),
+                chunks.len(),
+            )
+        };
+        assert_eq!(named_count, 2);
+        assert_eq!(chunks[0].tag, tag::NEWSPATH);
+        assert_eq!(chunks[1].tag, tag::FILE_NAME);
+        assert_eq!(
+            unsafe { slice::from_raw_parts(chunks[0].data, chunks[0].len as usize) },
+            parent
+        );
+        assert_eq!(
+            unsafe { slice::from_raw_parts(chunks[1].data, chunks[1].len as usize) },
+            name
+        );
+    }
 
     // The decode rule + boundary-walk truncation belong to text::to_utf8_into;
     // tests for those live in src/text.rs. The FFI-only contract — NULL

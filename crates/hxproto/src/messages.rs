@@ -335,6 +335,9 @@ pub mod tag {
     /// it is [`THREADID`] that carries the parent's id. This constant
     /// was called `PARENTTHREAD` until the two were told apart.
     pub const NEWSFLAGS: u16 = 0x014e;
+    /// Backwards-compatible name for [`NEWSFLAGS`]. The SDK field is article
+    /// flags, not a parent-thread id; new code should use the corrected name.
+    pub const PARENTTHREAD: u16 = NEWSFLAGS;
     /// `0x01f1` — Large-Files extension: 64-bit file size companion
     /// to `FILE_SIZE` on FILE_GETINFO replies (u64 BE, 8 bytes).
     /// When present, callers prefer this over the legacy 32-bit

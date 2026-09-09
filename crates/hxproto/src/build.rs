@@ -426,7 +426,7 @@ pub fn build_get_chat_history_chunks(
     hc
 }
 
-/// One optional mini-TLV carried after a packed chat-history entry.
+/// One mini-TLV in the optional trailer of a packed chat-history entry.
 #[derive(Debug, Clone, Copy)]
 pub struct HistorySubfield<'a> {
     pub ty: u16,
@@ -435,7 +435,7 @@ pub struct HistorySubfield<'a> {
 
 /// Build one `DATA_HISTORY_ENTRY` body, the exact inverse of
 /// [`crate::parse::parse_history_entry`]. Returns `None` when a text or
-/// sub-field cannot be represented by its u16 length, or when the complete
+/// subfield cannot be represented by its u16 length, or when the complete
 /// body would not fit in one Hotline data chunk.
 pub fn build_history_entry(
     message_id: u64,
