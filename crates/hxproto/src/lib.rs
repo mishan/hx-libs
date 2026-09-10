@@ -27,15 +27,9 @@
 //! - [`build`] — outgoing-message builders for the SEND path. Each
 //!   `hx_send_*` in C delegates to a `build_*_chunks` here, then hands
 //!   the chunk array to `hlwrite_chunks()` for actual wire encoding.
-//! - `ffi` — `#[no_mangle] extern "C"` entry points the C dispatcher calls.
-//!   Not part of the Rust-facing API; only compiled into the staticlib.
 //!
-//! ## FFI discipline
-//!
-//! Same convention as the Phase R1 crypto crates: the C side hand-declares
-//! the `extern` prototypes, so signature drift surfaces as an undefined
-//! symbol at link time. No cbindgen for this crate — the FFI surface is
-//! small and opaque-pointer-free.
+//! The crate exports no C ABI. A consumer with a C side (GtkHx) keeps its
+//! `extern "C"` entry points in its own tree, over this Rust API.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -54,8 +48,6 @@ pub mod text;
 pub mod user_change;
 pub mod voice;
 pub mod wire;
-
-pub mod ffi;
 
 /// Size of the fixed Hotline transaction header (`struct hl_hdr`):
 /// `type`(4) + `trans`(4) + `flag`(4) + `len`(4) + `len2`(4) + `hc`(2).
