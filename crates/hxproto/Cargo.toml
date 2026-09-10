@@ -6,8 +6,3 @@ edition = "2021"
 license = "GPL-2.0-or-later"
 description = "Typed Hotline 1.0/1.2/1.5/1.9 wire protocol parser and serializer"
 publish = false
-
-[lib]
-# Rust consumers use the rlib. GtkHx also links this crate directly from
-# C-facing protocol tests, so it needs the standalone staticlib.
-crate-type = ["staticlib", "rlib"]
