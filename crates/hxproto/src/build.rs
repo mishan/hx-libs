@@ -1903,6 +1903,7 @@ pub fn build_htxf_hdr(
 /// HTXF handshake flag bits (mirror `HTXF_FLAG_*` in `src/hotline.h`).
 pub const HTXF_FLAG_LARGE_FILE: u16 = 0x0001;
 pub const HTXF_FLAG_SIZE64: u16 = 0x0002;
+pub const HTXF_FLAG_RESUME: u16 = 0x0004;
 
 /// Pack the full HTXF subchannel handshake preamble: the 16-byte header, plus —
 /// when `size64` — an 8-byte big-endian `total_size` after it (the large-file
@@ -4128,6 +4129,13 @@ mod tests {
         assert_eq!(HTXF_HDR_SIZE, 16);
         let mut out = [0u8; HTXF_HDR_SIZE];
         assert!(build_htxf_hdr(&mut out, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn htxf_flag_values_match_large_file_spec() {
+        assert_eq!(HTXF_FLAG_LARGE_FILE, 0x0001);
+        assert_eq!(HTXF_FLAG_SIZE64, 0x0002);
+        assert_eq!(HTXF_FLAG_RESUME, 0x0004);
     }
 
     #[test]
