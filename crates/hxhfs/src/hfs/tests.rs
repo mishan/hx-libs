@@ -79,7 +79,7 @@ fn path_too_long_is_error() {
 
 #[test]
 fn cap_record_golden_bytes() {
-    let rec = build_cap_record(&sample());
+    let rec = encode_cap_info(&sample());
     assert_eq!(rec.len(), SIZEOF_CAP_INFO);
     assert_eq!(rec[CAP_OFF_MAGIC1], CAP_MAGIC1);
     assert_eq!(rec[CAP_OFF_VERSION], CAP_VERSION);
@@ -100,6 +100,20 @@ fn cap_record_golden_bytes() {
         &rec[CAP_OFF_COMNT..CAP_OFF_COMNT + sample().comment.len()],
         sample().comment.as_slice()
     );
+}
+
+#[test]
+fn cap_record_codec_is_available_without_ambient_path_access() {
+    let encoded = encode_cap_info(&sample());
+    let decoded = decode_cap_info(&encoded).unwrap();
+    assert_eq!(decoded.type_creator, sample().type_creator);
+    assert_eq!(decoded.create_time, sample().create_time);
+    assert_eq!(decoded.modify_time, sample().modify_time);
+    assert_eq!(decoded.comment, sample().comment);
+
+    let mut invalid = encoded;
+    invalid[CAP_OFF_MAGIC] = 0;
+    assert!(decode_cap_info(&invalid).is_none());
 }
 
 #[test]

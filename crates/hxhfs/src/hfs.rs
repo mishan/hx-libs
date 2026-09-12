@@ -363,6 +363,25 @@ fn read_cap_info(f: &mut File, fi: &mut HfsInfo) {
     if read_exact_or_none(f, &mut buf).ok().flatten().is_none() {
         return;
     }
+    if let Some(decoded) = decode_cap_info(&buf) {
+        *fi = decoded;
+    }
+}
+
+/// Decode one fixed-size CAP Finder-info record without performing I/O.
+///
+/// Capability-oriented consumers use this with file handles they opened
+/// relative to their own directory authority, so parsing a sidecar never
+/// requires turning an untrusted relative path back into an ambient path.
+pub fn decode_cap_info(buf: &[u8]) -> Option<HfsInfo> {
+    if buf.len() < SIZEOF_CAP_INFO
+        || buf[CAP_OFF_MAGIC1] != CAP_MAGIC1
+        || buf[CAP_OFF_VERSION] != CAP_VERSION
+        || buf[CAP_OFF_MAGIC] != CAP_MAGIC
+    {
+        return None;
+    }
+    let mut fi = HfsInfo::default();
     fi.type_creator
         .copy_from_slice(&buf[CAP_OFF_FNDR..CAP_OFF_FNDR + 8]);
     let datevalid = buf[CAP_OFF_DATEVALID];
@@ -376,6 +395,7 @@ fn read_cap_info(f: &mut File, fi: &mut HfsInfo) {
     }
     let comln = (buf[CAP_OFF_COMLN] as usize).min(MAX_COMMENT);
     fi.comment = buf[CAP_OFF_COMNT..CAP_OFF_COMNT + comln].to_vec();
+    Some(fi)
 }
 
 fn read_dbl_info(f: &mut File, fi: &mut HfsInfo) {
@@ -416,7 +436,8 @@ fn read_dbl_info(f: &mut File, fi: &mut HfsInfo) {
 // ---------- Finder info write ----------
 
 /// Build the 300-byte CAP `.fndrinfo` record for `fi`.
-fn build_cap_record(fi: &HfsInfo) -> [u8; SIZEOF_CAP_INFO] {
+/// Encode one fixed-size CAP Finder-info record without performing I/O.
+pub fn encode_cap_info(fi: &HfsInfo) -> [u8; SIZEOF_CAP_INFO] {
     let mut b = [0u8; SIZEOF_CAP_INFO];
     b[CAP_OFF_MAGIC1] = CAP_MAGIC1;
     b[CAP_OFF_VERSION] = CAP_VERSION;
@@ -440,7 +461,7 @@ pub fn hfsinfo_write(cfg: &Config, path: &Path, fi: &HfsInfo) -> io::Result<()> 
             // Like hfs.c: O_RDWR|O_CREAT (no O_TRUNC) — overwrite the first 300
             // bytes from offset 0, leaving any trailing bytes intact.
             let mut f = open_rw_create(&info, cfg.file_perm)?;
-            f.write_all(&build_cap_record(fi))?;
+            f.write_all(&encode_cap_info(fi))?;
             f.sync_all()?;
             Ok(())
         }
