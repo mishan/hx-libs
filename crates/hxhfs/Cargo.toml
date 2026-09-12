@@ -1,14 +1,11 @@
 [package]
 rust-version.workspace = true
-name = "hxfiles-xfer"
+name = "hxhfs"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
-description = "Safe Hotline FFO/FILP and HTXF wire codec"
+description = "Safe HFS metadata and resource-fork sidecar support"
 publish = false
 
 [lib]
 crate-type = ["rlib"]
-
-[dependencies]
-sha2 = "0.10"
