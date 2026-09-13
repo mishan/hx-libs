@@ -19,6 +19,23 @@ pub enum Error {
     LengthMismatch,
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => f.write_str("truncated HTXF preamble"),
+            Self::BadMagic => f.write_str("invalid HTXF magic"),
+            Self::UnsupportedFlags(flags) => {
+                write!(f, "unsupported HTXF flags: {flags:#06x}")
+            }
+            Self::FlagRelationship => f.write_str("invalid HTXF flag relationship"),
+            Self::LengthOverflow => f.write_str("HTXF length exceeds the selected encoding"),
+            Self::LengthMismatch => f.write_str("HTXF legacy and extended lengths disagree"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preamble {
     pub reference: u32,
