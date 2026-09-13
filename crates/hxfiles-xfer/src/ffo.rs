@@ -50,14 +50,21 @@ pub struct ForkHeader {
     pub length: u64,
 }
 
-pub fn pack_fork_header(tag: &[u8; 4], length: u64, large: bool) -> [u8; FORK_HEADER_LEN] {
+pub fn pack_fork_header(
+    tag: &[u8; 4],
+    length: u64,
+    large: bool,
+) -> Result<[u8; FORK_HEADER_LEN], Error> {
+    if !large && length > u32::MAX as u64 {
+        return Err(Error::SizeOverflow);
+    }
     let mut out = [0; FORK_HEADER_LEN];
     out[..4].copy_from_slice(tag);
     if large {
         out[4..8].copy_from_slice(&(length >> 32).to_be_bytes()[4..]);
     }
     out[12..16].copy_from_slice(&(length as u32).to_be_bytes());
-    out
+    Ok(out)
 }
 
 pub fn parse_fork_header(bytes: &[u8], large: bool) -> Result<ForkHeader, Error> {
@@ -166,7 +173,7 @@ pub fn encode(metadata: &Metadata<'_>, forks: Forks, large: bool) -> Result<Enco
     // Period clients expect a trailing zero MACR marker even when this says
     // INFO + DATA. A non-empty resource fork is the third declared fork.
     out.extend_from_slice(&(if resource_remaining == 0 { 2u16 } else { 3 }).to_be_bytes());
-    out.extend_from_slice(&pack_fork_header(b"INFO", info_len as u64, large));
+    out.extend_from_slice(&pack_fork_header(b"INFO", info_len as u64, large)?);
 
     let mut info = vec![0; info_len];
     info[..4].copy_from_slice(b"AMAC");
@@ -181,11 +188,11 @@ pub fn encode(metadata: &Metadata<'_>, forks: Forks, large: bool) -> Result<Enco
         .copy_from_slice(&(metadata.comment.len() as u16).to_be_bytes());
     info[comment_at + 2..].copy_from_slice(metadata.comment);
     out.extend_from_slice(&info);
-    out.extend_from_slice(&pack_fork_header(b"DATA", data_remaining, large));
+    out.extend_from_slice(&pack_fork_header(b"DATA", data_remaining, large)?);
 
     Ok(Encoded {
         prefix: out,
-        resource_header: pack_fork_header(b"MACR", resource_remaining, large),
+        resource_header: pack_fork_header(b"MACR", resource_remaining, large)?,
         data_remaining,
         resource_remaining,
         transfer_len,
@@ -334,7 +341,7 @@ mod tests {
     #[test]
     fn large_fork_vector_reconstructs_high_and_low_halves() {
         let length = 0x1_4000_0005;
-        let header = pack_fork_header(b"DATA", length, true);
+        let header = pack_fork_header(b"DATA", length, true).unwrap();
         assert_eq!(&header[4..8], &1u32.to_be_bytes());
         assert_eq!(&header[12..16], &0x4000_0005u32.to_be_bytes());
         assert_eq!(parse_fork_header(&header, true).unwrap().length, length);
@@ -342,6 +349,14 @@ mod tests {
         assert_eq!(
             parse_fork_header(&header, false).unwrap().length,
             0x4000_0005
+        );
+    }
+
+    #[test]
+    fn legacy_fork_headers_reject_lengths_the_wire_cannot_carry() {
+        assert_eq!(
+            pack_fork_header(b"DATA", u32::MAX as u64 + 1, false),
+            Err(Error::SizeOverflow)
         );
     }
 

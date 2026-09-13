@@ -1915,8 +1915,12 @@ pub const HTXF_FLAG_RESUME: u16 = 0x0004;
 /// legacy 16-byte form fails closed (returns 0) if `total_size` exceeds
 /// `u32::MAX` rather than silently truncating.
 ///
-/// Returns the number of bytes written (16 or 24), or 0 on a too-small `out`
-/// (or the >4 GiB legacy case).
+/// This builder has no resume-digest argument, so it rejects
+/// [`HTXF_FLAG_RESUME`] rather than emitting a preamble whose flag promises an
+/// extension that is not present.
+///
+/// Returns the number of bytes written (16 or 24), or 0 on a too-small `out`,
+/// a resume request, or the >4 GiB legacy case.
 pub fn build_htxf_preamble(
     out: &mut [u8],
     ref_id: u32,
@@ -1925,6 +1929,9 @@ pub fn build_htxf_preamble(
     flags: u16,
     size64: bool,
 ) -> usize {
+    if flags & HTXF_FLAG_RESUME != 0 {
+        return 0;
+    }
     if size64 {
         if out.len() < HTXF_HDR_SIZE + 8 {
             return 0;
@@ -4102,6 +4109,15 @@ mod tests {
         // Too-small buffers return 0.
         assert_eq!(build_htxf_preamble(&mut [0u8; 15], 1, 1, 1, 0, false), 0);
         assert_eq!(build_htxf_preamble(&mut [0u8; 23], 1, 1, 1, 0, true), 0);
+
+        // The digest-bearing resume extension belongs to the full codec. This
+        // compatibility builder must not set a flag for bytes it cannot write.
+        let mut out = [0xa5; 40];
+        assert_eq!(
+            build_htxf_preamble(&mut out, 1, 1, 1, HTXF_FLAG_RESUME, true),
+            0
+        );
+        assert_eq!(out, [0xa5; 40]);
     }
 
     #[test]
