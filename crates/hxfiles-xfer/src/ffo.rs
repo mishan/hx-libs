@@ -30,7 +30,7 @@ impl core::fmt::Display for Error {
             Error::BadFork => f.write_str("invalid FILP fork header"),
             Error::NameTooLong => f.write_str("FILP filename exceeds 128 bytes"),
             Error::CommentTooLong => f.write_str("FILP comment exceeds 255 bytes"),
-            Error::SizeOverflow => f.write_str("FILP transfer size overflows u64"),
+            Error::SizeOverflow => f.write_str("FILP size exceeds the selected wire encoding"),
             Error::Range(e) => e.fmt(f),
         }
     }
@@ -100,7 +100,7 @@ pub fn hfs_h_to_mtime(wire: [u8; 4]) -> [u8; 4] {
 
 /// Bytes read after the 40-byte fixed FILP/INFO headers by period clients.
 pub fn info_block_len(b38: u8, b39: u8) -> usize {
-    (if b38 == 0 { 0 } else { 0x100 }) + usize::from(b39) + FORK_HEADER_LEN
+    usize::from(u16::from_be_bytes([b38, b39])) + FORK_HEADER_LEN
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +211,9 @@ pub struct ParsedInfo {
 pub fn parse_info(info: &[u8]) -> Result<ParsedInfo, Error> {
     if info.len() < INFO_FIXED_LEN {
         return Err(Error::Truncated);
+    }
+    if info[..4] != *b"AMAC" {
+        return Err(Error::BadMagic);
     }
     let name_len = u16::from_be_bytes(info[70..72].try_into().expect("two bytes")) as usize;
     if name_len > MAX_NAME_LEN {
@@ -336,6 +339,36 @@ mod tests {
         assert_eq!(&encoded.prefix[40 + info_len..44 + info_len], b"DATA");
         assert_eq!(&encoded.resource_header[..4], b"MACR");
         assert_eq!(encoded.transfer_len, encoded.prefix.len() as u64 + 5 + 16);
+    }
+
+    #[test]
+    fn info_length_uses_both_bytes_and_info_magic_is_required() {
+        assert_eq!(info_block_len(0xb8, 0xb9), 0xb8b9 + FORK_HEADER_LEN);
+
+        let encoded = encode(
+            &metadata(b"notes.txt", b"source"),
+            Forks {
+                data_len: 0,
+                data_offset: 0,
+                resource_len: 0,
+                resource_offset: 0,
+            },
+            false,
+        )
+        .unwrap();
+        let info_len = INFO_FIXED_LEN + b"notes.txt".len() + b"source".len();
+        let mut info = encoded.prefix[40..40 + info_len].to_vec();
+        info[..4].copy_from_slice(b"NOPE");
+
+        assert_eq!(parse_info(&info), Err(Error::BadMagic));
+    }
+
+    #[test]
+    fn size_overflow_message_describes_the_selected_encoding() {
+        assert_eq!(
+            Error::SizeOverflow.to_string(),
+            "FILP size exceeds the selected wire encoding"
+        );
     }
 
     #[test]

@@ -1917,7 +1917,9 @@ pub const HTXF_FLAG_RESUME: u16 = 0x0004;
 ///
 /// This builder has no resume-digest argument, so it rejects
 /// [`HTXF_FLAG_RESUME`] rather than emitting a preamble whose flag promises an
-/// extension that is not present.
+/// extension that is not present. The legacy form likewise rejects a supplied
+/// [`HTXF_FLAG_SIZE64`] instead of advertising an eight-byte extension it does
+/// not write.
 ///
 /// Returns the number of bytes written (16 or 24), or 0 on a too-small `out`,
 /// a resume request, or the >4 GiB legacy case.
@@ -1929,7 +1931,7 @@ pub fn build_htxf_preamble(
     flags: u16,
     size64: bool,
 ) -> usize {
-    if flags & HTXF_FLAG_RESUME != 0 {
+    if flags & HTXF_FLAG_RESUME != 0 || (!size64 && flags & HTXF_FLAG_SIZE64 != 0) {
         return 0;
     }
     if size64 {
@@ -4115,6 +4117,13 @@ mod tests {
         let mut out = [0xa5; 40];
         assert_eq!(
             build_htxf_preamble(&mut out, 1, 1, 1, HTXF_FLAG_RESUME, true),
+            0
+        );
+        assert_eq!(out, [0xa5; 40]);
+
+        // The legacy form must not advertise a size extension it omits.
+        assert_eq!(
+            build_htxf_preamble(&mut out, 1, 1, 1, HTXF_FLAG_SIZE64, false),
             0
         );
         assert_eq!(out, [0xa5; 40]);
