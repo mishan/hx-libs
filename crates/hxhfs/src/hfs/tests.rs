@@ -1,0 +1,902 @@
+//! Round-trip + golden-byte tests for the native HFS-sidecar API.
+
+use super::format::*;
+use super::*;
+// Explicit std imports rather than leaning on the `use super::*` glob pulling in
+// hfs.rs's private `use`s (which works, but is fragile).
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A unique temp directory for one test (no external crates). Best-effort
+/// cleanup on drop.
+struct TmpDir(PathBuf);
+
+impl TmpDir {
+    fn new() -> TmpDir {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "hxhfs-test-{}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        TmpDir(dir)
+    }
+    fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn sample() -> HfsInfo {
+    HfsInfo {
+        type_creator: *b"TEXTMSIE",
+        create_time: [0x11, 0x22, 0x33, 0x44],
+        modify_time: [0x55, 0x66, 0x77, 0x88],
+        rsrclen: 0,
+        comment: b"a finder comment".to_vec(),
+    }
+}
+
+fn appledouble_bytes(descrs: &[Descr], payload: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0; SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * descrs.len()];
+    bytes[0..4].copy_from_slice(&DBL_MAGIC.to_be_bytes());
+    bytes[4..8].copy_from_slice(&HDR_VERSION_2.to_be_bytes());
+    bytes[24..26].copy_from_slice(&(descrs.len() as u16).to_be_bytes());
+    for (index, descr) in descrs.iter().enumerate() {
+        descr.write_bytes(&mut bytes[SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * index..]);
+    }
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// The payload of the first entry with `id` in a serialized container.
+fn dbl_entry(container: &[u8], id: u32) -> &[u8] {
+    let entries = u16::from_be_bytes([container[24], container[25]]) as usize;
+    let descr = (0..entries)
+        .map(|i| Descr::from_bytes(&container[SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * i..]))
+        .find(|d| d.id == id)
+        .expect("entry present");
+    &container[descr.offset as usize..(descr.offset + descr.length) as usize]
+}
+
+// ---------- sidecar path computation ----------
+
+#[test]
+fn sidecar_paths() {
+    assert_eq!(
+        finderinfo_path(Path::new("/home/x/file.bin"), b'/').unwrap(),
+        Path::new("/home/x/file.bin.fndrinfo")
+    );
+    assert_eq!(
+        resource_path(Path::new("/home/x/file.bin"), b'/').unwrap(),
+        Path::new("/home/x/file.bin.rsrc")
+    );
+    assert_eq!(
+        finderinfo_path(Path::new("/file.bin"), b'/').unwrap(),
+        Path::new("/file.bin.fndrinfo")
+    );
+    // No separator → "." directory.
+    assert_eq!(
+        finderinfo_path(Path::new("bare"), b'/').unwrap(),
+        Path::new("./bare.fndrinfo")
+    );
+}
+
+#[test]
+fn path_too_long_is_error() {
+    let long = "a".repeat(4090);
+    assert!(finderinfo_path(Path::new(&long), b'/').is_err());
+}
+
+#[cfg(not(unix))]
+#[test]
+fn non_ascii_dir_char_cannot_split_platform_encoding() {
+    assert_eq!(
+        finderinfo_path(Path::new("é.bin"), 0xa9).unwrap(),
+        Path::new("./é.bin.fndrinfo")
+    );
+}
+
+// ---------- CAP ----------
+
+#[test]
+fn cap_record_golden_bytes() {
+    let rec = encode_cap_info(&sample());
+    assert_eq!(rec.len(), SIZEOF_CAP_INFO);
+    assert_eq!(rec[CAP_OFF_MAGIC1], CAP_MAGIC1);
+    assert_eq!(rec[CAP_OFF_VERSION], CAP_VERSION);
+    assert_eq!(rec[CAP_OFF_MAGIC], CAP_MAGIC);
+    assert_eq!(rec[CAP_OFF_DATEMAGIC], CAP_DMAGIC);
+    assert_eq!(rec[CAP_OFF_DATEVALID], CAP_MDATE | CAP_CDATE);
+    assert_eq!(&rec[0..8], b"TEXTMSIE");
+    assert_eq!(
+        &rec[CAP_OFF_CTIME..CAP_OFF_CTIME + 4],
+        &[0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(
+        &rec[CAP_OFF_CTIME + 4..CAP_OFF_CTIME + 8],
+        &[0x55, 0x66, 0x77, 0x88]
+    );
+    assert_eq!(rec[CAP_OFF_COMLN] as usize, sample().comment.len());
+    assert_eq!(
+        &rec[CAP_OFF_COMNT..CAP_OFF_COMNT + sample().comment.len()],
+        sample().comment.as_slice()
+    );
+}
+
+#[test]
+fn cap_record_codec_is_available_without_ambient_path_access() {
+    let encoded = encode_cap_info(&sample());
+    let decoded = decode_cap_info(&encoded).unwrap();
+    assert_eq!(decoded.type_creator, sample().type_creator);
+    assert_eq!(decoded.create_time, sample().create_time);
+    assert_eq!(decoded.modify_time, sample().modify_time);
+    assert_eq!(decoded.comment, sample().comment);
+
+    let mut invalid = encoded;
+    invalid[CAP_OFF_MAGIC] = 0;
+    assert!(decode_cap_info(&invalid).is_none());
+
+    let mut invalid_dates = encoded;
+    invalid_dates[CAP_OFF_DATEMAGIC] = 0;
+    let decoded = decode_cap_info(&invalid_dates).unwrap();
+    assert_eq!(decoded.create_time, [0; 4]);
+    assert_eq!(decoded.modify_time, [0; 4]);
+}
+
+#[test]
+fn cap_roundtrip() {
+    let cfg = Config::default(); // CAP
+    let tmp = TmpDir::new();
+    let data = tmp.path("doc.bin");
+
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let got = hfsinfo_read(&cfg, &data);
+
+    assert_eq!(got.type_creator, sample().type_creator);
+    assert_eq!(got.create_time, sample().create_time);
+    assert_eq!(got.modify_time, sample().modify_time);
+    assert_eq!(got.comment, sample().comment);
+}
+
+#[test]
+fn cap_missing_sidecar_falls_back_to_suffix_and_mtime() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("art.png");
+    std::fs::write(&data, b"data").unwrap();
+
+    let got = hfsinfo_read(&cfg, &data);
+    // No sidecar → suffix table + the data file's mtime for both dates.
+    assert_eq!(&got.type_creator, b"PNGfGKON");
+    assert_ne!(got.create_time, [0; 4]);
+    assert_eq!(got.create_time, got.modify_time);
+}
+
+#[test]
+fn cap_config_comment_fallback() {
+    let cfg = Config {
+        comment: Some(b"default comment".to_vec()),
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("x.bin");
+    // No sidecar and no stored comment → cfg.comment.
+    let got = hfsinfo_read(&cfg, &data);
+    assert_eq!(got.comment, b"default comment");
+}
+
+#[test]
+fn cap_comment_len_and_write() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("c.bin");
+
+    comment_write(&cfg, &data, b"hello").unwrap();
+    assert_eq!(comment_len(&cfg, &data), 5);
+    // The comment write also seeds a suffix-derived type when fresh.
+    let got = hfsinfo_read(&cfg, &data);
+    assert_eq!(got.comment, b"hello");
+}
+
+#[test]
+fn cap_comment_write_fresh_record_sets_magic_bytes() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("dm.bin");
+    comment_write(&cfg, &data, b"c").unwrap();
+
+    let bytes = std::fs::read(finderinfo_path(&data, b'/').unwrap()).unwrap();
+    assert_eq!(bytes[CAP_OFF_MAGIC1], CAP_MAGIC1);
+    assert_eq!(bytes[CAP_OFF_MAGIC], CAP_MAGIC);
+    // fi_datemagic must be set on a freshly-synthesized record (matches hfs.c).
+    assert_eq!(bytes[CAP_OFF_DATEMAGIC], CAP_DMAGIC);
+}
+
+#[test]
+fn cap_comment_clamped_to_max() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("big.bin");
+    let big = vec![b'x'; 500];
+    comment_write(&cfg, &data, &big).unwrap();
+    assert_eq!(comment_len(&cfg, &data), MAX_COMMENT);
+}
+
+#[test]
+fn cap_resource_fork() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("r.bin");
+
+    // Write a resource fork, then read it back through resource_open + len.
+    let mut write_opts = ResourceOpenOptions::new();
+    write_opts.write(true).create(true).truncate(true);
+    write_opts.mode(0o600);
+    let mut w = resource_open(&cfg, &data, &write_opts).unwrap().unwrap();
+    w.write_all(b"RESOURCEDATA").unwrap();
+    w.sync_all().unwrap();
+    drop(w);
+
+    assert_eq!(resource_len(&cfg, &data), 12);
+    let mut read_opts = ResourceOpenOptions::new();
+    read_opts.read(true);
+    let mut r = resource_open(&cfg, &data, &read_opts).unwrap().unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"RESOURCEDATA");
+}
+
+#[test]
+fn cap_resource_open_write_does_not_truncate() {
+    // A resumed transfer opens the existing fork write-only (no create/truncate)
+    // and seeks before writing — the untouched tail must survive.
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("resume.bin");
+    let rsrc = resource_path(&data, b'/').unwrap();
+    std::fs::write(&rsrc, b"ORIGINAL-CONTENT").unwrap();
+
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true);
+    let mut f = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    f.write_all(b"NEW").unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+
+    assert_eq!(std::fs::read(&rsrc).unwrap(), b"NEWGINAL-CONTENT");
+}
+
+#[test]
+fn cap_append_tracks_the_real_fork_position() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("append.bin");
+    let rsrc = resource_path(&data, b'/').unwrap();
+    std::fs::write(&rsrc, b"abc").unwrap();
+
+    let mut opts = ResourceOpenOptions::new();
+    opts.append(true);
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    assert_eq!(resource.stream_position().unwrap(), 3);
+    resource.write_all(b"d").unwrap();
+    assert_eq!(resource.stream_position().unwrap(), 4);
+    resource.seek(SeekFrom::Start(0)).unwrap();
+    resource.write_all(b"e").unwrap();
+    assert_eq!(resource.stream_position().unwrap(), 5);
+    drop(resource);
+
+    assert_eq!(std::fs::read(rsrc).unwrap(), b"abcde");
+}
+
+#[test]
+fn cap_resource_open_absent_is_none() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("none.bin");
+    let mut read_opts = ResourceOpenOptions::new();
+    read_opts.read(true);
+    assert!(resource_open(&cfg, &data, &read_opts).unwrap().is_none());
+    assert_eq!(resource_len(&cfg, &data), 0);
+}
+
+#[test]
+fn cap_hfsinfo_reports_resource_len_without_finderinfo() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("resource-only.bin");
+    let rsrc = resource_path(&data, b'/').unwrap();
+    std::fs::write(&rsrc, b"resource").unwrap();
+
+    assert!(!finderinfo_path(&data, b'/').unwrap().exists());
+    assert_eq!(hfsinfo_read(&cfg, &data).rsrclen, 8);
+}
+
+#[test]
+fn cap_comment_replaces_a_malformed_full_record() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("invalid-comment.bin");
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    std::fs::write(&sidecar, [0xa5; SIZEOF_CAP_INFO]).unwrap();
+
+    comment_write(&cfg, &data, b"repaired").unwrap();
+
+    let bytes = std::fs::read(sidecar).unwrap();
+    let decoded = decode_cap_info(&bytes).unwrap();
+    assert_eq!(decoded.comment, b"repaired");
+    assert_eq!(
+        decoded.type_creator,
+        suffix_type_creator(b"invalid-comment.bin")
+    );
+}
+
+#[test]
+fn resource_open_missing_parent_dir_is_error() {
+    // A missing *parent directory* (not just a missing file) is a real error,
+    // not the "no fork, skip" case — it must not be swallowed as Ok(None).
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    let data = tmp.path("nonexistent-subdir/file.bin");
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    opts.mode(0o600);
+    assert!(resource_open(&cfg, &data, &opts).is_err());
+}
+
+#[test]
+fn cap_type_creator_prefers_sidecar() {
+    let cfg = Config::default();
+    let tmp = TmpDir::new();
+    // .png extension, but the sidecar says TEXTMSIE — sidecar wins.
+    let data = tmp.path("thing.png");
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    assert_eq!(&type_creator(&cfg, &data), b"TEXTMSIE");
+
+    // No sidecar → extension.
+    let other = tmp.path("other.gif");
+    assert_eq!(&type_creator(&cfg, &other), b"GIFfGKON");
+}
+
+// ---------- AppleDouble / Netatalk ----------
+
+#[test]
+fn appledouble_header_golden_bytes() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("ad.bin");
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+
+    let bytes = std::fs::read(finderinfo_path(&data, b'/').unwrap()).unwrap();
+    assert_eq!(&bytes[0..4], DBL_MAGIC.to_be_bytes());
+    assert_eq!(&bytes[4..8], HDR_VERSION_2.to_be_bytes());
+    assert_eq!(u16::from_be_bytes([bytes[24], bytes[25]]), 4);
+}
+
+#[test]
+fn netatalk_uses_version_1() {
+    let cfg = Config {
+        fork: Fork::Netatalk,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("na.bin");
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let bytes = std::fs::read(finderinfo_path(&data, b'/').unwrap()).unwrap();
+    assert_eq!(&bytes[4..8], HDR_VERSION_1.to_be_bytes());
+}
+
+#[test]
+fn appledouble_updates_existing_comment() {
+    // A second write hits the existing-header path — the comment must still be
+    // written (a same-length replacement keeps the descriptor offsets valid).
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("upd.bin");
+
+    hfsinfo_write(&cfg, &data, &sample()).unwrap(); // "a finder comment" (16 B)
+    let mut fi2 = sample();
+    fi2.comment = b"XXXXXXXXXXXXXXXX".to_vec(); // same length
+    hfsinfo_write(&cfg, &data, &fi2).unwrap();
+
+    assert_eq!(hfsinfo_read(&cfg, &data).comment, b"XXXXXXXXXXXXXXXX");
+}
+
+#[test]
+fn appledouble_comment_length_change_relayouts_the_container() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("comment-relayout.bin");
+    let mut fi = sample();
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+    let mut write_opts = ResourceOpenOptions::new();
+    write_opts.write(true);
+    let mut resource = resource_open(&cfg, &data, &write_opts).unwrap().unwrap();
+    resource.write_all(b"RSRCBYTES").unwrap();
+    fi.rsrclen = resource.len();
+    drop(resource);
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+
+    let mut read_opts = ResourceOpenOptions::new();
+    read_opts.read(true);
+    for comment in [&b"short"[..], &b"a considerably longer finder comment"[..]] {
+        fi.comment = comment.to_vec();
+        hfsinfo_write(&cfg, &data, &fi).unwrap();
+
+        let got = hfsinfo_read(&cfg, &data);
+        assert_eq!(got.comment, comment);
+        assert_eq!(got.type_creator, sample().type_creator);
+        assert_eq!(got.create_time, sample().create_time);
+        assert_eq!(got.modify_time, sample().modify_time);
+        assert_eq!(got.rsrclen, 9);
+        let mut fork = Vec::new();
+        resource_open(&cfg, &data, &read_opts)
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut fork)
+            .unwrap();
+        assert_eq!(fork, b"RSRCBYTES");
+    }
+
+    // The fork still ends the container, so it can keep growing.
+    let mut resource = resource_open(&cfg, &data, &write_opts).unwrap().unwrap();
+    resource.seek(SeekFrom::End(0)).unwrap();
+    resource.write_all(b"MORE").unwrap();
+    assert_eq!(resource.len(), 13);
+    drop(resource);
+
+    // No scratch file is left beside the container.
+    let names = std::fs::read_dir(&tmp.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [std::ffi::OsString::from("comment-relayout.bin.fndrinfo")]
+    );
+}
+
+#[test]
+fn appledouble_relayout_keeps_what_it_does_not_own() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("foreign.bin");
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    // Laid out by someone else: the resource fork mid-container, an entry this
+    // crate does not know after it, and Finder info longer than the eight
+    // bytes hfsinfo_write rewrites.
+    let table_end = (SIZEOF_DBL_HDR + 5 * SIZEOF_HDR_DESCR) as u32;
+    let descrs = [
+        Descr {
+            id: HDR_COMNT,
+            offset: table_end,
+            length: 3,
+        },
+        Descr {
+            id: HDR_RSRC,
+            offset: table_end + 3,
+            length: 4,
+        },
+        Descr {
+            id: 42,
+            offset: table_end + 7,
+            length: 5,
+        },
+        Descr {
+            id: HDR_FINFO,
+            offset: table_end + 12,
+            length: 16,
+        },
+        Descr {
+            id: HDR_DATES,
+            offset: table_end + 28,
+            length: 8,
+        },
+    ];
+    std::fs::write(
+        &sidecar,
+        appledouble_bytes(&descrs, b"oldrsrcFORGNtypecreaEXTENDEDDATESDAT"),
+    )
+    .unwrap();
+
+    let mut fi = sample();
+    fi.rsrclen = 4;
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+
+    let container = std::fs::read(&sidecar).unwrap();
+    assert_eq!(
+        dbl_entry(&container, HDR_COMNT),
+        sample().comment.as_slice()
+    );
+    assert_eq!(dbl_entry(&container, HDR_RSRC), b"rsrc");
+    assert_eq!(dbl_entry(&container, 42), b"FORGN");
+    assert_eq!(dbl_entry(&container, HDR_FINFO), b"TEXTMSIEEXTENDED");
+    assert_eq!(
+        dbl_entry(&container, HDR_DATES),
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+    );
+    // The resource fork now ends the container.
+    assert_eq!(
+        dbl_entry(&container, HDR_RSRC).as_ptr_range().end,
+        container.as_ptr_range().end
+    );
+}
+
+#[test]
+fn appledouble_resource_fork_roundtrip() {
+    // The AppleDouble resource fork lives inside the .fndrinfo at the RSRC
+    // descriptor's offset. Create the sidecar, write fork bytes there, record
+    // the length via a second hfsinfo_write, and read it back.
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("adr.bin");
+
+    let mut fi = sample();
+    fi.rsrclen = 0;
+    hfsinfo_write(&cfg, &data, &fi).unwrap(); // RSRC descr present, length 0
+
+    // Write fork bytes at the RSRC offset. read+write, NOT truncate: the
+    // AppleDouble fork is embedded, so resource_open must read the container
+    // header to find the RSRC offset (a write-only fd couldn't), and the header
+    // + other entries must survive.
+    let mut wopts = ResourceOpenOptions::new();
+    wopts.read(true).write(true);
+    let mut w = resource_open(&cfg, &data, &wopts).unwrap().unwrap();
+    w.write_all(b"RSRCBYTES").unwrap();
+    w.sync_all().unwrap();
+    drop(w);
+
+    // Record the fork length in the RSRC descriptor (existing-header path).
+    fi.rsrclen = 9;
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+
+    assert_eq!(resource_len(&cfg, &data), 9);
+    // The Finder metadata still round-trips too.
+    assert_eq!(hfsinfo_read(&cfg, &data).comment, sample().comment);
+
+    let mut ropts = ResourceOpenOptions::new();
+    ropts.read(true);
+    let mut r = resource_open(&cfg, &data, &ropts).unwrap().unwrap();
+    let mut buf = Vec::new();
+    r.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"RSRCBYTES");
+}
+
+#[test]
+fn appledouble_rejects_unbacked_resource_lengths_without_mutating_metadata() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("unbacked-resource.bin");
+    let mut fi = sample();
+    fi.rsrclen = 9;
+
+    let error = hfsinfo_write(&cfg, &data, &fi).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"");
+
+    fi.rsrclen = 0;
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+    fi.rsrclen = 1;
+
+    let error = hfsinfo_write(&cfg, &data, &fi).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(std::fs::read(sidecar).unwrap(), before);
+}
+
+#[test]
+fn appledouble_resource_seeks_are_fork_relative() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("resume-resource.bin");
+    let mut fi = sample();
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true);
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    resource.write_all(b"abcdef").unwrap();
+    resource.seek(SeekFrom::Start(2)).unwrap();
+    resource.write_all(b"XY").unwrap();
+    resource.sync_all().unwrap();
+    drop(resource);
+
+    fi.rsrclen = 6;
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+    let container = std::fs::read(finderinfo_path(&data, b'/').unwrap()).unwrap();
+    assert_eq!(&container[0..4], &DBL_MAGIC.to_be_bytes());
+
+    let mut read_opts = ResourceOpenOptions::new();
+    read_opts.read(true);
+    let mut resource = resource_open(&cfg, &data, &read_opts).unwrap().unwrap();
+    let mut bytes = Vec::new();
+    resource.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"abXYef");
+}
+
+#[test]
+fn appledouble_rejects_container_truncation_without_mutating_it() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("no-container-truncate.bin");
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true).truncate(true);
+    let error = resource_open(&cfg, &data, &opts).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read(sidecar).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn appledouble_rejects_raw_open_flags_without_mutating_it() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("no-raw-container-flags.bin");
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true).custom_flags(1);
+    let error = resource_open(&cfg, &data, &opts).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read(sidecar).unwrap(), before);
+}
+
+#[test]
+fn appledouble_rejects_invalid_headers_and_descriptor_ranges() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("invalid-container.bin");
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    let mut opts = ResourceOpenOptions::new();
+    opts.read(true);
+
+    std::fs::write(&sidecar, [0u8; SIZEOF_DBL_HDR]).unwrap();
+    let error = resource_open(&cfg, &data, &opts).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    let table_end = (SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR) as u32;
+    let bytes = appledouble_bytes(
+        &[Descr {
+            id: HDR_RSRC,
+            offset: table_end - 1,
+            length: 1,
+        }],
+        &[0],
+    );
+    std::fs::write(&sidecar, bytes).unwrap();
+    let error = resource_open(&cfg, &data, &opts).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+    for id in [HDR_OLDI, HDR_DATES, HDR_FINFO] {
+        let bytes = appledouble_bytes(
+            &[Descr {
+                id,
+                offset: table_end,
+                length: 7,
+            }],
+            &[0; 7],
+        );
+        std::fs::write(&sidecar, bytes).unwrap();
+        let error = resource_open(&cfg, &data, &opts).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn appledouble_nonterminal_resource_writes_stop_at_the_descriptor_boundary() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("bounded-resource.bin");
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    let table_end = (SIZEOF_DBL_HDR + 2 * SIZEOF_HDR_DESCR) as u32;
+    let bytes = appledouble_bytes(
+        &[
+            Descr {
+                id: HDR_RSRC,
+                offset: table_end,
+                length: 4,
+            },
+            Descr {
+                id: 42,
+                offset: table_end + 4,
+                length: 4,
+            },
+        ],
+        b"rsrcTAIL",
+    );
+    std::fs::write(&sidecar, &bytes).unwrap();
+
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true);
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    let error = resource.write_all(b"ABCDEFGH").unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+    assert!(resource.seek(SeekFrom::Start(5)).is_err());
+    drop(resource);
+
+    let after = std::fs::read(sidecar).unwrap();
+    assert_eq!(&after[table_end as usize..table_end as usize + 4], b"ABCD");
+    assert_eq!(&after[table_end as usize + 4..], b"TAIL");
+}
+
+#[test]
+fn appledouble_terminal_resource_cannot_exceed_u32_length() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("bounded-terminal-resource.bin");
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    let original_len = std::fs::metadata(&sidecar).unwrap().len();
+
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true);
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    assert_eq!(
+        resource.seek(SeekFrom::Start(u64::from(u32::MAX))).unwrap(),
+        u64::from(u32::MAX)
+    );
+    assert_eq!(resource.write(b"x").unwrap(), 0);
+    assert!(resource
+        .seek(SeekFrom::Start(u64::from(u32::MAX) + 1))
+        .is_err());
+    drop(resource);
+
+    assert_eq!(std::fs::metadata(sidecar).unwrap().len(), original_len);
+}
+
+#[test]
+fn appledouble_accepts_empty_entries_wherever_they_point() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("empty-entry.bin");
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    let table_end = (SIZEOF_DBL_HDR + 2 * SIZEOF_HDR_DESCR) as u32;
+    let bytes = appledouble_bytes(
+        &[
+            Descr {
+                id: HDR_FINFO,
+                offset: table_end,
+                length: 8,
+            },
+            Descr {
+                id: HDR_RSRC,
+                offset: 0,
+                length: 0,
+            },
+        ],
+        b"TEXTttxt",
+    );
+    std::fs::write(&sidecar, &bytes).unwrap();
+
+    assert_eq!(&type_creator(&cfg, &data), b"TEXTttxt");
+    // An empty fork that does not end the container still cannot grow into it.
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true);
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    assert_eq!(resource.write(b"x").unwrap(), 0);
+    drop(resource);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), bytes);
+}
+
+#[test]
+fn appledouble_resource_open_accepts_create_as_legacy_callers_pass_it() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("created.bin");
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true).create(true).mode(0o600);
+
+    // No container yet: no fork, and nothing is created.
+    assert!(resource_open(&cfg, &data, &opts).unwrap().is_none());
+    assert!(!finderinfo_path(&data, b'/').unwrap().exists());
+
+    // With the container hfsinfo_write makes, the fork opens for writing.
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    resource.write_all(b"fork").unwrap();
+    assert_eq!(resource.len(), 4);
+}
+
+#[test]
+fn pre_epoch_mtime_has_a_signed_header_timestamp() {
+    let time = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+    assert_eq!(header_time(time), Some((-946_684_801i32).to_be_bytes()));
+}
+
+#[test]
+fn appledouble_rejects_a_resource_fork_its_descriptor_cannot_represent() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("too-large.bin");
+    let mut fi = sample();
+    fi.rsrclen = u64::from(u32::MAX) + 1;
+
+    let error = hfsinfo_write(&cfg, &data, &fi).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!finderinfo_path(&data, b'/').unwrap().exists());
+}
+
+#[test]
+fn appledouble_roundtrip() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("ad2.bin");
+
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let got = hfsinfo_read(&cfg, &data);
+
+    assert_eq!(got.type_creator, sample().type_creator);
+    assert_eq!(got.create_time, sample().create_time);
+    assert_eq!(got.modify_time, sample().modify_time);
+    assert_eq!(got.comment, sample().comment);
+}
