@@ -7,16 +7,19 @@ pub const FORK_HEADER_LEN: usize = 16;
 pub const INFO_FIXED_LEN: usize = 74;
 pub const MAX_NAME_LEN: usize = 128;
 pub const MAX_COMMENT_LEN: usize = 255;
+/// The largest INFO fork [`parse_info`] accepts: the fixed fields, a maximal
+/// name, and a maximal comment.
+pub const MAX_INFO_LEN: usize = INFO_FIXED_LEN + MAX_NAME_LEN + MAX_COMMENT_LEN;
 pub const HFS_MAC_HEADER_DELTA: u32 = 3_029_529_600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Truncated,
-    BadMagic,
     BadVersion,
     BadFork,
     NameTooLong,
     CommentTooLong,
+    InfoTooLong,
     SizeOverflow,
     Range(RangeError),
 }
@@ -25,11 +28,11 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Truncated => f.write_str("truncated FILP data"),
-            Error::BadMagic => f.write_str("invalid FILP magic"),
             Error::BadVersion => f.write_str("unsupported FILP version"),
             Error::BadFork => f.write_str("invalid FILP fork header"),
             Error::NameTooLong => f.write_str("FILP filename exceeds 128 bytes"),
             Error::CommentTooLong => f.write_str("FILP comment exceeds 255 bytes"),
+            Error::InfoTooLong => write!(f, "FILP INFO fork exceeds {MAX_INFO_LEN} bytes"),
             Error::SizeOverflow => f.write_str("FILP size exceeds the selected wire encoding"),
             Error::Range(e) => e.fmt(f),
         }
@@ -67,22 +70,26 @@ pub fn pack_fork_header(
     Ok(out)
 }
 
+/// Parse a fork header. In legacy mode only the tag and the 32-bit length are
+/// read: mhxd ignores the compression and reserved fields, so a period peer
+/// that leaves junk in them still transfers. Large-file mode repurposes the
+/// compression field as the high half of the length and the extension keeps
+/// the reserved field zero, so there a nonzero one is rejected rather than
+/// guessed at.
 pub fn parse_fork_header(bytes: &[u8], large: bool) -> Result<ForkHeader, Error> {
-    let bytes = bytes.get(..FORK_HEADER_LEN).ok_or(Error::Truncated)?;
-    if bytes[8..12] != [0; 4] {
+    let marker: &[u8; FORK_HEADER_LEN] = bytes
+        .get(..FORK_HEADER_LEN)
+        .ok_or(Error::Truncated)?
+        .try_into()
+        .expect("sixteen bytes");
+    if large && marker[8..12] != [0; 4] {
         return Err(Error::BadFork);
     }
     let mut tag = [0; 4];
-    tag.copy_from_slice(&bytes[..4]);
-    let high = if large {
-        u32::from_be_bytes(bytes[4..8].try_into().expect("four bytes")) as u64
-    } else {
-        0
-    };
-    let low = u32::from_be_bytes(bytes[12..16].try_into().expect("four bytes")) as u64;
+    tag.copy_from_slice(&marker[..4]);
     Ok(ForkHeader {
         tag,
-        length: (high << 32) | low,
+        length: fork_len(marker, large),
     })
 }
 
@@ -98,9 +105,18 @@ pub fn hfs_h_to_mtime(wire: [u8; 4]) -> [u8; 4] {
         .to_be_bytes()
 }
 
-/// Bytes read after the 40-byte fixed FILP/INFO headers by period clients.
-pub fn info_block_len(b38: u8, b39: u8) -> usize {
-    usize::from(u16::from_be_bytes([b38, b39])) + FORK_HEADER_LEN
+/// Bytes to read after the 40-byte FFO and INFO fork headers: the INFO fork
+/// itself plus the DATA fork header that follows it. `b38`/`b39` are the low
+/// half of the INFO fork's length, which is all period clients read. mhxd's
+/// `(b38 ? 0x100 : 0) + b39` agrees with this for every length up to
+/// [`MAX_INFO_LEN`], and anything longer is rejected before a caller sizes a
+/// read from it.
+pub fn info_block_len(b38: u8, b39: u8) -> Result<usize, Error> {
+    let info_len = usize::from(u16::from_be_bytes([b38, b39]));
+    if info_len > MAX_INFO_LEN {
+        return Err(Error::InfoTooLong);
+    }
+    Ok(info_len + FORK_HEADER_LEN)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +217,9 @@ pub fn encode(metadata: &Metadata<'_>, forks: Forks, large: bool) -> Result<Enco
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedInfo {
+    /// The sender's platform tag, `AMAC` or `MWIN` from period peers. Reported,
+    /// never validated: see [`parse_info`].
+    pub platform: [u8; 4],
     pub type_creator: [u8; 8],
     pub create_time: u32,
     pub modify_time: u32,
@@ -212,9 +231,11 @@ pub fn parse_info(info: &[u8]) -> Result<ParsedInfo, Error> {
     if info.len() < INFO_FIXED_LEN {
         return Err(Error::Truncated);
     }
-    if info[..4] != *b"AMAC" {
-        return Err(Error::BadMagic);
-    }
+    // The platform tag is not checked. Windows clients and servers send
+    // `MWIN`, and mhxd never looks at the field; rejecting anything but
+    // `AMAC` would refuse their transfers.
+    let mut platform = [0; 4];
+    platform.copy_from_slice(&info[..4]);
     let name_len = u16::from_be_bytes(info[70..72].try_into().expect("two bytes")) as usize;
     if name_len > MAX_NAME_LEN {
         return Err(Error::NameTooLong);
@@ -236,6 +257,7 @@ pub fn parse_info(info: &[u8]) -> Result<ParsedInfo, Error> {
     let mut type_creator = [0; 8];
     type_creator.copy_from_slice(&info[4..12]);
     Ok(ParsedInfo {
+        platform,
         type_creator,
         create_time: u32::from_be_bytes(hfs_m_to_htime(
             info[56..60].try_into().expect("four bytes"),
@@ -311,15 +333,20 @@ mod tests {
         }
     }
 
+    const NO_FORKS: Forks = Forks {
+        data_len: 0,
+        data_offset: 0,
+        resource_len: 0,
+        resource_offset: 0,
+    };
+
     #[test]
     fn legacy_filp_vector_has_variable_name_and_trailing_macr() {
         let encoded = encode(
             &metadata(b"notes.txt", b"source"),
             Forks {
                 data_len: 5,
-                data_offset: 0,
-                resource_len: 0,
-                resource_offset: 0,
+                ..NO_FORKS
             },
             false,
         )
@@ -334,6 +361,7 @@ mod tests {
             info_len as u64
         );
         let info = parse_info(&encoded.prefix[40..40 + info_len]).unwrap();
+        assert_eq!(info.platform, *b"AMAC");
         assert_eq!(info.name, b"notes.txt");
         assert_eq!(info.comment, b"source");
         assert_eq!(&encoded.prefix[40 + info_len..44 + info_len], b"DATA");
@@ -342,25 +370,43 @@ mod tests {
     }
 
     #[test]
-    fn info_length_uses_both_bytes_and_info_magic_is_required() {
-        assert_eq!(info_block_len(0xb8, 0xb9), 0xb8b9 + FORK_HEADER_LEN);
+    fn info_length_agrees_with_period_readers_and_is_bounded() {
+        assert_eq!(info_block_len(0, 0x5a), Ok(0x5a + FORK_HEADER_LEN));
+        assert_eq!(info_block_len(1, 0x23), Ok(0x123 + FORK_HEADER_LEN));
+        assert_eq!(
+            info_block_len(0x01, 0xc9),
+            Ok(MAX_INFO_LEN + FORK_HEADER_LEN)
+        );
+        assert_eq!(info_block_len(0x01, 0xca), Err(Error::InfoTooLong));
+        assert_eq!(info_block_len(0xb8, 0xb9), Err(Error::InfoTooLong));
+    }
 
-        let encoded = encode(
-            &metadata(b"notes.txt", b"source"),
-            Forks {
-                data_len: 0,
-                data_offset: 0,
-                resource_len: 0,
-                resource_offset: 0,
-            },
-            false,
-        )
-        .unwrap();
+    #[test]
+    fn windows_platform_info_parses() {
+        let encoded = encode(&metadata(b"notes.txt", b"source"), NO_FORKS, false).unwrap();
         let info_len = INFO_FIXED_LEN + b"notes.txt".len() + b"source".len();
         let mut info = encoded.prefix[40..40 + info_len].to_vec();
-        info[..4].copy_from_slice(b"NOPE");
+        info[..4].copy_from_slice(b"MWIN");
 
-        assert_eq!(parse_info(&info), Err(Error::BadMagic));
+        let parsed = parse_info(&info).unwrap();
+        assert_eq!(parsed.platform, *b"MWIN");
+        assert_eq!(parsed.name, b"notes.txt");
+        assert_eq!(parsed.comment, b"source");
+    }
+
+    #[test]
+    fn legacy_fork_headers_ignore_what_period_readers_ignore() {
+        let mut header = pack_fork_header(b"DATA", 5, false).unwrap();
+        header[4..12].copy_from_slice(&[0xa5; 8]);
+        assert_eq!(
+            parse_fork_header(&header, false),
+            Ok(ForkHeader {
+                tag: *b"DATA",
+                length: 5
+            })
+        );
+        // Large-file mode reads 4..8 as the high half and keeps 8..12 zero.
+        assert_eq!(parse_fork_header(&header, true), Err(Error::BadFork));
     }
 
     #[test]
@@ -400,8 +446,7 @@ mod tests {
             Forks {
                 data_len: 0x1_0000_0020,
                 data_offset: 0x1_0000_0000,
-                resource_len: 0,
-                resource_offset: 0,
+                ..NO_FORKS
             },
             true,
         )
@@ -417,9 +462,7 @@ mod tests {
                 &metadata(b"x", b""),
                 Forks {
                     data_len: u32::MAX as u64,
-                    data_offset: 0,
-                    resource_len: 0,
-                    resource_offset: 0,
+                    ..NO_FORKS
                 },
                 false,
             )
@@ -431,29 +474,11 @@ mod tests {
     #[test]
     fn lengths_and_ranges_fail_closed() {
         assert!(matches!(
-            encode(
-                &metadata(&[b'x'; 129], b""),
-                Forks {
-                    data_len: 0,
-                    data_offset: 0,
-                    resource_len: 0,
-                    resource_offset: 0
-                },
-                false
-            ),
+            encode(&metadata(&[b'x'; 129], b""), NO_FORKS, false),
             Err(Error::NameTooLong)
         ));
         assert!(matches!(
-            encode(
-                &metadata(b"x", &[b'x'; 256]),
-                Forks {
-                    data_len: 0,
-                    data_offset: 0,
-                    resource_len: 0,
-                    resource_offset: 0
-                },
-                false
-            ),
+            encode(&metadata(b"x", &[b'x'; 256]), NO_FORKS, false),
             Err(Error::CommentTooLong)
         ));
         assert!(matches!(
@@ -462,8 +487,7 @@ mod tests {
                 Forks {
                     data_len: 1,
                     data_offset: 2,
-                    resource_len: 0,
-                    resource_offset: 0
+                    ..NO_FORKS
                 },
                 false
             ),
@@ -474,9 +498,7 @@ mod tests {
                 &metadata(b"x", b""),
                 Forks {
                     data_len: u32::MAX as u64 + 1,
-                    data_offset: 0,
-                    resource_len: 0,
-                    resource_offset: 0
+                    ..NO_FORKS
                 },
                 false
             ),

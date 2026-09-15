@@ -78,6 +78,10 @@ impl Preamble {
 }
 
 pub fn encoded_len(flags: u16) -> Result<usize, Error> {
+    // mhxd reads this half of the word as `__reserved` and ignores it; the
+    // rejection here is deliberate. Each flag declares a fixed-size block after
+    // the header, so a reader cannot skip one it does not recognize (Large File
+    // extension, "Handshake Flags and Length"). Period clients send zero.
     if flags & !KNOWN_FLAGS != 0 {
         return Err(Error::UnsupportedFlags(flags & !KNOWN_FLAGS));
     }

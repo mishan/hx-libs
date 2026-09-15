@@ -354,9 +354,6 @@ pub mod tag {
     pub const XFERSIZE64: u16 = 0x01f3;
     /// `0x01f4` — Large-Files extension: exact folder item-count companion.
     pub const FOLDER_ITEM_COUNT64: u16 = 0x01f4;
-    /// `0x01fa` — Large-Files upload-resume digest: an eight-byte window
-    /// length followed by a 32-byte SHA-256 digest.
-    pub const PARTIAL_DIGEST: u16 = 0x01fa;
     /// `0x01f5` — Voice-chat extension: SDP blob (UTF-8 text,
     /// RFC 8866). Carried on JOIN replies (server's offer),
     /// HTLS_HDR_VOICE_SDP_OFFER notifications, and HTLC_HDR_VOICE_SDP_ANSWER
@@ -376,6 +373,10 @@ pub mod tag {
     /// reflects the new state to other participants via
     /// VOICE_PARTICIPANTS in a VOICE_ROOM_STATUS notification.
     pub const VOICE_MUTED: u16 = 0x01f8;
+    /// `0x01fa` — Large-Files upload-resume digest: an eight-byte window
+    /// length followed by a 32-byte SHA-256 digest. Source: fogWraith
+    /// Capabilities-Large-File.md, "Resume Digest".
+    pub const PARTIAL_DIGEST: u16 = 0x01fa;
     /// `0x0201` — Inline-media extension: canonical MIME type
     /// (server-supplied on relay; sender's declared type is a hint
     /// only and gets overwritten). Companion to [`CHAT_MEDIA_ID`].
