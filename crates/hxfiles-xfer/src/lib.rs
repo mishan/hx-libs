@@ -1,4 +1,4 @@
-//! Safe, dependency-free Hotline file-transfer wire primitives.
+//! Safe, consumer-neutral Hotline file-transfer wire primitives.
 //!
 //! This crate owns byte shapes, not sockets or filesystems. Callers stream
 //! fork bytes between the prefix and suffix returned by [`ffo::encode`].
@@ -7,6 +7,7 @@
 
 pub mod ffo;
 pub mod htxf;
+pub mod resume_digest;
 pub mod rflt;
 
 /// Checked subtraction used for every resumed fork.

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hxproto", "crates/hxfiles-xfer"]
+members = ["crates/hxproto", "crates/hxfiles-xfer", "crates/hxhfs"]
 
 [workspace.package]
 # Debian trixie ships rustc 1.85. GtkHx supports that toolchain, so shared
