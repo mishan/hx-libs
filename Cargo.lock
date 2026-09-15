@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
+name = "hxfiles-xfer"
+version = "0.1.0"
+
+[[package]]
 name = "hxproto"
 version = "0.1.0"

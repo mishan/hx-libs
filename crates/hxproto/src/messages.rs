@@ -343,12 +343,17 @@ pub mod tag {
     /// When present, callers prefer this over the legacy 32-bit
     /// field (which may have been clamped at `0xFFFFFFFF`).
     pub const FILESIZE64: u16 = 0x01f1;
+    /// `0x01f2` — Large-Files extension: 64-bit file offset companion.
+    /// It follows the clamped legacy offset in download and resume shapes.
+    pub const OFFSET64: u16 = 0x01f2;
     /// `0x01f3` — Large-Files extension: 64-bit transfer size
     /// companion to `HTXF_SIZE` (u64 BE, 8 bytes). Sent on FILE_PUT
     /// when `CAP_LARGE_FILES` was negotiated; receivers in large-
     /// file mode prefer this over the 32-bit legacy field, which is
     /// clamped at `0xFFFFFFFF` when the true size overflows.
     pub const XFERSIZE64: u16 = 0x01f3;
+    /// `0x01f4` — Large-Files extension: exact folder item-count companion.
+    pub const FOLDER_ITEM_COUNT64: u16 = 0x01f4;
     /// `0x01f5` — Voice-chat extension: SDP blob (UTF-8 text,
     /// RFC 8866). Carried on JOIN replies (server's offer),
     /// HTLS_HDR_VOICE_SDP_OFFER notifications, and HTLC_HDR_VOICE_SDP_ANSWER
@@ -368,6 +373,10 @@ pub mod tag {
     /// reflects the new state to other participants via
     /// VOICE_PARTICIPANTS in a VOICE_ROOM_STATUS notification.
     pub const VOICE_MUTED: u16 = 0x01f8;
+    /// `0x01fa` — Large-Files upload-resume digest: an eight-byte window
+    /// length followed by a 32-byte SHA-256 digest. Source: fogWraith
+    /// Capabilities-Large-File.md, "Resume Digest".
+    pub const PARTIAL_DIGEST: u16 = 0x01fa;
     /// `0x0201` — Inline-media extension: canonical MIME type
     /// (server-supplied on relay; sender's declared type is a hint
     /// only and gets overwritten). Companion to [`CHAT_MEDIA_ID`].
@@ -538,5 +547,14 @@ mod tests {
         assert_eq!(tag::CHAT_MEDIA_MAX_FRAMES, 0x0210);
         assert_eq!(tag::CHAT_MEDIA_MAX_DURATION_MS, 0x0211);
         assert_eq!(tag::CHAT_MEDIA_ERROR_CODE, 0x0212);
+    }
+
+    #[test]
+    fn large_file_field_tag_values_match_spec() {
+        assert_eq!(tag::FILESIZE64, 0x01f1);
+        assert_eq!(tag::OFFSET64, 0x01f2);
+        assert_eq!(tag::XFERSIZE64, 0x01f3);
+        assert_eq!(tag::FOLDER_ITEM_COUNT64, 0x01f4);
+        assert_eq!(tag::PARTIAL_DIGEST, 0x01fa);
     }
 }

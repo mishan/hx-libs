@@ -1,0 +1,11 @@
+[package]
+rust-version.workspace = true
+name = "hxfiles-xfer"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Safe Hotline FFO/FILP and HTXF wire codec"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
