@@ -61,6 +61,16 @@ fn appledouble_bytes(descrs: &[Descr], payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// The payload of the first entry with `id` in a serialized container.
+fn dbl_entry(container: &[u8], id: u32) -> &[u8] {
+    let entries = u16::from_be_bytes([container[24], container[25]]) as usize;
+    let descr = (0..entries)
+        .map(|i| Descr::from_bytes(&container[SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * i..]))
+        .find(|d| d.id == id)
+        .expect("entry present");
+    &container[descr.offset as usize..(descr.offset + descr.length) as usize]
+}
+
 // ---------- sidecar path computation ----------
 
 #[test]
@@ -412,23 +422,129 @@ fn appledouble_updates_existing_comment() {
 }
 
 #[test]
-fn appledouble_rejects_comment_relayout_without_mutating_container() {
+fn appledouble_comment_length_change_relayouts_the_container() {
     let cfg = Config {
         fork: Fork::Double,
         ..Config::default()
     };
     let tmp = TmpDir::new();
     let data = tmp.path("comment-relayout.bin");
-    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let mut fi = sample();
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+    let mut write_opts = ResourceOpenOptions::new();
+    write_opts.write(true);
+    let mut resource = resource_open(&cfg, &data, &write_opts).unwrap().unwrap();
+    resource.write_all(b"RSRCBYTES").unwrap();
+    fi.rsrclen = resource.len();
+    drop(resource);
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
+
+    let mut read_opts = ResourceOpenOptions::new();
+    read_opts.read(true);
+    for comment in [&b"short"[..], &b"a considerably longer finder comment"[..]] {
+        fi.comment = comment.to_vec();
+        hfsinfo_write(&cfg, &data, &fi).unwrap();
+
+        let got = hfsinfo_read(&cfg, &data);
+        assert_eq!(got.comment, comment);
+        assert_eq!(got.type_creator, sample().type_creator);
+        assert_eq!(got.create_time, sample().create_time);
+        assert_eq!(got.modify_time, sample().modify_time);
+        assert_eq!(got.rsrclen, 9);
+        let mut fork = Vec::new();
+        resource_open(&cfg, &data, &read_opts)
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut fork)
+            .unwrap();
+        assert_eq!(fork, b"RSRCBYTES");
+    }
+
+    // The fork still ends the container, so it can keep growing.
+    let mut resource = resource_open(&cfg, &data, &write_opts).unwrap().unwrap();
+    resource.seek(SeekFrom::End(0)).unwrap();
+    resource.write_all(b"MORE").unwrap();
+    assert_eq!(resource.len(), 13);
+    drop(resource);
+
+    // No scratch file is left beside the container.
+    let names = std::fs::read_dir(&tmp.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [std::ffi::OsString::from("comment-relayout.bin.fndrinfo")]
+    );
+}
+
+#[test]
+fn appledouble_relayout_keeps_what_it_does_not_own() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("foreign.bin");
     let sidecar = finderinfo_path(&data, b'/').unwrap();
-    let before = std::fs::read(&sidecar).unwrap();
+    // Laid out by someone else: the resource fork mid-container, an entry this
+    // crate does not know after it, and Finder info longer than the eight
+    // bytes hfsinfo_write rewrites.
+    let table_end = (SIZEOF_DBL_HDR + 5 * SIZEOF_HDR_DESCR) as u32;
+    let descrs = [
+        Descr {
+            id: HDR_COMNT,
+            offset: table_end,
+            length: 3,
+        },
+        Descr {
+            id: HDR_RSRC,
+            offset: table_end + 3,
+            length: 4,
+        },
+        Descr {
+            id: 42,
+            offset: table_end + 7,
+            length: 5,
+        },
+        Descr {
+            id: HDR_FINFO,
+            offset: table_end + 12,
+            length: 16,
+        },
+        Descr {
+            id: HDR_DATES,
+            offset: table_end + 28,
+            length: 8,
+        },
+    ];
+    std::fs::write(
+        &sidecar,
+        appledouble_bytes(&descrs, b"oldrsrcFORGNtypecreaEXTENDEDDATESDAT"),
+    )
+    .unwrap();
 
-    let mut changed = sample();
-    changed.comment = b"short".to_vec();
-    let error = hfsinfo_write(&cfg, &data, &changed).unwrap_err();
+    let mut fi = sample();
+    fi.rsrclen = 4;
+    hfsinfo_write(&cfg, &data, &fi).unwrap();
 
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(std::fs::read(sidecar).unwrap(), before);
+    let container = std::fs::read(&sidecar).unwrap();
+    assert_eq!(
+        dbl_entry(&container, HDR_COMNT),
+        sample().comment.as_slice()
+    );
+    assert_eq!(dbl_entry(&container, HDR_RSRC), b"rsrc");
+    assert_eq!(dbl_entry(&container, 42), b"FORGN");
+    assert_eq!(dbl_entry(&container, HDR_FINFO), b"TEXTMSIEEXTENDED");
+    assert_eq!(
+        dbl_entry(&container, HDR_DATES),
+        [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+    );
+    // The resource fork now ends the container.
+    assert_eq!(
+        dbl_entry(&container, HDR_RSRC).as_ptr_range().end,
+        container.as_ptr_range().end
+    );
 }
 
 #[test]
@@ -684,6 +800,65 @@ fn appledouble_terminal_resource_cannot_exceed_u32_length() {
     drop(resource);
 
     assert_eq!(std::fs::metadata(sidecar).unwrap().len(), original_len);
+}
+
+#[test]
+fn appledouble_accepts_empty_entries_wherever_they_point() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("empty-entry.bin");
+    let sidecar = finderinfo_path(&data, b'/').unwrap();
+    let table_end = (SIZEOF_DBL_HDR + 2 * SIZEOF_HDR_DESCR) as u32;
+    let bytes = appledouble_bytes(
+        &[
+            Descr {
+                id: HDR_FINFO,
+                offset: table_end,
+                length: 8,
+            },
+            Descr {
+                id: HDR_RSRC,
+                offset: 0,
+                length: 0,
+            },
+        ],
+        b"TEXTttxt",
+    );
+    std::fs::write(&sidecar, &bytes).unwrap();
+
+    assert_eq!(&type_creator(&cfg, &data), b"TEXTttxt");
+    // An empty fork that does not end the container still cannot grow into it.
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true);
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    assert_eq!(resource.write(b"x").unwrap(), 0);
+    drop(resource);
+    assert_eq!(std::fs::read(&sidecar).unwrap(), bytes);
+}
+
+#[test]
+fn appledouble_resource_open_accepts_create_as_legacy_callers_pass_it() {
+    let cfg = Config {
+        fork: Fork::Double,
+        ..Config::default()
+    };
+    let tmp = TmpDir::new();
+    let data = tmp.path("created.bin");
+    let mut opts = ResourceOpenOptions::new();
+    opts.write(true).create(true).mode(0o600);
+
+    // No container yet: no fork, and nothing is created.
+    assert!(resource_open(&cfg, &data, &opts).unwrap().is_none());
+    assert!(!finderinfo_path(&data, b'/').unwrap().exists());
+
+    // With the container hfsinfo_write makes, the fork opens for writing.
+    hfsinfo_write(&cfg, &data, &sample()).unwrap();
+    let mut resource = resource_open(&cfg, &data, &opts).unwrap().unwrap();
+    resource.write_all(b"fork").unwrap();
+    assert_eq!(resource.len(), 4);
 }
 
 #[test]

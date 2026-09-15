@@ -7,6 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::suffix::suffix_type_creator;
 
@@ -63,10 +64,10 @@ pub(crate) fn with_mode(_opts: &mut OpenOptions, _mode: u32) {}
 pub const MAX_COMMENT: usize = 200;
 
 /// The native path-length ceiling — the upper bound of the C `MAXPATHLEN`
-/// (`src/compat.h` = `PATH_MAX` clamped to 4095). The native API doesn't write
-/// into a fixed C buffer (it returns a heap `PathBuf`), so this is just a
-/// rejection limit; the FFI shim uses the platform-exact `min(PATH_MAX, 4095)`
-/// so it can never overrun a C caller's `char buf[MAXPATHLEN]`.
+/// (`PATH_MAX` clamped to 4095). The native API doesn't write into a fixed C
+/// buffer (it returns a heap `PathBuf`), so this is just a rejection limit. A
+/// consumer's C shim that fills a caller's `char buf[MAXPATHLEN]` has to apply
+/// its platform's own bound.
 pub const MAXPATHLEN: usize = 4095;
 
 /// The AppleDouble / CAP on-disk constants (`hfs.h`).
@@ -266,32 +267,42 @@ fn read_dbl_descrs(f: &mut File) -> io::Result<Option<Vec<Descr>>> {
     let descrs = (0..entries as usize)
         .map(|i| Descr::from_bytes(&tbl[SIZEOF_HDR_DESCR * i..]))
         .collect::<Vec<_>>();
+    validate_descrs(&descrs, file_len)?;
+    Ok(Some(descrs))
+}
 
+/// Check a descriptor table against the container it describes. The known
+/// metadata entries must be long enough for what the readers take from them,
+/// and every non-empty entry must lie after the table, inside the file, and
+/// apart from the others. An empty entry holds no bytes, so where it points is
+/// not checked: `resource_open` lets an empty resource fork grow only when it
+/// sits exactly at the end of the container.
+fn validate_descrs(descrs: &[Descr], file_len: u64) -> io::Result<()> {
+    let table_end = (SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * descrs.len()) as u64;
     let mut ranges = Vec::with_capacity(descrs.len());
-    for d in &descrs {
+    for d in descrs {
         if matches!(d.id, HDR_OLDI | HDR_DATES | HDR_FINFO) && d.length < 8 {
             return Err(invalid_appledouble(
                 "AppleDouble metadata descriptor is too short",
             ));
         }
+        if d.length == 0 {
+            continue;
+        }
         let start = u64::from(d.offset);
-        let end = start
-            .checked_add(u64::from(d.length))
-            .ok_or_else(|| invalid_appledouble("AppleDouble descriptor overflows"))?;
-        if start < table_end as u64 || end > file_len {
+        let end = start + u64::from(d.length);
+        if start < table_end || end > file_len {
             return Err(invalid_appledouble(
                 "AppleDouble descriptor lies outside the container",
             ));
         }
-        if d.length != 0 {
-            ranges.push((start, end));
-        }
+        ranges.push((start, end));
     }
     ranges.sort_unstable();
     if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return Err(invalid_appledouble("AppleDouble descriptors overlap"));
     }
-    Ok(Some(descrs))
+    Ok(())
 }
 
 fn invalid_appledouble(message: &'static str) -> io::Error {
@@ -491,8 +502,8 @@ fn read_dbl_info(f: &mut File, fi: &mut HfsInfo) {
 
 // ---------- Finder info write ----------
 
-/// Build the 300-byte CAP `.fndrinfo` record for `fi`.
-/// Encode one fixed-size CAP Finder-info record without performing I/O.
+/// Encode the fixed-size CAP `.fndrinfo` record for `fi` without performing
+/// I/O.
 pub fn encode_cap_info(fi: &HfsInfo) -> [u8; SIZEOF_CAP_INFO] {
     let mut b = [0u8; SIZEOF_CAP_INFO];
     b[CAP_OFF_MAGIC1] = CAP_MAGIC1;
@@ -510,6 +521,14 @@ pub fn encode_cap_info(fi: &HfsInfo) -> [u8; SIZEOF_CAP_INFO] {
 }
 
 /// Write the Finder metadata for `path` into its sidecar.
+///
+/// For AppleDouble and Netatalk, [`HfsInfo::rsrclen`] becomes the resource
+/// descriptor's length exactly, as in hfs.c, so passing zero forgets a fork
+/// that was written. A new container holds no resource bytes yet, so a fork is
+/// recorded in two steps: write the metadata with `rsrclen` zero, write the
+/// fork through [`resource_open`], then write the metadata again with the
+/// fork's [`ResourceFork::len`]. A comment whose length differs from the stored
+/// one rewrites the container rather than failing.
 pub fn hfsinfo_write(cfg: &Config, path: &Path, fi: &HfsInfo) -> io::Result<()> {
     let info = finderinfo_path(path, cfg.dir_char)?;
     match cfg.fork {
@@ -526,7 +545,6 @@ pub fn hfsinfo_write(cfg: &Config, path: &Path, fi: &HfsInfo) -> io::Result<()> 
 }
 
 fn write_dbl_info(cfg: &Config, info: &Path, fi: &HfsInfo) -> io::Result<()> {
-    const NENTRIES: u16 = 4;
     let comlen = fi.comment.len().min(MAX_COMMENT) as u32;
     let rsrclen: u32 = fi.rsrclen.try_into().map_err(|_| {
         io::Error::new(
@@ -536,35 +554,16 @@ fn write_dbl_info(cfg: &Config, info: &Path, fi: &HfsInfo) -> io::Result<()> {
     })?;
 
     let mut f = open_rw_create(info, cfg.file_perm)?;
-    // Read the existing header, or synthesize the default 4-entry table.
-    let existing = read_dbl_descrs(&mut f)?;
-    let mut descrs: Vec<Descr> = match &existing {
-        Some(d) => d.clone(),
-        None => {
-            let base = (SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * NENTRIES as usize) as u32;
-            vec![
-                Descr {
-                    id: HDR_COMNT,
-                    offset: base,
-                    length: comlen,
-                },
-                Descr {
-                    id: HDR_DATES,
-                    offset: base + comlen,
-                    length: 8,
-                },
-                Descr {
-                    id: HDR_FINFO,
-                    offset: base + comlen + 8,
-                    length: 8,
-                },
-                Descr {
-                    id: HDR_RSRC,
-                    offset: base + comlen + 8 + 8,
-                    length: 0,
-                },
-            ]
+    let Some(mut descrs) = read_dbl_descrs(&mut f)? else {
+        // A fresh container cannot truthfully advertise resource bytes which
+        // have not been written yet.
+        if rsrclen != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "new AppleDouble resource fork has no backing bytes",
+            ));
         }
+        return write_dbl_entries(cfg, &mut f, &fresh_dbl_descrs(comlen), fi);
     };
 
     let mut has_resource = false;
@@ -580,24 +579,55 @@ fn write_dbl_info(cfg: &Config, info: &Path, fi: &HfsInfo) -> io::Result<()> {
             "AppleDouble container has no resource-fork descriptor",
         ));
     }
+    // The replacement resource length must be backed and must not run into
+    // another entry. Check before touching any payload or header byte.
+    validate_descrs(&descrs, f.metadata()?.len())?;
 
-    // Existing entry offsets are fixed. Validate the replacement resource
-    // length, as well as the unchanged metadata ranges, before touching any
-    // payload or header bytes. A fresh container cannot truthfully advertise
-    // resource bytes which have not been written yet; callers create it with a
-    // zero-length descriptor, write through `resource_open`, then record the
-    // resulting length in a second call.
-    if existing.is_some() {
-        validate_dbl_write_layout(&f, &descrs, comlen)?;
-    } else if rsrclen != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "new AppleDouble resource fork has no backing bytes",
-        ));
+    if descrs
+        .iter()
+        .any(|d| d.id == HDR_COMNT && d.length != comlen)
+    {
+        return relayout_dbl(cfg, info, f, &descrs, fi, comlen);
     }
+    write_dbl_entries(cfg, &mut f, &descrs, fi)
+}
 
+/// The table hfs.c writes into a new container: comment, dates and Finder
+/// info packed after it, then an empty resource fork at the end, where it can
+/// grow.
+fn fresh_dbl_descrs(comlen: u32) -> Vec<Descr> {
+    const NENTRIES: usize = 4;
+    let base = (SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * NENTRIES) as u32;
+    vec![
+        Descr {
+            id: HDR_COMNT,
+            offset: base,
+            length: comlen,
+        },
+        Descr {
+            id: HDR_DATES,
+            offset: base + comlen,
+            length: 8,
+        },
+        Descr {
+            id: HDR_FINFO,
+            offset: base + comlen + 8,
+            length: 8,
+        },
+        Descr {
+            id: HDR_RSRC,
+            offset: base + comlen + 8 + 8,
+            length: 0,
+        },
+    ]
+}
+
+/// Write `fi` into the entries `descrs` place, then the header naming them.
+/// The caller has already validated `descrs` against the container.
+fn write_dbl_entries(cfg: &Config, f: &mut File, descrs: &[Descr], fi: &HfsInfo) -> io::Result<()> {
+    let comlen = fi.comment.len().min(MAX_COMMENT);
     // Write each entry's payload at its offset (mirrors hfsinfo_write's loop).
-    for d in descrs.iter_mut() {
+    for d in descrs {
         if f.seek(SeekFrom::Start(d.offset as u64)).is_err() {
             continue;
         }
@@ -609,7 +639,7 @@ fn write_dbl_info(cfg: &Config, info: &Path, fi: &HfsInfo) -> io::Result<()> {
             // never exactly 26 at this point — so the guard is dead and the C
             // always writes the comment.
             HDR_COMNT => {
-                f.write_all(&fi.comment[..comlen as usize])?;
+                f.write_all(&fi.comment[..comlen])?;
             }
             HDR_OLDI | HDR_DATES => {
                 let mut t = [0u8; 8];
@@ -644,58 +674,81 @@ fn write_dbl_info(cfg: &Config, info: &Path, fi: &HfsInfo) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_dbl_write_layout(f: &File, descrs: &[Descr], comlen: u32) -> io::Result<()> {
-    let table_end = (SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * descrs.len()) as u64;
-    let file_len = f.metadata()?.len();
-    let mut ranges = Vec::with_capacity(descrs.len());
-
-    for d in descrs {
-        let required = match d.id {
-            HDR_COMNT => {
-                if d.length != comlen {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "changing an existing AppleDouble comment length requires relayout",
-                    ));
-                }
-                comlen
-            }
-            HDR_OLDI | HDR_DATES | HDR_FINFO => 8,
-            _ => 0,
-        };
-        if d.length < required {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AppleDouble metadata descriptor is too short",
-            ));
+/// Rewrite a container whose comment changes length, since the entries after
+/// it cannot move in place. Entries are packed in table order with the
+/// resource fork last, so it can still grow. Entries this module does not own
+/// are copied byte for byte, and Finder info or dates longer than the eight
+/// bytes written here keep their tails. The rewrite goes to a scratch file
+/// that replaces the container only once it is complete, so a failure leaves
+/// the original untouched. The resource fork is copied as well: that is the
+/// cost of a comment edit, which is rare next to the transfers that write forks.
+fn relayout_dbl(
+    cfg: &Config,
+    info: &Path,
+    mut old: File,
+    descrs: &[Descr],
+    fi: &HfsInfo,
+    comlen: u32,
+) -> io::Result<()> {
+    let mut placed = descrs.to_vec();
+    let resource_last = (0..placed.len())
+        .filter(|&i| placed[i].id != HDR_RSRC)
+        .chain((0..placed.len()).filter(|&i| placed[i].id == HDR_RSRC))
+        .collect::<Vec<_>>();
+    let mut next = (SIZEOF_DBL_HDR + SIZEOF_HDR_DESCR * placed.len()) as u64;
+    for i in resource_last {
+        if placed[i].id == HDR_COMNT {
+            placed[i].length = comlen;
         }
-
-        let start = u64::from(d.offset);
-        let end = start.checked_add(u64::from(d.length)).ok_or_else(|| {
+        placed[i].offset = u32::try_from(next).map_err(|_| {
             io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AppleDouble descriptor overflows",
+                io::ErrorKind::InvalidInput,
+                "relaid-out AppleDouble container exceeds its 32-bit offsets",
             )
         })?;
-        if start < table_end || end > file_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "AppleDouble descriptor lies outside the container",
-            ));
-        }
-        if d.length != 0 {
-            ranges.push((start, end));
-        }
+        next += u64::from(placed[i].length);
     }
 
-    ranges.sort_unstable();
-    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "AppleDouble descriptors overlap",
-        ));
+    let scratch = relayout_path(info);
+    let result = (|| -> io::Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        with_mode(&mut opts, cfg.file_perm);
+        let mut new = opts.open(&scratch)?;
+        for (from, to) in descrs.iter().zip(&placed) {
+            if to.id == HDR_COMNT || to.length == 0 {
+                continue;
+            }
+            old.seek(SeekFrom::Start(u64::from(from.offset)))?;
+            new.seek(SeekFrom::Start(u64::from(to.offset)))?;
+            let copied = io::copy(&mut (&mut old).take(u64::from(to.length)), &mut new)?;
+            if copied != u64::from(to.length) {
+                return Err(invalid_appledouble(
+                    "AppleDouble container shrank during relayout",
+                ));
+            }
+        }
+        write_dbl_entries(cfg, &mut new, &placed, fi)
+    })();
+    drop(old);
+    let result = result.and_then(|()| std::fs::rename(&scratch, info));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&scratch);
     }
-    Ok(())
+    result
+}
+
+/// A scratch sibling for [`relayout_dbl`], unique within this process so two
+/// rewrites never share one. `create_new` keeps it from clobbering anything.
+fn relayout_path(info: &Path) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let mut name = info.as_os_str().to_owned();
+    name.push(format!(
+        ".{}-{}.relayout",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    PathBuf::from(name)
 }
 
 // ---------- comment ----------
@@ -847,9 +900,14 @@ impl ResourceOpenOptions {
         let has_custom_flags = self.custom_flags != 0;
         #[cfg(not(unix))]
         let has_custom_flags = false;
-        if embedded
-            && (self.truncate || self.append || self.create || self.create_new || has_custom_flags)
-        {
+        // `create` is accepted for an embedded fork and not applied. The fork
+        // lives inside a container `hfsinfo_write` makes, so a missing
+        // container means no fork, where hfs.c's O_CREAT left an empty,
+        // unreadable one behind and failed anyway. Callers ported from open(2)
+        // pass O_CREAT for every fork (mhxd and GtkHx both do), so refusing it
+        // would refuse them. Options that could rewrite the whole container
+        // are still refused.
+        if embedded && (self.truncate || self.append || self.create_new || has_custom_flags) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "whole-file or raw open options are not valid for an embedded resource fork",
@@ -862,7 +920,7 @@ impl ResourceOpenOptions {
             .write(self.write || self.append)
             .append(self.append)
             .truncate(self.truncate)
-            .create(self.create)
+            .create(self.create && !embedded)
             .create_new(self.create_new);
         if let Some(mode) = self.mode {
             with_mode(&mut opts, mode);
@@ -933,6 +991,17 @@ impl ResourceFork {
     /// seeks remain fork-relative.
     pub fn into_file(self) -> File {
         self.file
+    }
+
+    /// The fork's length, including bytes written through this handle. An
+    /// AppleDouble descriptor changes only when this is recorded with
+    /// [`hfsinfo_write`].
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
     }
 
     pub fn sync_all(&self) -> io::Result<()> {
@@ -1069,10 +1138,12 @@ pub fn resource_len(cfg: &Config, path: &Path) -> u64 {
 ///
 /// `opts` carries the full open policy. Destructive whole-file options are
 /// rejected for AppleDouble and Netatalk because their resource fork is only
-/// one region of the container. A missing file (when `opts` doesn't
-/// create) yields `None`, not an error (the C returns -1 and the caller skips
-/// the fork).
+/// one region of the container; `create` is accepted there but never makes a
+/// container. A missing file (when `opts` doesn't create) yields `None`, not
+/// an error (the C returns -1 and the caller skips the fork).
 ///
+/// Writing an AppleDouble fork does not record its length. Pass
+/// [`ResourceFork::len`] to [`hfsinfo_write`] once the fork is written.
 pub fn resource_open(
     cfg: &Config,
     path: &Path,
