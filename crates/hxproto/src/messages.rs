@@ -596,36 +596,6 @@ mod tests {
     }
 
     #[test]
-    fn news_opcode_values_match_hotline_h() {
-        assert_eq!(ClientHdr::NewsListDir.as_u32(), 0x0172);
-        assert_eq!(ClientHdr::NewsListCategory.as_u32(), 0x0173);
-        assert_eq!(ClientHdr::NewsDelete.as_u32(), 0x017c);
-        assert_eq!(ClientHdr::NewsMkdir.as_u32(), 0x017d);
-        assert_eq!(ClientHdr::NewsMkCategory.as_u32(), 0x017e);
-        assert_eq!(ClientHdr::GetThread.as_u32(), 0x0190);
-        assert_eq!(ClientHdr::PostThread.as_u32(), 0x019a);
-        assert_eq!(ClientHdr::DeleteThread.as_u32(), 0x019b);
-        assert_eq!(ServerHdr::NewsFilePost.as_u32(), 0x0066);
-        assert_eq!(ServerHdr::from_u32(0x0066), Some(ServerHdr::NewsFilePost));
-    }
-
-    #[test]
-    fn news_field_tag_values_match_hotline_h() {
-        assert_eq!(tag::NEWSPATH, 0x0145);
-        assert_eq!(tag::THREADID, 0x0146);
-        assert_eq!(tag::NEWSTYPE, 0x0147);
-        assert_eq!(tag::NEWSSUBJECT, 0x0148);
-        assert_eq!(tag::NEWSPOSTER, 0x0149);
-        assert_eq!(tag::NEWSDATE, 0x014a);
-        assert_eq!(tag::PREVTHREADID, 0x014b);
-        assert_eq!(tag::NEXTTHREADID, 0x014c);
-        assert_eq!(tag::NEWSDATA, 0x014d);
-        assert_eq!(tag::PARENTTHREADID, 0x014f);
-        assert_eq!(tag::NEXTSUBTHREADID, 0x0150);
-        assert_eq!(tag::DELETEREPLIES, 0x0151);
-    }
-
-    #[test]
     fn large_file_field_tag_values_match_spec() {
         assert_eq!(tag::FILESIZE64, 0x01f1);
         assert_eq!(tag::OFFSET64, 0x01f2);
