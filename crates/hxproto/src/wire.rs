@@ -4,7 +4,7 @@
 //! The Hotline wire format is big-endian on every multi-byte integer. The C
 //! code spells this out with the `HN16` / `HN32` macros (`src/protocol.h`),
 //! which are hand-rolled byte swaps — and the source of at least one
-//! aliasing bug (`HN16(&x, &x)`, see `gtkhx_selfinfo_uid_bug.md`). Rust's
+//! aliasing bug (`HN16(&x, &x)`). Rust's
 //! `u16::from_be_bytes` / `u32::from_be_bytes` are the safe equivalents;
 //! [`Decoder`] wraps them with bounds checking so a short/truncated frame
 //! returns `None` instead of reading past the buffer.

@@ -1,8 +1,8 @@
 //! Emoji <-> `:shortcode:` conversion.
 //!
 //! Hotline servers that don't negotiate `CAP_TEXT_ENCODING` carry text as
-//! Mac Roman, which has no emoji. Rather than let `gtkhx_text_for_wire`
-//! turn every emoji into `?`, we rewrite emoji to their Slack/Discord-style
+//! Mac Roman, which has no emoji. Rather than let the conversion to Mac
+//! Roman turn every emoji into `?`, we rewrite emoji to their Slack/Discord-style
 //! `:joy:` shortcodes on the way out (pure ASCII, survives Mac Roman) and
 //! rewrite known `:shortcode:` tokens back to emoji at display time.
 //!
