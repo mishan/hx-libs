@@ -208,7 +208,7 @@ pub mod tag {
     /// `0x0098` — banner type code (exactly 4 bytes, e.g. "URL ", "JPEG").
     pub const BANNER_TYPE: u16 = 0x0098;
     /// `0x00c9` — file basename (the leaf of a FILE_*-opcode path).
-    /// Already encoded by the C caller via `gtkhx_text_for_wire`.
+    /// Already encoded by the caller in the connection's encoding.
     pub const FILE_NAME: u16 = 0x00c9;
     /// `0x00ca` — directory path component bytes (built by
     /// `path_to_hldir` on the C side; the builders treat it as opaque
@@ -316,14 +316,11 @@ pub mod tag {
     pub const THREADID: u16 = 0x0146;
     /// `0x0147` — 1.5 news article MIME type (e.g. "text/plain").
     pub const NEWSTYPE: u16 = 0x0147;
-    /// `0x0148` — 1.5 news article subject line. Single-line; the C
-    /// `gtkhx_text_for_wire` is called with `is_body = FALSE` so the
-    /// LF→CR send-path normalisation is skipped.
+    /// `0x0148` — 1.5 news article subject line. Single-line, so it gets
+    /// no LF→CR send-path normalisation.
     pub const NEWSSUBJECT: u16 = 0x0148;
-    /// `0x014d` — 1.5 news article body. Multi-line; the C
-    /// `gtkhx_text_for_wire` is called with `is_body = TRUE` so the
-    /// LF→CR send-path normalisation is applied for legacy Mac
-    /// servers. (CR2LF is the *receive*-path inverse — applied in
+    /// `0x014d` — 1.5 news article body. Multi-line, so its line endings
+    /// are normalised LF→CR on the send path for legacy Mac servers. (CR2LF is the *receive*-path inverse — applied in
     /// `parse_news_post` / `parse_news_file`, not here.)
     pub const NEWSDATA: u16 = 0x014d;
     /// `0x014e` — 1.5 news article flags (u32 BE), the SDK's

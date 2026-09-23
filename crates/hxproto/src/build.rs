@@ -22,12 +22,11 @@
 //! failure (buffer too small / NULL pointer). Matches the C builder
 //! return convention so the dispatch site can `if (hc > 0) hlwrite_chunks(...)`.
 //!
-//! ## What stays in C
+//! ## What stays with the caller
 //!
-//! Text conversion (`gtkhx_text_for_wire`, the iconv-backed UTF-8 ↔
-//! Mac Roman path in `src/text_util.c`) is the caller's responsibility —
-//! the builder receives already-encoded body bytes. This keeps the
-//! Rust crate free of GLib iconv dependencies.
+//! Text conversion — UTF-8 to the connection's encoding, Mac Roman or
+//! negotiated UTF-8 — is the caller's responsibility: the builder
+//! receives already-encoded body bytes.
 
 use crate::messages::tag;
 
@@ -95,7 +94,7 @@ pub struct ChatRequest<'a> {
     /// Style bitmap (mIRC-ish flags). Always emitted as a u16 chunk.
     pub style: u16,
     /// Already-encoded body bytes (UTF-8 if CAP_TEXT_ENCODING was
-    /// negotiated, Mac Roman otherwise — see `gtkhx_text_for_wire`).
+    /// negotiated, Mac Roman otherwise).
     /// Empty bodies are legal and emit a zero-length CHAT chunk.
     pub body: &'a [u8],
 }
@@ -488,9 +487,7 @@ pub fn build_history_entry(
 // ---- HTLC_HDR_AGREEMENTAGREE ------------------------------------------
 //
 // Wire shape: ICON + NAME + OPTIONS, all three mandatory (Mobius panics
-// without OPTIONS). The C call sites (network.c::hx_send_agreement_agree
-// and the integration harness) reach this through the
-// `gtkhx_proto_build_agreement_agree_chunks` FFI shim.
+// without OPTIONS).
 
 /// Request data for [`build_agreement_agree_chunks`].
 pub struct AgreementAgreeRequest<'a> {
@@ -973,7 +970,7 @@ pub fn build_news_mkdir_chunks(req: &NewsMakeDirRequest<'_>, chunks: &mut [HxChu
 // CATEGORY (byte payloads), NEWSFLAGS (u32, gtkhx always sends 0).
 //
 // All the variable-length payloads (mime type, subject, body, category
-// name) are pre-encoded by the C caller via `gtkhx_text_for_wire`;
+// name) are pre-encoded by the caller in the connection's encoding;
 // the builders treat them as opaque byte buffers — same discipline as
 // chat / msg / agreement-agree.
 
@@ -1075,9 +1072,7 @@ pub struct NewsMakeCategoryRequest<'a> {
 /// CATEGORY. 2 chunks; the `chunks` slice must have at least 2 slots.
 /// No scratch needed. Returns 2 on success, 0 on validation failure
 /// (`chunks.len() < 2`, `path.len() > u16::MAX`, or `name.len() >
-/// u16::MAX`). NULL-pointer rejects live in the FFI shim
-/// `gtkhx_proto_build_news_mkcat_chunks` — at the Rust level the
-/// arguments are slices and a reference, so they can't be null.
+/// u16::MAX`).
 pub fn build_news_mkcat_chunks(req: &NewsMakeCategoryRequest<'_>, chunks: &mut [HxChunk]) -> usize {
     if chunks.len() < 2 || req.path.len() > u16::MAX as usize || req.name.len() > u16::MAX as usize
     {
@@ -1117,15 +1112,11 @@ pub struct NewsPostThreadRequest<'a> {
     pub flags: u32,
     /// MIME type bytes (the C call site hard-codes "text/plain").
     pub mime_type: &'a [u8],
-    /// Single-line subject bytes, already encoded by the caller's
-    /// `gtkhx_text_for_wire` (called with `is_body = FALSE` so the
-    /// LF→CR send-path normalisation is skipped — subjects don't
-    /// carry line endings).
+    /// Single-line subject bytes, already encoded by the caller. No
+    /// LF→CR normalisation: subjects don't carry line endings.
     pub subject: &'a [u8],
-    /// Article body bytes, already encoded by the caller's
-    /// `gtkhx_text_for_wire` (called with `is_body = TRUE` so the
-    /// LF→CR send-path normalisation is applied for legacy Mac
-    /// servers).
+    /// Article body bytes, already encoded by the caller, with line
+    /// endings normalised LF→CR for legacy Mac servers.
     pub text: &'a [u8],
     /// `THREADID` (326, `myField_NewsArtID`) — the article the new
     /// post replies to, 0 for a top-level post. This is the field that
@@ -1228,9 +1219,8 @@ pub fn build_news_post_thread_chunks(
 //                        from "file at the root" (FILE_NAME alone).
 //
 // All variable-length payloads (file name, directory path) are
-// pre-encoded by the C caller: gtkhx_text_for_wire handles UTF-8 /
-// Mac Roman conversion for the filename; path_to_hldir builds the DIR
-// chunk bytes verbatim. The Rust crate treats both as opaque byte
+// pre-encoded by the caller: the filename in the connection's
+// encoding, the DIR chunk bytes built verbatim. The Rust crate treats both as opaque byte
 // buffers.
 
 /// Build the chunk array for `HTLC_HDR_FILE_MKDIR` — single
@@ -1984,8 +1974,7 @@ pub const MAX_PACK_CHUNKS: usize = 64;
 /// u16::MAX` — are NOT re-checked here. Callers that use this value to
 /// pre-size a buffer should either (a) also call `pack_message` and
 /// handle its `None`, or (b) range-check the slice themselves before
-/// calling this. The FFI shim at `gtkhx_proto_pack_message_size` does
-/// the latter and returns 0 to signal a rejected request.
+/// calling this.
 pub fn pack_message_size(chunks: &[PackChunk<'_>]) -> usize {
     let mut n = crate::HL_HDR_LEN;
     for c in chunks {
@@ -2004,10 +1993,8 @@ pub fn pack_message_size(chunks: &[PackChunk<'_>]) -> usize {
 /// C `hlpack` path produce, so a header packed here is byte-for-byte identical.
 ///
 /// This is the single wire-header encoder: [`pack_message`] calls it for the
-/// header portion, and the receive-side bridge calls it (via
-/// `gtkhx_proto_pack_header`) to reconstruct the header of a frame the Rust
-/// actor already parsed, so the C handlers can decode it back out of
-/// `htlc->in`.
+/// header portion, and a caller that already parsed a frame can use it to
+/// reconstruct that frame's header.
 ///
 /// # Panics
 /// Panics if `out` is shorter than [`HL_HDR_LEN`](crate::HL_HDR_LEN) (22), or if

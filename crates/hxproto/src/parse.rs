@@ -432,9 +432,7 @@ pub fn parse_chat_subject(buf: &[u8], len: usize, max_subject: usize) -> ChatSub
 /// Parse a `HTLS_DATA_TASKERROR` chunk out of an error TASK reply.
 /// Returns `Some(bytes)` containing the CR2LF + `strip_ansi`-sanitised
 /// error string (capped at `max_len` bytes), or `None` when no
-/// `TASK_ERROR` chunk is present in the body. The C-facing wrapper
-/// (`gtkhx_proto_parse_task_error` in `ffi.rs`) is where the
-/// "write into caller buffer / SIZE_MAX sentinel" surface lives.
+/// `TASK_ERROR` chunk is present in the body.
 pub fn parse_task_error(buf: &[u8], len: usize, max_len: usize) -> Option<Vec<u8>> {
     for chunk in ChunkIter::over_message(buf, len) {
         if chunk.tag == tag::TASK_ERROR {

@@ -32,14 +32,12 @@ const MAC_ROMAN_HIGH: [u32; 128] = [
     0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7,
 ];
 
-/// Convert wire bytes to a UTF-8 `String`, mirroring `gtkhx_text_to_utf8`.
+/// Convert wire bytes to a UTF-8 `String`.
 ///
-/// Behaviour matches the C function exactly:
-/// 1. If `bytes` is already valid UTF-8, it is returned verbatim (the C
-///    code calls `g_utf8_validate` first and passes valid input through).
+/// 1. If `bytes` is already valid UTF-8, it is returned verbatim.
 /// 2. Otherwise every byte is mapped through the Mac Roman table (ASCII
 ///    identity below 0x80, [`MAC_ROMAN_HIGH`] at and above). This always
-///    succeeds, so there is no lossy `g_utf8_make_valid` fallback to model.
+///    succeeds, so there is no lossy fallback.
 pub fn to_utf8(bytes: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_owned();
@@ -122,14 +120,11 @@ pub fn to_utf8_into(bytes: &[u8], dst: &mut [u8]) -> usize {
     written
 }
 
-/// Convert UTF-8 text to Mac Roman wire bytes, mirroring the legacy-mode
-/// branch of `gtkhx_text_for_wire`. Characters outside the Mac Roman
-/// repertoire are replaced with `?` (the same fallback the C code passes to
-/// `g_convert_with_fallback`).
+/// Convert UTF-8 text to Mac Roman wire bytes. Characters outside the Mac
+/// Roman repertoire are replaced with `?`.
 ///
-/// This does **not** perform the LF→CR body normalisation the C function
-/// does for `is_body` fields; that stays a caller concern for now and moves
-/// into the typed `build_*` serializers as `commands.c` is ported.
+/// This does **not** perform LF→CR body normalisation; that is the caller's
+/// concern.
 pub fn from_utf8(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     for ch in text.chars() {
