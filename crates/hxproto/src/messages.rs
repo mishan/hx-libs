@@ -53,10 +53,29 @@ pub enum ClientHdr {
     AccountRead = 0x0000_0160,
     AccountModify = 0x0000_0161,
     MsgBroadcast = 0x0000_0163,
+    /// 1.5 threaded news: list a bundle (`HTLC_HDR_NEWS_LISTDIR`).
+    /// Request is an optional [`tag::NEWSPATH`]; absent is the root.
+    NewsListDir = 0x0000_0172,
+    /// 1.5 threaded news: list a category's articles
+    /// (`HTLC_HDR_NEWS_LISTCATEGORY`). Reply is one [`tag::CATLIST`].
+    NewsListCategory = 0x0000_0173,
+    /// 1.5 threaded news: delete the bundle or category a
+    /// [`tag::NEWSPATH`] names (`HTLC_HDR_NEWS_DELETE`).
+    NewsDelete = 0x0000_017c,
+    /// 1.5 threaded news: make a bundle (`HTLC_HDR_NEWS_MKDIR`) —
+    /// [`tag::NEWSPATH`] is the parent, [`tag::FILE_NAME`] the new name.
+    NewsMkdir = 0x0000_017d,
+    /// 1.5 threaded news: make a category (`HTLC_HDR_NEWS_MKCATEGORY`) —
+    /// [`tag::NEWSPATH`] is the parent, [`tag::CATEGORY`] the new name.
+    NewsMkCategory = 0x0000_017e,
     GetThread = 0x0000_0190,
     /// 700 — chat-history extension request (fogWraith Capabilities-Chat-History).
     GetChatHistory = 0x0000_02bc,
     PostThread = 0x0000_019a,
+    /// 1.5 threaded news: delete an article (`HTLC_HDR_NEWS_DELETETHREAD`)
+    /// — [`tag::NEWSPATH`], [`tag::THREADID`], and optionally
+    /// [`tag::DELETEREPLIES`].
+    DeleteThread = 0x0000_019b,
     Ping = 0x0000_01f4,
     /// Voice-chat extension (fogWraith `Capabilities-Voice.md`).
     /// Client requests to join voice in a chat room. Reply carries the
@@ -97,6 +116,10 @@ pub enum ServerHdr {
     // NB: these match hotline.h — MSG is 0x68, CHAT is 0x6a. (They were
     // previously swapped here; the values are unused so nothing routed on them.
     // Routing lives in dispatch::route, keyed off its own hotline.h constants.)
+    /// 1.2 flat news: one new entry, pushed to every reader so a client
+    /// can prepend it to the news it already shows
+    /// (`HTLS_HDR_NEWSFILE_POST`). The entry rides in [`tag::NEWS`].
+    NewsFilePost = 0x0000_0066,
     Msg = 0x0000_0068,
     Chat = 0x0000_006a,
     Queue = 0x0000_00d3,
@@ -128,6 +151,7 @@ impl ServerHdr {
     pub fn from_u32(v: u32) -> Option<ServerHdr> {
         use ServerHdr::*;
         Some(match v {
+            0x0000_0066 => NewsFilePost,
             0x0000_0068 => Msg,
             0x0000_006a => Chat,
             0x0000_00d3 => Queue,
@@ -338,6 +362,28 @@ pub mod tag {
     /// Backwards-compatible name for [`NEWSFLAGS`]. The SDK field is article
     /// flags, not a parent-thread id; new code should use the corrected name.
     pub const PARENTTHREAD: u16 = NEWSFLAGS;
+    /// `0x014f` — 1.5 news article's parent (u32 BE), in a GETTHREAD
+    /// reply. 0 for a thread starter. A post names its parent in
+    /// [`THREADID`] instead, and this is not [`PARENTTHREAD`], which is
+    /// the old name of [`NEWSFLAGS`].
+    pub const PARENTTHREADID: u16 = 0x014f;
+    /// `0x0149` — 1.5 news article poster, in a GETTHREAD reply.
+    pub const NEWSPOSTER: u16 = 0x0149;
+    /// `0x014a` — 1.5 news article date (the 8-byte Hotline date), in a
+    /// GETTHREAD reply.
+    pub const NEWSDATE: u16 = 0x014a;
+    /// `0x014b` — the previous article in the category (u32 BE, 0 for
+    /// none), in a GETTHREAD reply.
+    pub const PREVTHREADID: u16 = 0x014b;
+    /// `0x014c` — the next article in the category (u32 BE, 0 for none),
+    /// in a GETTHREAD reply.
+    pub const NEXTTHREADID: u16 = 0x014c;
+    /// `0x0150` — the article's first reply (u32 BE, 0 for none), in a
+    /// GETTHREAD reply.
+    pub const NEXTSUBTHREADID: u16 = 0x0150;
+    /// `0x0151` — on DELETETHREAD, nonzero to delete the article's
+    /// replies with it.
+    pub const DELETEREPLIES: u16 = 0x0151;
     /// `0x01f1` — Large-Files extension: 64-bit file size companion
     /// to `FILE_SIZE` on FILE_GETINFO replies (u64 BE, 8 bytes).
     /// When present, callers prefer this over the legacy 32-bit
@@ -547,6 +593,36 @@ mod tests {
         assert_eq!(tag::CHAT_MEDIA_MAX_FRAMES, 0x0210);
         assert_eq!(tag::CHAT_MEDIA_MAX_DURATION_MS, 0x0211);
         assert_eq!(tag::CHAT_MEDIA_ERROR_CODE, 0x0212);
+    }
+
+    #[test]
+    fn news_opcode_values_match_hotline_h() {
+        assert_eq!(ClientHdr::NewsListDir.as_u32(), 0x0172);
+        assert_eq!(ClientHdr::NewsListCategory.as_u32(), 0x0173);
+        assert_eq!(ClientHdr::NewsDelete.as_u32(), 0x017c);
+        assert_eq!(ClientHdr::NewsMkdir.as_u32(), 0x017d);
+        assert_eq!(ClientHdr::NewsMkCategory.as_u32(), 0x017e);
+        assert_eq!(ClientHdr::GetThread.as_u32(), 0x0190);
+        assert_eq!(ClientHdr::PostThread.as_u32(), 0x019a);
+        assert_eq!(ClientHdr::DeleteThread.as_u32(), 0x019b);
+        assert_eq!(ServerHdr::NewsFilePost.as_u32(), 0x0066);
+        assert_eq!(ServerHdr::from_u32(0x0066), Some(ServerHdr::NewsFilePost));
+    }
+
+    #[test]
+    fn news_field_tag_values_match_hotline_h() {
+        assert_eq!(tag::NEWSPATH, 0x0145);
+        assert_eq!(tag::THREADID, 0x0146);
+        assert_eq!(tag::NEWSTYPE, 0x0147);
+        assert_eq!(tag::NEWSSUBJECT, 0x0148);
+        assert_eq!(tag::NEWSPOSTER, 0x0149);
+        assert_eq!(tag::NEWSDATE, 0x014a);
+        assert_eq!(tag::PREVTHREADID, 0x014b);
+        assert_eq!(tag::NEXTTHREADID, 0x014c);
+        assert_eq!(tag::NEWSDATA, 0x014d);
+        assert_eq!(tag::PARENTTHREADID, 0x014f);
+        assert_eq!(tag::NEXTSUBTHREADID, 0x0150);
+        assert_eq!(tag::DELETEREPLIES, 0x0151);
     }
 
     #[test]
