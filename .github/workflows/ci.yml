@@ -1,0 +1,58 @@
+# hx-libs CI: format, clippy with warnings denied, and the test suite on
+# stable, plus a build and test run on the MSRV. The crates here are
+# consumed by GtkHx and hxd-ng at pinned revisions, so what this checks is
+# that a revision is fit to be pinned.
+
+name: CI
+
+# `push` is scoped to main so a branch with an open PR is not built twice
+# for the same commit: `pull_request` covers every topic branch, and the
+# push build of main is what says a merge landed green.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per ref at a time; a re-pushed branch cancels its stale run.
+# main is exempt, since its build is the record of a merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  # `rust-version` is GtkHx's floor, Debian stable's rustc, and it only
+  # means something if a build on that toolchain is what checks it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.85
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tests on the MSRV
+        run: cargo test --workspace --locked
