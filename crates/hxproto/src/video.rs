@@ -101,6 +101,17 @@ impl Publication {
     pub fn is_paused(&self) -> bool {
         self.flags & FLAG_PAUSED != 0
     }
+
+    /// Encode as one `DATA_VIDEO_PUBLISHERS` entry. The field is these
+    /// entries back to back; a server builds it by concatenation.
+    pub fn to_bytes(&self) -> [u8; PUBLISHER_STRIDE] {
+        let mut b = [0u8; PUBLISHER_STRIDE];
+        b[0..2].copy_from_slice(&self.user_id.to_be_bytes());
+        b[2..4].copy_from_slice(&self.kind.wire().to_be_bytes());
+        b[4..6].copy_from_slice(&self.flags.to_be_bytes());
+        b[6..8].copy_from_slice(&self.codec_id.to_be_bytes());
+        b
+    }
 }
 
 /// Walk a `DATA_VIDEO_PUBLISHERS` blob: eight-byte entries,
@@ -374,9 +385,9 @@ mod tests {
     }
 
     #[test]
-    fn publishers_blob_matches_hxd_ng_bytes() {
-        // The exact bytes hxd-ng's publishers_payload test pins: uid 12's
-        // live camera and paused screen, both VP8.
+    fn publishers_blob_matches_the_spec_bytes() {
+        // uid 12's live camera and paused screen, both VP8. Byte for
+        // byte, so a change to either direction has to be deliberate.
         let blob = [0, 12, 0, 1, 0, 0, 0, 0, 0, 12, 0, 2, 0, 1, 0, 0];
         let ps: Vec<_> = parse_video_publishers(&blob).collect();
         assert_eq!(ps.len(), 2);
@@ -386,6 +397,8 @@ mod tests {
         assert_eq!(ps[1].kind, VideoKind::Screen);
         assert!(ps[1].is_paused());
         assert_eq!(ps[1].codec_id, CODEC_VP8);
+        let back: Vec<u8> = ps.iter().flat_map(|p| p.to_bytes()).collect();
+        assert_eq!(back, blob);
     }
 
     #[test]
