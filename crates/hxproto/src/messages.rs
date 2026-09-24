@@ -92,6 +92,18 @@ pub enum ClientHdr {
     VoiceIce = 0x0000_025c,
     /// Voice-chat extension: client toggles mute on a room.
     VoiceMute = 0x0000_025e,
+    /// Video extension (hxd-ng `capabilities-video.md`): begin publishing
+    /// a stream of the [`tag::VIDEO_KIND`] named. The reply carries no
+    /// SDP; the offer adding the send section follows as a 602.
+    VideoStart = 0x0000_025f,
+    /// Video extension: end a publication and release its slot. Omitting
+    /// [`tag::VIDEO_KIND`] stops every publication in the room.
+    VideoStop = 0x0000_0260,
+    /// Video extension: pause or resume a publication. No renegotiation.
+    VideoState = 0x0000_0261,
+    /// Video extension: the complete set of streams this client wishes to
+    /// receive, in [`tag::VIDEO_SUBSCRIPTIONS`]. Not a delta.
+    VideoSubscribe = 0x0000_0262,
     /// Inline-media extension (fogWraith
     /// `Capabilities-Inline-Media.md`): client uploads image bytes
     /// to the server. Single-shot when the bytes fit in one chunk,
@@ -142,6 +154,9 @@ pub enum ServerHdr {
     /// user mutes/unmutes, or when a participant joins/leaves voice.
     /// Notification — task id `0`, no reply expected.
     VoiceRoomStatus = 0x0000_025d,
+    /// Video extension: the room's complete publication list, sent on
+    /// every start, stop, pause and resume. Notification — task id `0`.
+    VideoStatus = 0x0000_0263,
     Task = 0x0001_0000,
 }
 
@@ -163,6 +178,7 @@ impl ServerHdr {
             0x0000_025a => VoiceSdpOffer,
             0x0000_025c => VoiceIce,
             0x0000_025d => VoiceRoomStatus,
+            0x0000_0263 => VideoStatus,
             0x0001_0000 => Task,
             _ => return None,
         })
@@ -495,6 +511,22 @@ pub mod tag {
     /// Table). All big-endian. Parser is
     /// [`crate::voice::parse_voice_participants`].
     pub const VOICE_PARTICIPANTS: u16 = 0x01f9;
+    /// `0x0220` — Video extension: stream kind (u16 BE); see
+    /// [`crate::video::VideoKind`]. `0x0220`–`0x023f` belong to video.
+    pub const VIDEO_KIND: u16 = 0x0220;
+    /// `0x0221` — Video extension: paused state (u16 BE), 0 live, 1 paused.
+    pub const VIDEO_PAUSED: u16 = 0x0221;
+    /// `0x0222` — Video extension: packed publication list, eight bytes an
+    /// entry. See [`crate::video::parse_video_publishers`].
+    pub const VIDEO_PUBLISHERS: u16 = 0x0222;
+    /// `0x0223` — Video extension: the room's video codec name (ASCII).
+    pub const VIDEO_CODEC: u16 = 0x0223;
+    /// `0x0224` — Video extension: the server's ceiling for one stream
+    /// kind. Repeated in the LOGIN reply, once per kind.
+    pub const VIDEO_LIMITS: u16 = 0x0224;
+    /// `0x0225` — Video extension: packed desired-receive set, four bytes
+    /// an entry.
+    pub const VIDEO_SUBSCRIPTIONS: u16 = 0x0225;
     /// `0x0500` — Colored-Nicknames extension: 0x00RRGGBB (u32 BE).
     pub const COLOR: u16 = 0x0500;
 
@@ -558,6 +590,26 @@ mod tests {
         assert_eq!(tag::VOICE_CODEC, 0x01f7);
         assert_eq!(tag::VOICE_MUTED, 0x01f8);
         assert_eq!(tag::VOICE_PARTICIPANTS, 0x01f9);
+    }
+
+    #[test]
+    fn video_opcode_values_continue_the_voice_block() {
+        assert_eq!(ClientHdr::VideoStart.as_u32(), 607);
+        assert_eq!(ClientHdr::VideoStop.as_u32(), 608);
+        assert_eq!(ClientHdr::VideoState.as_u32(), 609);
+        assert_eq!(ClientHdr::VideoSubscribe.as_u32(), 610);
+        assert_eq!(ServerHdr::VideoStatus.as_u32(), 611);
+        assert_eq!(ServerHdr::from_u32(611), Some(ServerHdr::VideoStatus));
+    }
+
+    #[test]
+    fn video_field_tag_values_match_spec() {
+        assert_eq!(tag::VIDEO_KIND, 0x0220);
+        assert_eq!(tag::VIDEO_PAUSED, 0x0221);
+        assert_eq!(tag::VIDEO_PUBLISHERS, 0x0222);
+        assert_eq!(tag::VIDEO_CODEC, 0x0223);
+        assert_eq!(tag::VIDEO_LIMITS, 0x0224);
+        assert_eq!(tag::VIDEO_SUBSCRIPTIONS, 0x0225);
     }
 
     #[test]

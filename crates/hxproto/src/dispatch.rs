@@ -43,6 +43,9 @@ pub enum HandlerKind {
     /// landing spot for voice opcodes in a `-Dvoice=disabled` build (the C
     /// kind→handler switch has no case for the voice kinds there).
     Unknown = 17,
+    /// Video extension 611. After [`HandlerKind::Unknown`] so the existing
+    /// discriminants, and the C mirror of them, stay where they were.
+    VideoStatus = 18,
 }
 
 // Opcode constants — mirror src/hotline.h. (ServerHdr in messages.rs covers a
@@ -66,6 +69,7 @@ const HTLS_HDR_MSG_BROADCAST: u32 = 0x0000_0163;
 const HTLS_HDR_VOICE_SDP_OFFER: u32 = 0x0000_025a;
 const HTLS_HDR_VOICE_ICE: u32 = 0x0000_025c;
 const HTLS_HDR_VOICE_ROOM_STATUS: u32 = 0x0000_025d;
+const HTLS_HDR_VIDEO_STATUS: u32 = 0x0000_0263;
 const HTLS_HDR_ICON_CHANGE: u32 = 0x0000_0748;
 const HTLS_HDR_TASK: u32 = 0x0001_0000;
 
@@ -102,6 +106,7 @@ pub fn route(opcode: u32) -> HandlerKind {
         HTLS_HDR_VOICE_SDP_OFFER => VoiceSdpOffer,
         HTLS_HDR_VOICE_ICE => VoiceIce,
         HTLS_HDR_VOICE_ROOM_STATUS => VoiceRoomStatus,
+        HTLS_HDR_VIDEO_STATUS => VideoStatus,
         HTLS_HDR_ICON_CHANGE => IconChange,
         _ => Unknown,
     }
@@ -140,6 +145,7 @@ mod tests {
             (0x0000_025a, VoiceSdpOffer),
             (0x0000_025c, VoiceIce),
             (0x0000_025d, VoiceRoomStatus),
+            (0x0000_0263, VideoStatus),
             (0x0000_0748, IconChange),
         ];
         for &(opcode, kind) in table {
