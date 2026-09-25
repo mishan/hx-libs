@@ -336,7 +336,11 @@ pub fn parse_video_reply(buf: &[u8], len: usize) -> VideoReply<'_> {
     for chunk in ChunkIter::over_message(buf, len) {
         match chunk.tag {
             tag::CHAT_ID => out.cid = chunk.as_uint(),
-            tag::VIDEO_KIND => out.kind = Some(chunk.as_uint() as u16),
+            // Exactly two bytes: a wider field is malformed, and reading
+            // its low word would turn `00 01 00 01` into a camera.
+            tag::VIDEO_KIND => {
+                out.kind = <[u8; 2]>::try_from(chunk.data).ok().map(u16::from_be_bytes)
+            }
             tag::VIDEO_CODEC => out.codec = Some(chunk.data),
             tag::VIDEO_PUBLISHERS => out.publishers = Some(chunk.data),
             _ => {}
@@ -535,5 +539,17 @@ mod tests {
         assert_eq!(r.codec, Some(&b"VP8"[..]));
         assert_eq!(parse_video_publishers(r.publishers.unwrap()).count(), 1);
         assert_eq!(r.kind, None);
+    }
+
+    #[test]
+    fn reply_kind_must_be_two_bytes() {
+        let mut body = Vec::new();
+        body.extend(chunk(tag::VIDEO_KIND, &[0, 2]));
+        let buf = frame(&body);
+        assert_eq!(parse_video_reply(&buf, buf.len()).kind, Some(2));
+        let mut body = Vec::new();
+        body.extend(chunk(tag::VIDEO_KIND, &[0, 1, 0, 1]));
+        let buf = frame(&body);
+        assert_eq!(parse_video_reply(&buf, buf.len()).kind, None);
     }
 }
