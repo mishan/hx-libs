@@ -218,6 +218,8 @@ pub const LOGIN_SEEN_MEDIA_MAX_FRAMES: u32 = 1 << 8;
 pub const LOGIN_SEEN_MEDIA_MAX_DURATION_MS: u32 = 1 << 9;
 pub const LOGIN_SEEN_HISTORY_MAX_MSGS: u32 = 1 << 10;
 pub const LOGIN_SEEN_HISTORY_MAX_DAYS: u32 = 1 << 11;
+pub const LOGIN_SEEN_VIDEO_CAMERA_LIMITS: u32 = 1 << 12;
+pub const LOGIN_SEEN_VIDEO_SCREEN_LIMITS: u32 = 1 << 13;
 
 /// Parsed `HTLS_HDR_TASK` LOGIN reply. Every field is independently optional on
 /// the wire (a 1.0/1.2 server sends almost none of them); `seen` says which were
@@ -239,6 +241,10 @@ pub struct LoginInfo {
     pub media_max_duration_ms: u32,
     pub history_max_msgs: u32,
     pub history_max_days: u32,
+    /// The camera's `DATA_VIDEO_LIMITS`, when the server sent one.
+    pub video_camera: Option<crate::video::Limits>,
+    /// The screen share's `DATA_VIDEO_LIMITS`, when the server sent one.
+    pub video_screen: Option<crate::video::Limits>,
 }
 
 /// Parse a LOGIN task reply. The server name (if present) is CR2LF'd +
@@ -333,6 +339,20 @@ pub fn parse_login(buf: &[u8], len: usize, servername: &mut [u8]) -> (LoginInfo,
                     out.seen |= LOGIN_SEEN_HISTORY_MAX_DAYS;
                 }
             }
+            // Repeated, once per kind: each lands in its own slot, so a
+            // server that sends only the camera's never leaves a screen
+            // ceiling behind. A malformed or unknown-kind field is skipped.
+            tag::VIDEO_LIMITS => match crate::video::Limits::parse(chunk.data) {
+                Some(l) if l.kind == crate::video::VideoKind::Camera => {
+                    out.video_camera = Some(l);
+                    out.seen |= LOGIN_SEEN_VIDEO_CAMERA_LIMITS;
+                }
+                Some(l) => {
+                    out.video_screen = Some(l);
+                    out.seen |= LOGIN_SEEN_VIDEO_SCREEN_LIMITS;
+                }
+                None => {}
+            },
             _ => {}
         }
     }
@@ -2715,6 +2735,53 @@ mod tests {
         let (li, _) = parse_login(&m, m.len(), &mut sn);
         assert_eq!(li.seen, 0);
         assert_eq!(li.media_max_bytes, 0);
+    }
+
+    #[test]
+    fn login_video_limits_land_per_kind() {
+        use crate::video::{Limits, VideoKind};
+        let cam = Limits {
+            kind: VideoKind::Camera,
+            max_width: 1280,
+            max_height: 720,
+            max_fps: 30,
+            max_bitrate: 1_500_000,
+            max_per_room: 8,
+        };
+        let scr = Limits {
+            kind: VideoKind::Screen,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 15,
+            max_bitrate: 2_500_000,
+            max_per_room: 1,
+        };
+        let mut body = Vec::new();
+        body.extend(chunk(tag::VIDEO_LIMITS, &cam.to_bytes()));
+        body.extend(chunk(tag::VIDEO_LIMITS, &scr.to_bytes()));
+        // A short field and a kind-0 field are both skipped.
+        body.extend(chunk(tag::VIDEO_LIMITS, &[0, 1, 0, 2]));
+        body.extend(chunk(tag::VIDEO_LIMITS, &[0u8; 16]));
+        let m = msg(0x0000_0000, 1, 0, &body);
+        let mut sn = [0u8; 64];
+        let (li, _) = parse_login(&m, m.len(), &mut sn);
+        assert_eq!(
+            li.seen,
+            LOGIN_SEEN_VIDEO_CAMERA_LIMITS | LOGIN_SEEN_VIDEO_SCREEN_LIMITS
+        );
+        assert_eq!(li.video_camera, Some(cam));
+        assert_eq!(li.video_screen, Some(scr));
+
+        // Camera only: the screen slot stays empty rather than inheriting.
+        let m = msg(
+            0x0000_0000,
+            1,
+            0,
+            &chunk(tag::VIDEO_LIMITS, &cam.to_bytes()),
+        );
+        let (li, _) = parse_login(&m, m.len(), &mut sn);
+        assert_eq!(li.seen, LOGIN_SEEN_VIDEO_CAMERA_LIMITS);
+        assert_eq!(li.video_screen, None);
     }
 
     #[test]

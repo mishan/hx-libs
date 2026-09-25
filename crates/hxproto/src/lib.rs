@@ -46,6 +46,7 @@ pub mod parse;
 pub mod sanitize;
 pub mod text;
 pub mod user_change;
+pub mod video;
 pub mod voice;
 pub mod wire;
 

@@ -245,34 +245,52 @@ pub fn parse_voice_participants(blob: &[u8]) -> impl Iterator<Item = Participant
 }
 
 /// Result of parsing an SDP `a=mid:` label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The voice extension defines `send` and `user-{UID}`; the video
+/// extension (hxd-ng `capabilities-video.md`) adds a camera and a screen
+/// pair. The screen-audio prefixes `sca-send` / `sca-user-` are reserved
+/// by that spec and not defined, so they parse as `None` like any other
+/// mid a client must mirror without mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MidLabel {
     /// `a=mid:send` — the local client's send track.
     Send,
     /// `a=mid:user-{UID}` — receive track for the user with the given
     /// id. `0` is reserved by the spec and rejected by the parser.
     User(u16),
+    /// `a=mid:cam-send` — the local client's own camera.
+    CamSend,
+    /// `a=mid:scr-send` — the local client's own screen share.
+    ScrSend,
+    /// `a=mid:cam-user-{UID}` — camera video from that user.
+    CamUser(u16),
+    /// `a=mid:scr-user-{UID}` — screen-share video from that user.
+    ScrUser(u16),
 }
 
-/// Parse an SDP `a=mid:` label value.
-///
-/// Returns `Some(MidLabel)` for the well-formed shapes (`send` /
-/// `user-N`), `None` for anything else. The strict shape matches the
-/// spec:
-///
-/// - `user-N` where N is `1..=65535` in decimal, **no leading zeros**.
-///   `user-05` is rejected — the spec explicitly forbids leading zeros.
-/// - `user-0` is rejected — uid 0 is reserved by the Hotline base
-///   protocol.
-/// - Trailing whitespace / arbitrary suffixes are rejected.
-///
-/// Defensive parsing matters here: the spec calls out parse failure
-/// as a "reject the track" condition rather than an assertion.
-pub fn parse_voice_mid_label(s: &[u8]) -> Option<MidLabel> {
-    if s == b"send" {
-        return Some(MidLabel::Send);
+impl MidLabel {
+    /// True for the video mids, camera or screen, send or receive.
+    pub fn is_video(self) -> bool {
+        !matches!(self, MidLabel::Send | MidLabel::User(_))
     }
-    let rest = s.strip_prefix(b"user-")?;
+
+    /// The remote user a receive mid names, of any kind.
+    pub fn user_id(self) -> Option<u16> {
+        match self {
+            MidLabel::User(u) | MidLabel::CamUser(u) | MidLabel::ScrUser(u) => Some(u),
+            _ => None,
+        }
+    }
+}
+
+/// The spec's ceiling on a mid's length: the one-byte RTP header
+/// extension form (RFC 8285) carries at most 16 bytes, so a longer mid
+/// cannot be put on the wire by a standard stack. `scr-user-65535` is 14.
+pub const MID_MAX_LEN: usize = 16;
+
+/// Parse the `{UID}` tail of a `user-` style mid: `1..=65535`, decimal,
+/// no leading zeros, nothing after the digits.
+fn parse_mid_uid(rest: &[u8]) -> Option<u16> {
     if rest.is_empty() {
         return None;
     }
@@ -294,7 +312,44 @@ pub fn parse_voice_mid_label(s: &[u8]) -> Option<MidLabel> {
     if acc == 0 {
         return None;
     }
-    Some(MidLabel::User(acc as u16))
+    Some(acc as u16)
+}
+
+/// Parse an SDP `a=mid:` label value.
+///
+/// Returns `Some(MidLabel)` for the well-formed shapes (`send`,
+/// `user-N`, `cam-send`, `scr-send`, `cam-user-N`, `scr-user-N`), `None`
+/// for anything else. The strict shape matches the specs:
+///
+/// - `N` is `1..=65535` in decimal, **no leading zeros**. `user-05` is
+///   rejected — the spec explicitly forbids leading zeros.
+/// - uid 0 is rejected — reserved by the Hotline base protocol.
+/// - Trailing whitespace / arbitrary suffixes are rejected.
+/// - Anything longer than [`MID_MAX_LEN`] is rejected rather than
+///   truncated, as the video spec asks.
+///
+/// Defensive parsing matters here: the spec calls out parse failure
+/// as a "reject the track" condition rather than an assertion.
+pub fn parse_voice_mid_label(s: &[u8]) -> Option<MidLabel> {
+    if s.len() > MID_MAX_LEN {
+        return None;
+    }
+    match s {
+        b"send" => return Some(MidLabel::Send),
+        b"cam-send" => return Some(MidLabel::CamSend),
+        b"scr-send" => return Some(MidLabel::ScrSend),
+        _ => {}
+    }
+    if let Some(rest) = s.strip_prefix(b"user-") {
+        return parse_mid_uid(rest).map(MidLabel::User);
+    }
+    if let Some(rest) = s.strip_prefix(b"cam-user-") {
+        return parse_mid_uid(rest).map(MidLabel::CamUser);
+    }
+    if let Some(rest) = s.strip_prefix(b"scr-user-") {
+        return parse_mid_uid(rest).map(MidLabel::ScrUser);
+    }
+    None
 }
 
 pub mod sdp {
@@ -325,13 +380,18 @@ pub mod sdp {
         /// line, in declaration order. The spec mandates a single
         /// BUNDLE group covering every media section.
         pub bundle: Vec<String>,
-        /// True if any `m=audio 0 ` line was seen — a disabled slot
-        /// after a participant leaves (RFC 8829 §5.2.2 recycling).
+        /// True if any `m=audio 0 ` or `m=video 0 ` line was seen — a
+        /// disabled slot after a participant leaves (RFC 8829 §5.2.2
+        /// recycling).
         pub has_disabled_slot: bool,
         /// True if the SDP advertises PCMU (`a=rtpmap:0 PCMU/8000`).
         /// The spec requires it on every offer; we surface the
         /// boolean so the runtime can reject offers that lack it.
         pub has_pcmu: bool,
+        /// True if the SDP advertises VP8 at the video extension's fixed
+        /// payload type (`a=rtpmap:96 VP8/90000`). Every video section
+        /// must carry it; there is no payload-type fallback.
+        pub has_vp8: bool,
     }
 
     /// Walk the SDP one line at a time and collect the subset of
@@ -361,10 +421,12 @@ pub mod sdp {
                     .filter(|s| !s.is_empty())
                     .map(|s| String::from_utf8_lossy(s).into_owned())
                     .collect();
-            } else if line.starts_with(b"m=audio 0 ") {
+            } else if line.starts_with(b"m=audio 0 ") || line.starts_with(b"m=video 0 ") {
                 out.has_disabled_slot = true;
             } else if line.starts_with(b"a=rtpmap:0 PCMU/8000") {
                 out.has_pcmu = true;
+            } else if line.starts_with(b"a=rtpmap:96 VP8/90000") {
+                out.has_vp8 = true;
             }
         }
 
@@ -1162,6 +1224,57 @@ mod tests {
         assert_eq!(parse_voice_mid_label(b"user-1a"), None);
     }
 
+    #[test]
+    fn mid_label_video_grammar() {
+        assert_eq!(parse_voice_mid_label(b"cam-send"), Some(MidLabel::CamSend));
+        assert_eq!(parse_voice_mid_label(b"scr-send"), Some(MidLabel::ScrSend));
+        assert_eq!(
+            parse_voice_mid_label(b"cam-user-12"),
+            Some(MidLabel::CamUser(12))
+        );
+        assert_eq!(
+            parse_voice_mid_label(b"scr-user-65535"),
+            Some(MidLabel::ScrUser(65535))
+        );
+        // The voice rules carry over: no leading zeros, no uid 0, no range
+        // overflow, no suffix.
+        assert_eq!(parse_voice_mid_label(b"cam-user-012"), None);
+        assert_eq!(parse_voice_mid_label(b"cam-user-0"), None);
+        assert_eq!(parse_voice_mid_label(b"scr-user-65536"), None);
+        assert_eq!(parse_voice_mid_label(b"cam-user-"), None);
+        assert_eq!(parse_voice_mid_label(b"cam-send "), None);
+        // Screen audio is reserved, not defined: mirrored, never mapped.
+        assert_eq!(parse_voice_mid_label(b"sca-send"), None);
+        assert_eq!(parse_voice_mid_label(b"sca-user-5"), None);
+        // The long spelling the spec abbreviates away from.
+        assert_eq!(parse_voice_mid_label(b"screen-user-5"), None);
+    }
+
+    #[test]
+    fn mid_label_enforces_the_sixteen_byte_ceiling() {
+        // The longest defined mid fits with room to spare, so the ceiling
+        // never rejects a well-formed label; what it rejects is anything
+        // longer, before the prefix match, rather than truncating it.
+        assert_eq!(MID_MAX_LEN, 16);
+        assert_eq!(b"scr-user-65535".len(), 14);
+        assert_eq!(parse_voice_mid_label(b"scr-user-65535x!!"), None);
+        assert_eq!(parse_voice_mid_label(b"cam-user-12345678"), None);
+        assert_eq!(parse_voice_mid_label(&[b'a'; 4096]), None);
+    }
+
+    #[test]
+    fn mid_label_accessors() {
+        assert!(!MidLabel::Send.is_video());
+        assert!(!MidLabel::User(3).is_video());
+        assert!(MidLabel::CamSend.is_video());
+        assert!(MidLabel::ScrUser(3).is_video());
+        assert_eq!(MidLabel::User(3).user_id(), Some(3));
+        assert_eq!(MidLabel::CamUser(4).user_id(), Some(4));
+        assert_eq!(MidLabel::ScrUser(5).user_id(), Some(5));
+        assert_eq!(MidLabel::CamSend.user_id(), None);
+        assert_eq!(MidLabel::Send.user_id(), None);
+    }
+
     // ---- SDP summary ----
 
     #[test]
@@ -1193,6 +1306,39 @@ mod tests {
         let s = sdp::summarize(sdp.as_bytes());
         assert!(s.has_disabled_slot);
         assert!(!s.has_pcmu);
+    }
+
+    #[test]
+    fn sdp_summary_understands_video_sections() {
+        let sdp = "v=0\r\n\
+                   a=group:BUNDLE user-12 send cam-user-12 scr-user-23 cam-send\r\n\
+                   m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
+                   a=mid:user-12\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
+                   m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
+                   a=mid:send\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+                   a=mid:cam-user-12\r\n\
+                   a=rtpmap:96 VP8/90000\r\n\
+                   m=video 0 UDP/TLS/RTP/SAVPF 96\r\n\
+                   a=mid:scr-user-23\r\n\
+                   a=content:slides\r\n\
+                   m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+                   a=mid:cam-send\r\n";
+        let s = sdp::summarize(sdp.as_bytes());
+        assert_eq!(
+            s.mids,
+            vec![
+                MidLabel::User(12),
+                MidLabel::Send,
+                MidLabel::CamUser(12),
+                MidLabel::ScrUser(23),
+                MidLabel::CamSend,
+            ]
+        );
+        assert!(s.has_pcmu);
+        assert!(s.has_vp8);
+        assert!(s.has_disabled_slot, "m=video 0 is a disabled slot");
     }
 
     #[test]
