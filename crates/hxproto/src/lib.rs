@@ -24,6 +24,8 @@
 //! - [`parse`] — typed parsers for individual server messages. Phase R2
 //!   grows this one opcode at a time; the proof-of-concept opcodes are
 //!   `HTLS_HDR_USER_SELFINFO` and `HTLS_HDR_TASK`.
+//! - [`tracker`] — the tracker protocol, v1 and v3: registration, listing,
+//!   and the typed server metadata both carry.
 //! - [`build`] — outgoing-message builders for the SEND path. Each
 //!   `hx_send_*` in C delegates to a `build_*_chunks` here, then hands
 //!   the chunk array to `hlwrite_chunks()` for actual wire encoding.
@@ -45,6 +47,7 @@ pub mod messages;
 pub mod parse;
 pub mod sanitize;
 pub mod text;
+pub mod tracker;
 pub mod user_change;
 pub mod video;
 pub mod voice;
