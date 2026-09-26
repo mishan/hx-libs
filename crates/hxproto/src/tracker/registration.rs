@@ -20,10 +20,12 @@
 //! version: Mac Roman for v1 in practice, UTF-8 for v3. The caller
 //! converts (see [`crate::text`]).
 //!
-//! A v3 datagram can be authenticated: a random `NONCE` field, then an
+//! A v3 datagram can be authenticated: a random `NONCE` field and an
 //! `HMAC_SHA256` field computed over the whole datagram with that field's
 //! value zeroed. [`build_v3`] lays both out and leaves the MAC to a
-//! caller-supplied signer, so this crate needs no crypto.
+//! caller-supplied signer, so this crate needs no crypto. It puts the HMAC
+//! last; a verifier ([`hmac_input`]) finds it wherever another
+//! implementation put it.
 
 use std::fmt;
 
@@ -127,8 +129,7 @@ pub struct Auth<'s> {
 
 /// A v3 datagram: the base fields, then `fields`, then the registration
 /// token if the tracker issued one, then — when `auth` is given — the nonce
-/// and the HMAC, which must come last because it covers everything before
-/// it.
+/// and the HMAC.
 pub fn build_v3(
     r: &Registration<'_>,
     fields: &TlvWriter,
@@ -169,9 +170,14 @@ pub struct Parsed<'a> {
     pub fields: Option<Vec<Tlv<'a>>>,
 }
 
-/// Parse a datagram, as a tracker receives it. `None` if it is truncated,
-/// or if a v3 extension block is malformed or followed by stray bytes.
-/// A datagram with nothing after the password is valid in any version.
+/// Parse a datagram, as a tracker receives it.
+///
+/// Leniency follows what deployed v1 trackers accept: only the 12-byte
+/// header is required, and text fields missing from the end read as
+/// empty. On a v1 datagram anything after the password is ignored. On a v3
+/// datagram, what follows the password must be one well-formed `"H3"`
+/// extension block and nothing else; the block is only looked for when
+/// the version says 3.
 pub fn parse(packet: &[u8]) -> Option<Parsed<'_>> {
     let head = packet.get(..12)?;
     let version = u16::from_be_bytes([head[0], head[1]]);
@@ -179,21 +185,29 @@ pub fn parse(packet: &[u8]) -> Option<Parsed<'_>> {
     let users = u16::from_be_bytes([head[4], head[5]]);
     let pass_id = u32::from_be_bytes([head[8], head[9], head[10], head[11]]);
     let mut off = 12;
-    let mut pascal = || {
-        let len = usize::from(*packet.get(off)?);
-        let value = packet.get(off + 1..off + 1 + len)?;
-        off += 1 + len;
+    // A field that is missing entirely reads as empty; one that starts
+    // but runs past the end is truncated, and refused.
+    let mut pascal = || -> Option<&[u8]> {
+        let Some(&len) = packet.get(off) else {
+            return Some(&[]);
+        };
+        let value = packet.get(off + 1..off + 1 + usize::from(len))?;
+        off += 1 + usize::from(len);
         Some(value)
     };
     let name = pascal()?;
     let description = pascal()?;
     let password = pascal()?;
-    let fields = match packet.get(off..)? {
-        [] => None,
-        [m0, m1, c0, c1, rest @ ..] if u16::from_be_bytes([*m0, *m1]) == EXT_MAGIC => {
-            Some(tlv::read_all(rest, u16::from_be_bytes([*c0, *c1]))?)
+    let rest = &packet[off.min(packet.len())..];
+    let fields = if version != VERSION_V3 || rest.is_empty() {
+        None
+    } else {
+        match rest {
+            [m0, m1, c0, c1, block @ ..] if u16::from_be_bytes([*m0, *m1]) == EXT_MAGIC => {
+                Some(tlv::read_all(block, u16::from_be_bytes([*c0, *c1]))?)
+            }
+            _ => return None,
         }
-        _ => return None,
     };
     Some(Parsed {
         version,
@@ -211,24 +225,26 @@ pub fn parse(packet: &[u8]) -> Option<Parsed<'_>> {
 
 /// For a tracker verifying an authenticated datagram: the bytes to MAC —
 /// the packet with its HMAC value zeroed — and the MAC it carries. `None`
-/// if the datagram does not parse or its last field is not an
-/// `HMAC_SHA256` of the right length.
+/// if the datagram does not parse, or does not carry exactly one
+/// `HMAC_SHA256` field of the right length.
 pub fn hmac_input(packet: &[u8]) -> Option<(Vec<u8>, [u8; HMAC_LEN])> {
-    let parsed = parse(packet)?;
-    let last = parsed.fields?.pop()?;
-    if last.id != id::HMAC_SHA256 || last.value.len() != HMAC_LEN {
+    let fields = parse(packet)?.fields?;
+    let mut macs = fields.iter().filter(|f| f.id == id::HMAC_SHA256);
+    let field = macs.next()?;
+    if macs.next().is_some() || field.value.len() != HMAC_LEN {
         return None;
     }
-    let at = packet.len() - HMAC_LEN;
-    let mac = <[u8; HMAC_LEN]>::try_from(&packet[at..]).ok()?;
+    let mac = <[u8; HMAC_LEN]>::try_from(field.value).ok()?;
+    // The value borrows from `packet`, so its offset is the distance
+    // between the two.
+    let at = field.value.as_ptr() as usize - packet.as_ptr() as usize;
     let mut zeroed = packet.to_vec();
-    zeroed[at..].fill(0);
+    zeroed[at..at + HMAC_LEN].fill(0);
     Some((zeroed, mac))
 }
 
 /// A v3 acknowledgment's status byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum AckStatus {
     Ok,
     Denied,
@@ -237,11 +253,13 @@ pub enum AckStatus {
     Full,
     Invalid,
     Error,
+    /// A status this implementation does not know. Not "ok".
+    Other(u8),
 }
 
 impl AckStatus {
-    pub fn from_wire(raw: u8) -> Option<AckStatus> {
-        Some(match raw {
+    pub fn from_wire(raw: u8) -> AckStatus {
+        match raw {
             0x00 => AckStatus::Ok,
             0x01 => AckStatus::Denied,
             0x02 => AckStatus::Banned,
@@ -249,8 +267,8 @@ impl AckStatus {
             0x04 => AckStatus::Full,
             0x05 => AckStatus::Invalid,
             0xff => AckStatus::Error,
-            _ => return None,
-        })
+            other => AckStatus::Other(other),
+        }
     }
 
     pub fn to_wire(self) -> u8 {
@@ -262,6 +280,7 @@ impl AckStatus {
             AckStatus::Full => 0x04,
             AckStatus::Invalid => 0x05,
             AckStatus::Error => 0xff,
+            AckStatus::Other(raw) => raw,
         }
     }
 
@@ -275,6 +294,7 @@ impl AckStatus {
             AckStatus::Full => "full",
             AckStatus::Invalid => "invalid",
             AckStatus::Error => "error",
+            AckStatus::Other(_) => "unknown",
         }
     }
 }
@@ -302,13 +322,8 @@ pub struct Ack {
 pub enum AckError {
     Truncated,
     BadMagic,
-    UnknownStatus(u8),
     /// The field block is malformed, or bytes follow it.
     BadFields,
-    /// A text field is not UTF-8.
-    NotUtf8 {
-        field: u16,
-    },
 }
 
 impl fmt::Display for AckError {
@@ -316,32 +331,27 @@ impl fmt::Display for AckError {
         match self {
             AckError::Truncated => f.write_str("v3 acknowledgment is shorter than 7 bytes"),
             AckError::BadMagic => f.write_str("v3 acknowledgment has bad magic"),
-            AckError::UnknownStatus(s) => write!(f, "unknown v3 acknowledgment status 0x{s:02x}"),
             AckError::BadFields => f.write_str("v3 acknowledgment fields are malformed"),
-            AckError::NotUtf8 { field } => {
-                write!(f, "v3 acknowledgment field 0x{field:04x} is not UTF-8")
-            }
         }
     }
 }
 
 impl std::error::Error for AckError {}
 
-/// Parse an acknowledgment. Unknown fields are skipped.
+/// Parse an acknowledgment. Unknown fields are skipped, an unknown status
+/// is [`AckStatus::Other`], and invalid UTF-8 in the text fields is
+/// replaced with U+FFFD: an acknowledgment is advisory, and a bad error
+/// message should not cost the server its registration token.
 pub fn parse_ack(packet: &[u8]) -> Result<Ack, AckError> {
     let head = packet.get(..7).ok_or(AckError::Truncated)?;
     if u16::from_be_bytes([head[0], head[1]]) != EXT_MAGIC {
         return Err(AckError::BadMagic);
     }
-    let status = AckStatus::from_wire(head[2]).ok_or(AckError::UnknownStatus(head[2]))?;
+    let status = AckStatus::from_wire(head[2]);
     let interval = u16::from_be_bytes([head[3], head[4]]);
     let count = u16::from_be_bytes([head[5], head[6]]);
     let fields = tlv::read_all(&packet[7..], count).ok_or(AckError::BadFields)?;
-    let text = |f: &Tlv<'_>| {
-        std::str::from_utf8(f.value)
-            .map(str::to_owned)
-            .map_err(|_| AckError::NotUtf8 { field: f.id })
-    };
+    let text = |f: &Tlv<'_>| String::from_utf8_lossy(f.value).into_owned();
     let mut ack = Ack {
         status,
         interval,
@@ -352,8 +362,8 @@ pub fn parse_ack(packet: &[u8]) -> Result<Ack, AckError> {
     for f in &fields {
         match f.id {
             id::REG_TOKEN => ack.token = Some(f.value.to_vec()),
-            id::ERROR_MSG => ack.error = Some(text(f)?),
-            id::TRACKER_NAME => ack.tracker_name = Some(text(f)?),
+            id::ERROR_MSG => ack.error = Some(text(f)),
+            id::TRACKER_NAME => ack.tracker_name = Some(text(f)),
             _ => {}
         }
     }
@@ -497,15 +507,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_refuses_stray_bytes_and_bad_blocks() {
-        let mut p = build_v1(&reg()).unwrap();
-        assert!(parse(&p[..p.len() - 1]).is_none(), "truncated");
-        p.push(0xee);
-        assert!(parse(&p).is_none(), "stray byte after the password");
+    fn parse_is_as_lenient_as_v1_trackers() {
+        let full = build_v1(&reg()).unwrap();
+        let header_only = parse(&full[..12]).unwrap();
+        assert_eq!(header_only.registration.pass_id, reg().pass_id);
+        assert_eq!(header_only.registration.name, b"");
 
+        let no_password = parse(&full[..full.len() - 1]).unwrap();
+        assert_eq!(no_password.registration.description, b"Desc");
+
+        let mut trailing = full.clone();
+        trailing.extend_from_slice(b"junk");
+        assert_eq!(
+            parse(&trailing).unwrap().registration,
+            reg(),
+            "v1 ignores the tail"
+        );
+
+        assert!(parse(&full[..15]).is_none(), "a string cut short");
+        assert!(parse(&full[..11]).is_none(), "no header");
+    }
+
+    #[test]
+    fn the_extension_block_is_v3_only_and_must_be_exact() {
         let mut v3 = build_v3(&reg(), &TlvWriter::new(), Some(b"t"), None).unwrap();
+        let mut as_v1 = v3.clone();
+        as_v1[..2].copy_from_slice(&VERSION_V1.to_be_bytes());
+        assert_eq!(parse(&as_v1).unwrap().fields, None, "not looked for on v1");
         v3.push(0);
         assert!(parse(&v3).is_none(), "trailing byte after the fields");
+    }
+
+    /// Another implementation may put the HMAC anywhere among the fields.
+    fn signed_with_hmac_first(macs: usize) -> Vec<u8> {
+        let mut w = TlvWriter::new();
+        for i in 0..macs {
+            w.push(id::HMAC_SHA256, &[0xa0 + i as u8; HMAC_LEN])
+                .unwrap();
+        }
+        w.push(id::NONCE, &[5; NONCE_LEN]).unwrap();
+        build_v3(&reg(), &w, None, None).unwrap()
+    }
+
+    #[test]
+    fn hmac_input_finds_the_mac_anywhere_and_only_once() {
+        let p = signed_with_hmac_first(1);
+        let (zeroed, mac) = hmac_input(&p).unwrap();
+        assert_eq!(mac, [0xa0; HMAC_LEN]);
+        assert_eq!(zeroed.len(), p.len());
+        assert!(zeroed.ends_with(&[5; NONCE_LEN]), "the nonce is left alone");
+        assert!(!zeroed.windows(HMAC_LEN).any(|w| w == [0xa0; HMAC_LEN]));
+        assert!(hmac_input(&signed_with_hmac_first(2)).is_none(), "two MACs");
     }
 
     #[test]
@@ -528,24 +580,30 @@ mod tests {
             Err(AckError::BadMagic)
         );
         assert_eq!(
-            parse_ack(&[0x48, 0x33, 0x42, 0, 0, 0, 0]),
-            Err(AckError::UnknownStatus(0x42))
-        );
-        assert_eq!(
             parse_ack(&[0x48, 0x33, 0, 0, 0, 0, 0, 9]),
             Err(AckError::BadFields)
         );
+    }
+
+    #[test]
+    fn ack_is_advisory_and_forgiving() {
+        let unknown = parse_ack(&[0x48, 0x33, 0x42, 0, 0, 0, 0]).unwrap();
+        assert_eq!(unknown.status, AckStatus::Other(0x42));
+        assert_eq!(unknown.status.to_wire(), 0x42);
+
         let mut w = TlvWriter::new();
-        w.push(id::ERROR_MSG, &[0xff]).unwrap();
+        w.push(id::REG_TOKEN, b"keep").unwrap();
+        w.push(id::ERROR_MSG, &[b'n', 0xa5, b'o']).unwrap();
         let (count, bytes) = w.into_parts();
         let mut p = vec![0x48, 0x33, 0xff, 0, 30];
         p.extend_from_slice(&count.to_be_bytes());
         p.extend_from_slice(&bytes);
+        let ack = parse_ack(&p).unwrap();
         assert_eq!(
-            parse_ack(&p),
-            Err(AckError::NotUtf8 {
-                field: id::ERROR_MSG
-            })
+            ack.token.as_deref(),
+            Some(&b"keep"[..]),
+            "the token survives"
         );
+        assert_eq!(ack.error.as_deref(), Some("n\u{fffd}o"));
     }
 }

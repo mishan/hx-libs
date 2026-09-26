@@ -13,7 +13,11 @@
 //! - A repeated id: the last one wins.
 //! - A number whose value is the wrong width reads as 0 (the field is
 //!   still present). Truncating an overlong value, or zero-extending a
-//!   short one, would invent a number the sender never sent.
+//!   short one, would invent a number the sender never sent. The one
+//!   exception is `TOTAL_FILE_SIZE`: the specification corrected it from
+//!   `u32` to `u64`, and a 4-byte value is read as the older form.
+//! - An IPv6 address of the wrong width is dropped: there is no zero
+//!   address worth keeping.
 //! - A flag is set if any byte of its value is non-zero.
 //! - Maturity and listing category are closed vocabularies: an unknown
 //!   value reads as the first entry, as the specification requires.
@@ -140,7 +144,8 @@ pub struct TrackerMeta {
     pub news_count: Option<u32>,
     pub msgboard_count: Option<u32>,
     pub files_count: Option<u32>,
-    pub total_file_size: Option<u32>,
+    /// Bytes. `u64` on the wire; see the module notes for 4-byte values.
+    pub total_file_size: Option<u64>,
     /// Unix time.
     pub last_news_time: Option<u32>,
     /// Unix time, public chat only.
@@ -178,6 +183,16 @@ fn i16_of(v: &[u8]) -> i16 {
 
 fn u32_of(v: &[u8]) -> u32 {
     <[u8; 4]>::try_from(v).map_or(0, u32::from_be_bytes)
+}
+
+/// `TOTAL_FILE_SIZE`: 8 bytes, or the 4 an implementation from before the
+/// specification's correction sends.
+fn size_of_files(v: &[u8]) -> u64 {
+    match v.len() {
+        8 => <[u8; 8]>::try_from(v).map_or(0, u64::from_be_bytes),
+        4 => u64::from(u32_of(v)),
+        _ => 0,
+    }
 }
 
 fn flag_of(v: &[u8]) -> bool {
@@ -239,7 +254,7 @@ impl TrackerMeta {
             id::NEWS_COUNT => self.news_count = Some(u32_of(v)),
             id::MSGBOARD_COUNT => self.msgboard_count = Some(u32_of(v)),
             id::FILES_COUNT => self.files_count = Some(u32_of(v)),
-            id::TOTAL_FILE_SIZE => self.total_file_size = Some(u32_of(v)),
+            id::TOTAL_FILE_SIZE => self.total_file_size = Some(size_of_files(v)),
             id::LAST_NEWS_TIME => self.last_news_time = Some(u32_of(v)),
             id::LAST_CHAT_TIME => self.last_chat_time = Some(u32_of(v)),
 
@@ -258,8 +273,9 @@ impl TrackerMeta {
     }
 
     /// Append every present field to `w`, in ascending id order, with the
-    /// widths the specification gives. Decoding the result gives back an
-    /// equal value.
+    /// widths the specification gives. A listing category of
+    /// [`Category::Unspecified`] is left out, as the specification requires;
+    /// otherwise decoding the result gives back an equal value.
     pub fn encode(&self, w: &mut TlvWriter) -> Result<(), TlvError> {
         fn s(w: &mut TlvWriter, field: u16, v: &Option<String>) -> Result<(), TlvError> {
             v.as_deref().map_or(Ok(()), |v| w.push_str(field, v))
@@ -320,12 +336,17 @@ impl TrackerMeta {
         n32(w, id::NEWS_COUNT, self.news_count)?;
         n32(w, id::MSGBOARD_COUNT, self.msgboard_count)?;
         n32(w, id::FILES_COUNT, self.files_count)?;
-        n32(w, id::TOTAL_FILE_SIZE, self.total_file_size)?;
+        if let Some(v) = self.total_file_size {
+            w.push_u64(id::TOTAL_FILE_SIZE, v)?;
+        }
         n32(w, id::LAST_NEWS_TIME, self.last_news_time)?;
         n32(w, id::LAST_CHAT_TIME, self.last_chat_time)?;
 
         f(w, id::PRIVATE_LISTING, self.private_listing)?;
-        if let Some(v) = self.listing_category {
+        if let Some(v) = self
+            .listing_category
+            .filter(|v| *v != Category::Unspecified)
+        {
             w.push_u8(id::LISTING_CATEGORY, v as u8)?;
         }
         f(w, id::LANGUAGE_STRICT, self.language_strict)?;
@@ -404,6 +425,42 @@ mod tests {
     }
 
     #[test]
+    fn total_file_size_is_u64_and_reads_the_old_u32_form() {
+        let big = 5_000_000_000u64;
+        let (bytes, count) = block(&[(id::TOTAL_FILE_SIZE, &big.to_be_bytes())]);
+        let m = TrackerMeta::decode(&bytes, count).unwrap();
+        assert_eq!(m.total_file_size, Some(big));
+        let (bytes, count) = block(&[(id::TOTAL_FILE_SIZE, &7u32.to_be_bytes())]);
+        assert_eq!(
+            TrackerMeta::decode(&bytes, count).unwrap().total_file_size,
+            Some(7)
+        );
+
+        let mut w = TlvWriter::new();
+        TrackerMeta {
+            total_file_size: Some(big),
+            ..TrackerMeta::default()
+        }
+        .encode(&mut w)
+        .unwrap();
+        let (count, bytes) = w.into_parts();
+        let fields = tlv::read_all(&bytes, count).unwrap();
+        assert_eq!(fields[0].value.len(), 8, "the specification's width");
+    }
+
+    #[test]
+    fn an_unspecified_category_is_not_sent() {
+        let mut w = TlvWriter::new();
+        TrackerMeta {
+            listing_category: Some(Category::Unspecified),
+            ..TrackerMeta::default()
+        }
+        .encode(&mut w)
+        .unwrap();
+        assert_eq!(w.count(), 0);
+    }
+
+    #[test]
     fn a_malformed_trailer_is_refused_whole() {
         let (bytes, count) = block(&[(id::REGION, b"Oslo")]);
         assert!(TrackerMeta::decode(&bytes, count + 1).is_none());
@@ -428,6 +485,7 @@ mod tests {
             supports_voice: true,
             tags: Some("retro,files".into()),
             files_count: Some(4),
+            total_file_size: Some(1 << 40),
             private_listing: true,
             listing_category: Some(Category::Creative),
             is_promoted: true,

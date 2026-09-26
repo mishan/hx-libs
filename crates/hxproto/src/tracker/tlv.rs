@@ -77,6 +77,10 @@ pub mod id {
     pub const ERROR_MSG: u16 = 0x0810;
     pub const TRACKER_NAME: u16 = 0x0811;
 
+    // Client listing authentication (0x082x).
+    pub const AUTH_LOGIN: u16 = 0x0820;
+    pub const AUTH_PASS: u16 = 0x0821;
+
     // Listing-request query fields (0x10xx).
     pub const SEARCH_TEXT: u16 = 0x1001;
     pub const PAGE_OFFSET: u16 = 0x1010;
@@ -182,6 +186,10 @@ impl TlvWriter {
     }
 
     pub fn push_u32(&mut self, id: u16, value: u32) -> Result<(), TlvError> {
+        self.push(id, &value.to_be_bytes())
+    }
+
+    pub fn push_u64(&mut self, id: u16, value: u64) -> Result<(), TlvError> {
         self.push(id, &value.to_be_bytes())
     }
 
