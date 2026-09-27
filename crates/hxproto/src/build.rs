@@ -1345,15 +1345,18 @@ pub fn build_file_getfolder_chunks(
 //                          UI (mhxd doesn't validate against the
 //                          actual stream).
 
-/// Request data for [`build_file_setinfo_chunks`]. Covers both the
-/// full setinfo (rename + comment + optional dir) and the rename-only
-/// variant used by `hx_file_move` (rename + dir, no comment).
+/// Request data for [`build_file_setinfo_chunks`]. Covers the full
+/// setinfo (rename and/or comment, optional dir), the rename-only
+/// variant a move uses (rename + dir, no comment), and the
+/// comment-only one (no rename).
 pub struct FileSetInfoRequest<'a> {
     /// `HTLC_DATA_FILE_NAME` — the current basename. Mandatory.
     pub name: &'a [u8],
-    /// `HTLC_DATA_FILE_RENAME` — the new basename. Mandatory in both
-    /// call sites (rename is what FILE_SETINFO is for in this code).
-    pub rename: &'a [u8],
+    /// `HTLC_DATA_FILE_RENAME` — the new basename. `None` skips the
+    /// chunk. Leave it out when the name isn't changing: some servers
+    /// (Janus) refuse a rename to the item's own name, and fail the
+    /// whole request with it, comment and all.
+    pub rename: Option<&'a [u8]>,
     /// `HTLC_DATA_FILE_COMMENT` — file-comment text. `None` skips
     /// the chunk entirely (the rename-only variant in `hx_file_move`).
     pub comment: Option<&'a [u8]>,
@@ -1366,29 +1369,27 @@ pub struct FileSetInfoRequest<'a> {
 /// Build the chunk array for `HTLC_HDR_FILE_SETINFO`. Wire shape:
 ///
 /// 1. `HTLC_DATA_FILE_NAME`   — always
-/// 2. `HTLC_DATA_FILE_RENAME` — always
+/// 2. `HTLC_DATA_FILE_RENAME` — when `rename.is_some()`
 /// 3. `HTLC_DATA_FILE_COMMENT` — when `comment.is_some()`
 /// 4. `HTLC_DATA_DIR`         — when `dir.is_some()`
 ///
-/// Returns the chunk count (2..=4) on success, or 0 on validation
+/// Returns the chunk count (1..=4) on success, or 0 on validation
 /// failure (`chunks` slice too small for the chunks that will be
 /// emitted, or any of `name` / `rename` / `comment` / `dir` longer
 /// than `u16::MAX`).
 pub fn build_file_setinfo_chunks(req: &FileSetInfoRequest<'_>, chunks: &mut [HxChunk]) -> usize {
-    if req.name.len() > u16::MAX as usize || req.rename.len() > u16::MAX as usize {
+    if req.name.len() > u16::MAX as usize {
         return 0;
     }
-    if let Some(c) = req.comment {
-        if c.len() > u16::MAX as usize {
+    for f in [req.rename, req.comment, req.dir].into_iter().flatten() {
+        if f.len() > u16::MAX as usize {
             return 0;
         }
     }
-    if let Some(d) = req.dir {
-        if d.len() > u16::MAX as usize {
-            return 0;
-        }
-    }
-    let needed = 2 + usize::from(req.comment.is_some()) + usize::from(req.dir.is_some());
+    let needed = 1
+        + usize::from(req.rename.is_some())
+        + usize::from(req.comment.is_some())
+        + usize::from(req.dir.is_some());
     if chunks.len() < needed {
         return 0;
     }
@@ -1402,16 +1403,19 @@ pub fn build_file_setinfo_chunks(req: &FileSetInfoRequest<'_>, chunks: &mut [HxC
             req.name.as_ptr()
         },
     };
-    chunks[1] = HxChunk {
-        tag: tag::FILE_RENAME,
-        len: req.rename.len() as u16,
-        data: if req.rename.is_empty() {
-            b"".as_ptr()
-        } else {
-            req.rename.as_ptr()
-        },
-    };
-    let mut hc = 2;
+    let mut hc = 1;
+    if let Some(r) = req.rename {
+        chunks[hc] = HxChunk {
+            tag: tag::FILE_RENAME,
+            len: r.len() as u16,
+            data: if r.is_empty() {
+                b"".as_ptr()
+            } else {
+                r.as_ptr()
+            },
+        };
+        hc += 1;
+    }
     if let Some(c) = req.comment {
         chunks[hc] = HxChunk {
             tag: tag::FILE_COMMENT,
@@ -3362,7 +3366,7 @@ mod tests {
         // present. Verifies NAME → RENAME → COMMENT → DIR ordering.
         let req = FileSetInfoRequest {
             name: b"old.txt",
-            rename: b"new.txt",
+            rename: Some(b"new.txt"),
             comment: Some(b"the comment"),
             dir: Some(b"Uploads"),
         };
@@ -3385,7 +3389,7 @@ mod tests {
         // dir is Some. Output is NAME + RENAME + DIR (no COMMENT chunk).
         let req = FileSetInfoRequest {
             name: b"old.txt",
-            rename: b"new.txt",
+            rename: Some(b"new.txt"),
             comment: None,
             dir: Some(b"Uploads"),
         };
@@ -3403,7 +3407,7 @@ mod tests {
         // RENAME. Smallest legal chunks slice is 2.
         let req = FileSetInfoRequest {
             name: b"a",
-            rename: b"b",
+            rename: Some(b"b"),
             comment: None,
             dir: None,
         };
@@ -3420,7 +3424,7 @@ mod tests {
         // COMMENT, no DIR.
         let req = FileSetInfoRequest {
             name: b"a",
-            rename: b"b",
+            rename: Some(b"b"),
             comment: Some(b"hi"),
             dir: None,
         };
@@ -3431,11 +3435,38 @@ mod tests {
     }
 
     #[test]
+    fn file_setinfo_without_rename_emits_no_rename_chunk() {
+        // A comment edit that keeps the name: NAME + COMMENT + DIR.
+        let req = FileSetInfoRequest {
+            name: b"a",
+            rename: None,
+            comment: Some(b"hi"),
+            dir: Some(b"Uploads"),
+        };
+        let mut chunks = [HxChunk::EMPTY; 3];
+        let hc = build_file_setinfo_chunks(&req, &mut chunks);
+        assert_eq!(hc, 3);
+        assert_eq!(chunks[0].tag, tag::FILE_NAME);
+        assert_eq!(chunks[1].tag, tag::FILE_COMMENT);
+        assert_eq!(unsafe { chunk_bytes(&chunks[1]) }, b"hi");
+        assert_eq!(chunks[2].tag, tag::DIR);
+        // And NAME alone fits one slot.
+        let req = FileSetInfoRequest {
+            name: b"a",
+            rename: None,
+            comment: None,
+            dir: None,
+        };
+        let mut chunks = [HxChunk::EMPTY; 1];
+        assert_eq!(build_file_setinfo_chunks(&req, &mut chunks), 1);
+    }
+
+    #[test]
     fn file_setinfo_rejects_short_chunks_slice() {
         // Full setinfo wants 4 slots; 3 is too few.
         let req = FileSetInfoRequest {
             name: b"a",
-            rename: b"b",
+            rename: Some(b"b"),
             comment: Some(b"c"),
             dir: Some(b"d"),
         };
@@ -3444,7 +3475,7 @@ mod tests {
         // 2-slot slice is too few for rename-only-with-dir (needs 3).
         let req2 = FileSetInfoRequest {
             name: b"a",
-            rename: b"b",
+            rename: Some(b"b"),
             comment: None,
             dir: Some(b"d"),
         };
@@ -3453,7 +3484,7 @@ mod tests {
         // 1-slot slice is too few even for the minimal NAME+RENAME.
         let req3 = FileSetInfoRequest {
             name: b"a",
-            rename: b"b",
+            rename: Some(b"b"),
             comment: None,
             dir: None,
         };
@@ -3467,7 +3498,7 @@ mod tests {
         for which in 0..4 {
             let req = FileSetInfoRequest {
                 name: if which == 0 { &big } else { b"n" },
-                rename: if which == 1 { &big } else { b"r" },
+                rename: Some(if which == 1 { big.as_slice() } else { b"r" }),
                 comment: Some(if which == 2 { big.as_slice() } else { b"c" }),
                 dir: Some(if which == 3 { big.as_slice() } else { b"d" }),
             };
@@ -3486,7 +3517,7 @@ mod tests {
         // side's defensive checks don't fire.
         let req = FileSetInfoRequest {
             name: b"",
-            rename: b"",
+            rename: Some(b""),
             comment: Some(b""),
             dir: Some(b""),
         };
