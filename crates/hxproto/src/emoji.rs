@@ -46,13 +46,6 @@ fn could_start_emoji(c: char) -> bool {
     !c.is_ascii() || c == '#' || c == '*' || c.is_ascii_digit()
 }
 
-fn shortcode_for_emoji(cluster: &str) -> Option<&'static str> {
-    ENCODE
-        .binary_search_by(|(k, _)| (*k).cmp(cluster))
-        .ok()
-        .map(|i| ENCODE[i].1)
-}
-
 fn emoji_for_shortcode(name: &str) -> Option<&'static str> {
     DECODE
         .binary_search_by(|(k, _)| (*k).cmp(name))
@@ -70,30 +63,13 @@ pub fn emoji_to_shortcodes(input: &str) -> String {
     let mut i = 0;
 
     while i < n {
-        let (start, c) = chars[i];
+        let c = chars[i].1;
         if could_start_emoji(c) {
-            // Longest-match: try the longest cluster first so multi-codepoint
-            // sequences (ZWJ families, keycaps, skin-tone combos) win over
-            // their leading codepoint.
-            let max_l = MAX_ENCODE_CHARS.min(n - i);
-            let mut matched = false;
-            for l in (1..=max_l).rev() {
-                let end = if i + l < n {
-                    chars[i + l].0
-                } else {
-                    input.len()
-                };
-                let sub = &input[start..end];
-                if let Some(sc) = shortcode_for_emoji(sub) {
-                    out.push(':');
-                    out.push_str(sc);
-                    out.push(':');
-                    i += l;
-                    matched = true;
-                    break;
-                }
-            }
-            if matched {
+            if let Some((l, sc)) = longest_emoji_at(input, &chars, i) {
+                out.push(':');
+                out.push_str(sc);
+                out.push(':');
+                i += l;
                 continue;
             }
         }
@@ -102,6 +78,42 @@ pub fn emoji_to_shortcodes(input: &str) -> String {
     }
 
     out
+}
+
+/// The longest [`ENCODE`] cluster starting at char `i` of `input`, as its
+/// length in chars and its shortcode — longest so that multi-codepoint
+/// sequences (ZWJ families, keycaps, skin-tone combos) win over their
+/// leading codepoint.
+///
+/// Grows the candidate a char at a time and stops as soon as no key starts
+/// with it: every shorter piece of a key is a prefix of that key, so no
+/// longer match can lie beyond that point. Most non-ASCII text (an `é`)
+/// then costs one probe rather than one per possible cluster length.
+fn longest_emoji_at(
+    input: &str,
+    chars: &[(usize, char)],
+    i: usize,
+) -> Option<(usize, &'static str)> {
+    let start = chars[i].0;
+    let max_l = MAX_ENCODE_CHARS.min(chars.len() - i);
+    let mut best = None;
+    for l in 1..=max_l {
+        let end = chars.get(i + l).map_or(input.len(), |&(off, _)| off);
+        let sub = &input[start..end];
+        // The first key not below `sub`: `sub` itself if it is a key, and
+        // otherwise a key extending it if there is one.
+        let p = ENCODE.partition_point(|(k, _)| *k < sub);
+        let Some(&(key, sc)) = ENCODE.get(p) else {
+            break;
+        };
+        if !key.starts_with(sub) {
+            break;
+        }
+        if key == sub {
+            best = Some((l, sc));
+        }
+    }
+    best
 }
 
 /// Decode: replace every known `:shortcode:` token with its emoji. Unknown
@@ -236,6 +248,63 @@ pub fn shortcodes_to_emoji_into(input: &[u8], dst: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The encode as it was before `longest_emoji_at`: every cluster length
+    /// from the longest down, each an exact lookup. The reference the
+    /// faster walk must agree with.
+    fn emoji_to_shortcodes_reference(input: &str) -> String {
+        let chars: Vec<(usize, char)> = input.char_indices().collect();
+        let n = chars.len();
+        let mut out = String::new();
+        let mut i = 0;
+        'outer: while i < n {
+            let (start, c) = chars[i];
+            if could_start_emoji(c) {
+                for l in (1..=MAX_ENCODE_CHARS.min(n - i)).rev() {
+                    let end = chars.get(i + l).map_or(input.len(), |&(off, _)| off);
+                    let sub = &input[start..end];
+                    if let Ok(k) = ENCODE.binary_search_by(|(e, _)| (*e).cmp(sub)) {
+                        out.push(':');
+                        out.push_str(ENCODE[k].1);
+                        out.push(':');
+                        i += l;
+                        continue 'outer;
+                    }
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn encode_matches_the_exhaustive_walk() {
+        let mut inputs: Vec<String> = vec![
+            "café crème naïve".into(),
+            "call 555-1234 #1 *2".into(),
+            "#️⃣ 1️⃣ *️⃣ 10".into(),
+            "👨‍👩‍👧‍👦 family, 👍🏽 thumbs, 🏳️‍🌈 flag".into(),
+            "👨‍👩‍ half a family, then 👨‍ and a ZWJ‍".into(),
+            String::new(),
+        ];
+        // Every key alone, glued to its neighbor, and truncated by a char.
+        for w in ENCODE.windows(2) {
+            let (a, b) = (w[0].0, w[1].0);
+            inputs.push(a.to_string());
+            inputs.push(format!("{a}{b}x{a}"));
+            let mut cut: Vec<char> = a.chars().collect();
+            cut.pop();
+            inputs.push(cut.into_iter().collect::<String>() + "é");
+        }
+        for s in &inputs {
+            assert_eq!(
+                emoji_to_shortcodes(s),
+                emoji_to_shortcodes_reference(s),
+                "{s:?}"
+            );
+        }
+    }
 
     #[test]
     fn table_sorted_and_searchable() {
