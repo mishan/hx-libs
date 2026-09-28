@@ -6,3 +6,10 @@ edition = "2021"
 license = "GPL-2.0-or-later"
 description = "Typed Hotline 1.0/1.2/1.5/1.9 wire protocol parser and serializer"
 publish = false
+
+[features]
+default = ["emoji"]
+# The emoji <-> `:shortcode:` tables (`hxproto::emoji`). They are most of
+# the crate's size in a wasm build, so a consumer with no use for them can
+# leave them out with `default-features = false`.
+emoji = []
