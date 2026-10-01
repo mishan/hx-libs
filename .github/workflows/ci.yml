@@ -63,6 +63,7 @@ jobs:
           cargo build --locked --target wasm32-unknown-unknown -p hxproto
           cargo build --locked --target wasm32-unknown-unknown -p hxproto --no-default-features
           cargo build --locked --target wasm32-unknown-unknown -p hxfiles-xfer
+          cargo build --locked --target wasm32-unknown-unknown -p hxsession
 
   # `rust-version` is GtkHx's floor, Debian stable's rustc, and it only
   # means something if a build on that toolchain is what checks it.
