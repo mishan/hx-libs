@@ -43,6 +43,27 @@ jobs:
       - name: Tests
         run: cargo test --workspace --locked
 
+  # The codecs are meant to run in a browser as well, so the crates with no
+  # platform dependencies have to keep building for wasm32. hxproto is
+  # built both ways, since a wasm consumer is expected to drop the emoji
+  # tables with `default-features = false`.
+  wasm32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build for wasm32
+        run: |
+          cargo build --locked --target wasm32-unknown-unknown -p hxproto
+          cargo build --locked --target wasm32-unknown-unknown -p hxproto --no-default-features
+          cargo build --locked --target wasm32-unknown-unknown -p hxfiles-xfer
+
   # `rust-version` is GtkHx's floor, Debian stable's rustc, and it only
   # means something if a build on that toolchain is what checks it.
   msrv:

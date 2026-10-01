@@ -37,7 +37,9 @@
 
 pub mod build;
 pub mod dispatch;
+#[cfg(feature = "emoji")]
 pub mod emoji;
+#[cfg(feature = "emoji")]
 mod emoji_table;
 pub mod gif_icons;
 pub mod hl_date;
