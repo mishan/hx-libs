@@ -106,6 +106,13 @@ impl FrameReader {
         std::mem::take(&mut self.abandoned)
     }
 
+    /// Whether nothing is part-read: no bytes of an unfinished frame
+    /// buffered, and no split transaction waiting for its rest. A stream
+    /// that ends now ends cleanly; one that ends otherwise ends mid-frame.
+    pub fn is_idle(&self) -> bool {
+        self.at == self.buf.len() && self.partials.is_empty()
+    }
+
     pub fn push(&mut self, bytes: &[u8]) {
         // Compact before growing, so a long session's buffer stays the size
         // of what is outstanding rather than of everything ever read.
@@ -409,5 +416,25 @@ mod tests {
         let (got, abandoned) = all(&wire);
         assert!(got.is_empty());
         assert_eq!(abandoned, [1, 1]);
+    }
+
+    #[test]
+    fn idle_only_between_whole_transactions() {
+        let mut r = FrameReader::new();
+        assert!(r.is_idle());
+        let whole = frame(0x6a, 0, None, &body(0x65, b"hi"));
+        r.push(&whole[..5]);
+        assert!(!r.is_idle(), "part of a frame");
+        r.push(&whole[5..]);
+        assert!(!r.is_idle(), "a frame not yet taken");
+        assert!(r.next_transaction().unwrap().is_some());
+        assert!(r.is_idle());
+
+        // The first fragment of a split transaction, read whole: still
+        // waiting on the rest.
+        let split = body(0x65, &[b'x'; 40]);
+        r.push(&frame(0x1_0000, 3, Some(split.len() as u32), &split[..10]));
+        assert!(r.next_transaction().unwrap().is_none());
+        assert!(!r.is_idle(), "a split transaction half in");
     }
 }
