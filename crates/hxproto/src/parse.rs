@@ -856,7 +856,8 @@ pub fn parse_history_entry(data: &[u8]) -> Option<HistoryEntry<'_>> {
 //                    walker drops it on the floor)
 //   u32 fsize       (byte size, or item count for folders)
 //   u32 unknown
-//   u32 fnlen       (filename byte length)
+//   u16 script      (the name's text script; 0 for Roman)
+//   u16 fnlen       (filename byte length)
 //   u8  fname[fnlen]
 //
 // Total fixed header = 4 (data hdr) + 20 (fields) = 24 bytes before
@@ -925,7 +926,10 @@ pub fn parse_file_list_entry(data: &[u8], off: usize) -> Option<(FileListEntry<'
     let fsize = u32::from_be_bytes([rest[12], rest[13], rest[14], rest[15]]);
     // rest[16..20] is the spec-named `unknown` field — surfaced
     // nowhere in current callers, dropped on the floor here.
-    let fnlen = u32::from_be_bytes([rest[20], rest[21], rest[22], rest[23]]);
+    // rest[20..22] is the name's script code. Read together with the
+    // length as one u32, a nonzero script made every such name look tens
+    // of kilobytes long, and the entry was dropped as malformed.
+    let fnlen = u16::from_be_bytes([rest[22], rest[23]]) as u32;
 
     // Name follows at offset 24 within this chunk. Bound the name
     // read against both the declared chunk total AND the actual
@@ -3648,6 +3652,26 @@ mod tests {
         assert_eq!(e.name, b"readme.txt");
         // Next offset = 4-byte hdr + chunk_len (20 + 10) = 34.
         assert_eq!(next, 34);
+        assert_eq!(next, body.len());
+    }
+
+    #[test]
+    fn file_list_entry_reads_the_name_past_its_script_code() {
+        // A name in a script other than Roman: the script code sits in the
+        // two bytes before the length and is not part of it.
+        let name = b"report";
+        let mut body = vec![0x00, 0xc8];
+        body.extend_from_slice(&(20 + name.len() as u16).to_be_bytes());
+        body.extend_from_slice(b"TEXT");
+        body.extend_from_slice(b"ttxt");
+        body.extend_from_slice(&7u32.to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0, 0]);
+        body.extend_from_slice(&1u16.to_be_bytes()); // script: Japanese
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name);
+        let (e, next) = parse_file_list_entry(&body, 0).expect("a whole entry");
+        assert_eq!(e.name, name);
+        assert_eq!(e.fnlen, name.len() as u32);
         assert_eq!(next, body.len());
     }
 

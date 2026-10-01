@@ -213,6 +213,7 @@ fn an_unanswered_login_times_out() {
 fn replies_find_their_requests() {
     let mut s = ready();
     // The post-login user list went out on trans 3: login 1, agree 2.
+    assert_eq!(s.roster_trans(), Some(3));
     let users = [
         &[0, 5, 0, 1, 0, 2, 0, 3, b'b', b'o', b'b'][..],
         &[0, 6, 0, 9, 0, 0, 0, 2, b'm', b'e', 0, 0x11, 0x22, 0x33][..],
@@ -452,7 +453,10 @@ fn threaded_news_walks_down_from_the_root() {
     assert_eq!(out[0].0, 371);
     assert_eq!(
         out[0].2,
-        [(tag::NEWSPATH, request::news_path(&[b"News", b"General"]))]
+        [(
+            tag::NEWSPATH,
+            [&[0, 2, 0, 0, 4][..], b"News", &[0, 0, 7], b"General"].concat()
+        )]
     );
     s.news_article(&["News", "General"], 3).unwrap();
     let out = sent(&mut s);
@@ -665,4 +669,191 @@ fn fields_read_back_a_reply() {
         fields(&frame),
         [(tag::NAME, b"x".to_vec()), (tag::UID, vec![0, 1])]
     );
+}
+
+/// One folder-listing entry: type, creator, size, then the name after its
+/// script code and length.
+fn entry(ftype: &[u8; 4], creator: &[u8; 4], size: u32, script: u16, name: &[u8]) -> Vec<u8> {
+    let mut e = Vec::new();
+    e.extend_from_slice(ftype);
+    e.extend_from_slice(creator);
+    e.extend_from_slice(&size.to_be_bytes());
+    e.extend_from_slice(&[0, 0, 0, 0]);
+    e.extend_from_slice(&script.to_be_bytes());
+    e.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    e.extend_from_slice(name);
+    e
+}
+
+#[test]
+fn a_folder_lists_its_files() {
+    let mut s = ready();
+    let t = s.file_list(&[]).unwrap();
+    let out = sent(&mut s);
+    assert_eq!(out[0].0, 200);
+    // The root still goes as a DIR, an empty one, as GtkHx sends it.
+    assert_eq!(out[0].2, [(tag::DIR, vec![0, 0])]);
+    // As real servers send a folder: zeros for its creator.
+    let a = entry(b"fldr", &[0; 4], 3, 0, b"Uploads");
+    let b = entry(b"TEXT", b"ttxt", 1234, 0, b"read me");
+    // Between them, a field this session has no use for.
+    s.feed(
+        &server(TASK, t, 0, &[(0x00c8, &a), (0x0099, b"x"), (0x00c8, &b)]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [Event::FileList {
+            trans: t,
+            files: vec![
+                FileEntry {
+                    name: "Uploads".into(),
+                    name_bytes: b"Uploads".to_vec(),
+                    folder: true,
+                    size: 3,
+                    type_code: *b"fldr",
+                    creator: [0; 4],
+                },
+                FileEntry {
+                    name: "read me".into(),
+                    name_bytes: b"read me".to_vec(),
+                    folder: false,
+                    size: 1234,
+                    type_code: *b"TEXT",
+                    creator: *b"ttxt",
+                },
+            ],
+        }]
+    );
+
+    // A nested folder, spelled out: a count, then per name two zeros, a
+    // length and the name.
+    s.file_list(&["Uploads", "new"]).unwrap();
+    assert_eq!(
+        sent(&mut s)[0].2,
+        [(
+            tag::DIR,
+            [&[0, 2, 0, 0, 7][..], b"Uploads", &[0, 0, 3], b"new"].concat()
+        )]
+    );
+}
+
+#[test]
+fn an_empty_folder_lists_nothing_and_a_refusal_says_why() {
+    let mut s = ready();
+    let t = s.file_list(&["Uploads"]).unwrap();
+    s.feed(&server(TASK, t, 0, &[]), T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::FileList {
+            trans: t,
+            files: vec![]
+        }]
+    );
+    let t = s.file_list(&[]).unwrap();
+    s.feed(
+        &server(TASK, t, 1, &[(tag::TASK_ERROR, b"No files here.")]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [Event::Failed {
+            trans: t,
+            reason: Some("No files here.".into())
+        }]
+    );
+}
+
+#[test]
+fn a_bad_entry_is_skipped_and_its_neighbors_list() {
+    let mut s = ready();
+    let t = s.file_list(&[]).unwrap();
+    let good = entry(b"TEXT", b"ttxt", 1, 0, b"a");
+    let short = vec![0u8; 10];
+    s.feed(
+        &server(
+            TASK,
+            t,
+            0,
+            &[(0x00c8, &good), (0x00c8, &short), (0x00c8, &good)],
+        ),
+        T0,
+    );
+    let ev = events(&mut s);
+    assert!(matches!(&ev[..], [Event::FileList { files, .. }] if files.len() == 2));
+}
+
+#[test]
+fn large_files_get_their_exact_size_from_the_field_after_them() {
+    let mut s = ready();
+    let t = s.file_list(&[]).unwrap();
+    let big = entry(b"BINA", b"????", u32::MAX, 0, b"disk image");
+    let small = entry(b"TEXT", b"ttxt", 5, 0, b"note");
+    let folder = entry(b"fldr", &[0; 4], u32::MAX, 0, b"huge");
+    let exact = (6u64 << 30).to_be_bytes();
+    let items = 70_000u64.to_be_bytes();
+    // A companion only where one is needed, as Janus sends them.
+    s.feed(
+        &server(
+            TASK,
+            t,
+            0,
+            &[
+                (0x00c8, &big),
+                (0x01f1, &exact),
+                (0x00c8, &small),
+                (0x00c8, &folder),
+                (0x01f4, &items),
+            ],
+        ),
+        T0,
+    );
+    let ev = events(&mut s);
+    let Event::FileList { files, .. } = &ev[0] else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(
+        files.iter().map(|f| f.size).collect::<Vec<_>>(),
+        [6u64 << 30, 5, 70_000]
+    );
+}
+
+#[test]
+fn names_go_back_as_the_server_sent_them() {
+    // A server that never agreed to UTF-8 but sends it anyway: "café"
+    // decodes from its UTF-8 bytes, and re-encoding the name would send
+    // Mac Roman ones it does not know.
+    let mut s = logging_in(Config::guest("me"));
+    s.feed(&login_reply(None, None), T0);
+    sent(&mut s);
+    events(&mut s);
+    let t = s.file_list(&[]).unwrap();
+    sent(&mut s);
+    let cafe = entry(b"fldr", &[0; 4], 0, 0, "café".as_bytes());
+    s.feed(&server(TASK, t, 0, &[(0x00c8, &cafe)]), T0);
+    let ev = events(&mut s);
+    let Event::FileList { files, .. } = &ev[0] else {
+        panic!("{ev:?}")
+    };
+    assert_eq!(files[0].name, "café");
+    assert_ne!(s.encode(&files[0].name), files[0].name_bytes);
+    s.file_list_raw(&[&files[0].name_bytes]).unwrap();
+    assert_eq!(
+        sent(&mut s)[0].2,
+        [(tag::DIR, [&[0, 1, 0, 0, 5][..], "café".as_bytes()].concat())]
+    );
+    // A name in another script still lists.
+    let t = s.file_list(&[]).unwrap();
+    let kana = entry(b"TEXT", b"ttxt", 1, 1, b"\x83\x41");
+    s.feed(&server(TASK, t, 0, &[(0x00c8, &kana)]), T0);
+    assert!(matches!(&events(&mut s)[..], [Event::FileList { files, .. }] if files.len() == 1));
+}
+
+#[test]
+fn a_path_too_long_to_send_is_refused_not_cut() {
+    let mut s = ready();
+    let long = "x".repeat(256);
+    assert_eq!(s.file_list(&[&long]), Err(Error::TooLong));
+    assert_eq!(s.news_category(&[&long]), Err(Error::TooLong));
+    assert!(s.take_outgoing().is_empty());
 }

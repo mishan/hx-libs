@@ -161,23 +161,37 @@ pub fn news_post(body: &[u8]) -> Option<Request> {
     Request::from_built(ClientHdr::NewsPost, &chunks, hc)
 }
 
-/// Encode a threaded-news path: a count, then per component two zero
-/// bytes, a length byte and the name. The same shape as a file DIR.
-/// Components longer than a length byte can say are cut to fit.
-pub fn news_path(components: &[&[u8]]) -> Vec<u8> {
+/// Encode a path as a file DIR or a threaded-news path: a count, then
+/// per component two zero bytes, a length byte and the name. Empty
+/// components are skipped, as GtkHx skips them.
+///
+/// `None` when a component is longer than its length byte can say, or
+/// the whole is longer than a field can hold. Cutting it to fit instead
+/// would name some other folder — a sibling that shares the first 255
+/// bytes, or an ancestor — and list that as if it were the one asked for.
+pub fn path(components: &[&[u8]]) -> Option<Vec<u8>> {
     let mut out = vec![0u8, 0u8];
     let mut count: u16 = 0;
     for part in components.iter().filter(|p| !p.is_empty()) {
-        let name = &part[..part.len().min(u8::MAX as usize)];
-        if out.len() + 3 + name.len() > u16::MAX as usize {
-            break;
-        }
-        out.extend_from_slice(&[0, 0, name.len() as u8]);
-        out.extend_from_slice(name);
-        count += 1;
+        let len = u8::try_from(part.len()).ok()?;
+        out.extend_from_slice(&[0, 0, len]);
+        out.extend_from_slice(part);
+        count = count.checked_add(1)?;
+    }
+    if out.len() > u16::MAX as usize {
+        return None;
     }
     out[..2].copy_from_slice(&count.to_be_bytes());
-    out
+    Some(out)
+}
+
+/// FILE_LIST (200) for a folder; the root is `&[]`. The folder always
+/// goes as a DIR, an empty one for the root, as GtkHx sends it.
+pub fn file_list(path: &[&[u8]]) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_file_list_chunks(&encoded, &mut chunks);
+    Request::from_built(ClientHdr::FileList, &chunks, hc)
 }
 
 /// NEWS_LISTDIR (370) or NEWS_LISTCATEGORY (371). The root is asked for
@@ -185,18 +199,14 @@ pub fn news_path(components: &[&[u8]]) -> Vec<u8> {
 pub fn news_list(opcode: ClientHdr, path: &[&[u8]]) -> Option<Request> {
     let mut r = Request::new(opcode as u32);
     if !path.is_empty() {
-        let encoded = news_path(path);
-        if encoded.len() > u16::MAX as usize {
-            return None;
-        }
-        r = r.field(tag::NEWSPATH, encoded);
+        r = r.field(tag::NEWSPATH, self::path(path)?);
     }
     Some(r)
 }
 
 /// GETTHREAD (400): one article, as text.
 pub fn news_article(path: &[&[u8]], id: u32) -> Option<Request> {
-    let encoded = news_path(path);
+    let encoded = self::path(path)?;
     let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY, HxChunk::EMPTY];
     let mut scratch = [0u8; 4];
     let req = build::NewsGetThreadRequest {
@@ -248,11 +258,14 @@ mod tests {
 
     #[test]
     fn news_paths_encode_like_file_paths() {
-        assert_eq!(news_path(&[]), vec![0, 0]);
+        assert_eq!(path(&[]), Some(vec![0, 0]));
         assert_eq!(
-            news_path(&[b"News", b"", b"Misc"]),
+            path(&[b"News", b"", b"Misc"]).unwrap(),
             [&[0, 2, 0, 0, 4][..], b"News", &[0, 0, 4], b"Misc"].concat()
         );
+        // A component too long for its length byte is refused, not cut.
+        assert_eq!(path(&[&[b'a'; 256]]), None);
+        assert!(path(&[&[b'a'; 255]]).is_some());
         // The root is no path at all.
         assert!(news_list(ClientHdr::NewsListDir, &[])
             .unwrap()
