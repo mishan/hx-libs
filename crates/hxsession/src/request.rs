@@ -1,0 +1,262 @@
+//! The requests a session sends, as owned values.
+//!
+//! Where hxproto has a builder for an opcode it is used, so these are the
+//! bytes GtkHx sends; the builders are shaped for a C caller, and
+//! [`Request::from_built`] copies what one filled into something that owns
+//! its bytes.
+
+use hxproto::build::{self, HxChunk, PackChunk};
+use hxproto::messages::{tag, ClientHdr};
+
+/// One request: the transaction type and its fields, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub opcode: u32,
+    pub fields: Vec<(u16, Vec<u8>)>,
+}
+
+impl Request {
+    pub fn new(opcode: u32) -> Self {
+        Request {
+            opcode,
+            fields: Vec::new(),
+        }
+    }
+
+    pub fn field(mut self, tag: u16, data: impl Into<Vec<u8>>) -> Self {
+        self.fields.push((tag, data.into()));
+        self
+    }
+
+    /// Copy what an hxproto builder filled. `hc` is its return: the number
+    /// of chunks filled, or 0 when it refused the input.
+    fn from_built(opcode: ClientHdr, chunks: &[HxChunk], hc: usize) -> Option<Self> {
+        if hc == 0 {
+            return None;
+        }
+        let fields = chunks[..hc]
+            .iter()
+            .map(|c| {
+                let data = if c.data.is_null() || c.len == 0 {
+                    Vec::new()
+                } else {
+                    // SAFETY: the builder pointed `data` at `len` bytes of an
+                    // input or scratch buffer that outlives this call.
+                    unsafe { std::slice::from_raw_parts(c.data, c.len as usize) }.to_vec()
+                };
+                (c.tag, data)
+            })
+            .collect();
+        Some(Request {
+            opcode: opcode as u32,
+            fields,
+        })
+    }
+
+    /// The whole frame for transaction `trans`, or `None` if a field is
+    /// longer than its 16-bit length can say or there are too many.
+    pub fn pack(&self, trans: u32) -> Option<Vec<u8>> {
+        let chunks: Vec<PackChunk<'_>> = self
+            .fields
+            .iter()
+            .map(|(tag, data)| PackChunk { tag: *tag, data })
+            .collect();
+        let mut out = vec![0u8; build::pack_message_size(&chunks)];
+        let n = build::pack_message(&mut out, self.opcode, trans, 0, &chunks)?;
+        out.truncate(n);
+        Some(out)
+    }
+}
+
+/// The Hotline credential obfuscation: every byte inverted.
+fn obfuscate(b: &[u8]) -> Vec<u8> {
+    b.iter().map(|x| !x).collect()
+}
+
+/// Longest login or password sent, as GtkHx caps them.
+const MAX_CREDENTIAL: usize = 64;
+
+/// LOGIN (107), as GtkHx sends it on the plain path: the login always,
+/// everything else only when it says something. The nickname is not sent
+/// here — it goes with the agreement, or in a user change to a server too
+/// old for one — which is what every server GtkHx is tested against
+/// expects.
+pub fn login(login: &[u8], password: &[u8], icon: u16, version: u16, caps: u16) -> Request {
+    let login = &login[..login.len().min(MAX_CREDENTIAL)];
+    let password = &password[..password.len().min(MAX_CREDENTIAL)];
+    let mut r = Request::new(ClientHdr::Login as u32).field(tag::LOGIN, obfuscate(login));
+    if !password.is_empty() {
+        r = r.field(tag::PASSWORD, obfuscate(password));
+    }
+    if icon != 0 {
+        r = r.field(tag::ICON, icon.to_be_bytes());
+    }
+    if version != 0 {
+        r = r.field(tag::VERSION, version.to_be_bytes());
+    }
+    if caps != 0 {
+        r = r.field(tag::CAPABILITIES, caps.to_be_bytes());
+    }
+    r
+}
+
+/// AGREEMENTAGREE (121): icon, name and options, always all three —
+/// Mobius drops a client whose agree leaves the options out.
+pub fn agree(name: &[u8], icon: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY, HxChunk::EMPTY];
+    let mut scratch = [0u8; 4];
+    let req = build::AgreementAgreeRequest {
+        icon,
+        display_name: name,
+        options: 0,
+    };
+    let hc = build::build_agreement_agree_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::AgreementAgree, &chunks, hc)
+}
+
+/// USER_CHANGE (304): the name and icon others see.
+pub fn user_change(name: &[u8], icon: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY, HxChunk::EMPTY];
+    let mut scratch = [0u8; 6];
+    let req = build::UserChangeRequest {
+        icon,
+        name,
+        nick_color: None,
+    };
+    let hc = build::build_user_change_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::UserChange, &chunks, hc)
+}
+
+/// CHAT (105) to the public chat (`cid` 0) or a private one. `style` 1 is
+/// an emote.
+pub fn chat(body: &[u8], cid: u32, style: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY, HxChunk::EMPTY];
+    let mut scratch = [0u8; 6];
+    let req = build::ChatRequest { cid, style, body };
+    let hc = build::build_chat_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::Chat, &chunks, hc)
+}
+
+/// MSG (108): a private message.
+pub fn msg(uid: u16, body: &[u8]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY];
+    let mut scratch = [0u8; 2];
+    let req = build::MsgRequest { uid, body };
+    let hc = build::build_msg_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::Msg, &chunks, hc)
+}
+
+/// USER_GETINFO (303).
+pub fn user_info(uid: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY];
+    let mut scratch = [0u8; 2];
+    let hc = build::build_user_getinfo_chunks(uid, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::UserGetInfo, &chunks, hc)
+}
+
+/// NEWS_POST (103): add to 1.2 flat news.
+pub fn news_post(body: &[u8]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_news_post_chunks(body, &mut chunks);
+    Request::from_built(ClientHdr::NewsPost, &chunks, hc)
+}
+
+/// Encode a threaded-news path: a count, then per component two zero
+/// bytes, a length byte and the name. The same shape as a file DIR.
+/// Components longer than a length byte can say are cut to fit.
+pub fn news_path(components: &[&[u8]]) -> Vec<u8> {
+    let mut out = vec![0u8, 0u8];
+    let mut count: u16 = 0;
+    for part in components.iter().filter(|p| !p.is_empty()) {
+        let name = &part[..part.len().min(u8::MAX as usize)];
+        if out.len() + 3 + name.len() > u16::MAX as usize {
+            break;
+        }
+        out.extend_from_slice(&[0, 0, name.len() as u8]);
+        out.extend_from_slice(name);
+        count += 1;
+    }
+    out[..2].copy_from_slice(&count.to_be_bytes());
+    out
+}
+
+/// NEWS_LISTDIR (370) or NEWS_LISTCATEGORY (371). The root is asked for
+/// with no path at all.
+pub fn news_list(opcode: ClientHdr, path: &[&[u8]]) -> Option<Request> {
+    let mut r = Request::new(opcode as u32);
+    if !path.is_empty() {
+        let encoded = news_path(path);
+        if encoded.len() > u16::MAX as usize {
+            return None;
+        }
+        r = r.field(tag::NEWSPATH, encoded);
+    }
+    Some(r)
+}
+
+/// GETTHREAD (400): one article, as text.
+pub fn news_article(path: &[&[u8]], id: u32) -> Option<Request> {
+    let encoded = news_path(path);
+    let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY, HxChunk::EMPTY];
+    let mut scratch = [0u8; 4];
+    let req = build::NewsGetThreadRequest {
+        path: &encoded,
+        threadid: id,
+        mime_type: b"text/plain",
+    };
+    let hc = build::build_news_getthread_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::GetThread, &chunks, hc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_says_only_what_it_has() {
+        let r = login(b"", b"", 0, 0, 0);
+        assert_eq!(r.fields, vec![(tag::LOGIN, vec![])]);
+        let r = login(b"ab", b"c", 414, 254, 2);
+        assert_eq!(
+            r.fields,
+            vec![
+                (tag::LOGIN, vec![!b'a', !b'b']),
+                (tag::PASSWORD, vec![!b'c']),
+                (tag::ICON, 414u16.to_be_bytes().to_vec()),
+                (tag::VERSION, 254u16.to_be_bytes().to_vec()),
+                (tag::CAPABILITIES, 2u16.to_be_bytes().to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn agree_always_carries_options() {
+        let r = agree(b"nick", 7).unwrap();
+        assert_eq!(r.opcode, 121);
+        assert!(r.fields.contains(&(tag::OPTIONS, vec![0, 0])));
+        assert!(r.fields.contains(&(tag::NAME, b"nick".to_vec())));
+    }
+
+    #[test]
+    fn a_frame_packs_with_its_field_count() {
+        let bytes = msg(3, b"hi").unwrap().pack(9).unwrap();
+        let h = hxproto::parse::Header::parse(&bytes).unwrap();
+        assert_eq!((h.type_, h.trans, h.hc), (108, 9, 2));
+        assert_eq!(h.len as usize, bytes.len() - 20);
+        assert_eq!(h.len, h.len2);
+    }
+
+    #[test]
+    fn news_paths_encode_like_file_paths() {
+        assert_eq!(news_path(&[]), vec![0, 0]);
+        assert_eq!(
+            news_path(&[b"News", b"", b"Misc"]),
+            [&[0, 2, 0, 0, 4][..], b"News", &[0, 0, 4], b"Misc"].concat()
+        );
+        // The root is no path at all.
+        assert!(news_list(ClientHdr::NewsListDir, &[])
+            .unwrap()
+            .fields
+            .is_empty());
+    }
+}

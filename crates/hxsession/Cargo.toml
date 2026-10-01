@@ -1,0 +1,17 @@
+[package]
+rust-version.workspace = true
+name = "hxsession"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "A Hotline client session over the classic control connection, with no I/O of its own"
+publish = false
+
+[features]
+# The end-to-end suite in tests/rig.rs, against GtkHx's Docker rig of real
+# servers. Off by default: CI has no rig.
+rig = []
+
+[dependencies]
+# The emoji tables are a consumer's choice, not this crate's.
+hxproto = { path = "../hxproto", default-features = false }
