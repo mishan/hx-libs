@@ -384,6 +384,8 @@ pub struct Session {
     awaiting_agree: bool,
     agreed: bool,
     ready: bool,
+    /// The trans of the user list sent once the login settled.
+    roster_trans: Option<u32>,
     last_sent: u64,
     /// A request was sent outside `feed` and `tick`, which carry the time,
     /// so `last_sent` waits for the next reading of the clock.
@@ -415,6 +417,7 @@ impl Session {
             awaiting_agree: false,
             agreed: false,
             ready: false,
+            roster_trans: None,
             last_sent: now_ms,
             unstamped: false,
             clocked: false,
@@ -431,6 +434,14 @@ impl Session {
     }
 
     /// The server, once the login has been answered.
+    /// The trans the user list sent with [`Event::Ready`] went out on: its
+    /// answer is an [`Event::UserList`] or an [`Event::Failed`] with this
+    /// trans, which tells a refusal of the list from a refusal of anything
+    /// else sent at login.
+    pub fn roster_trans(&self) -> Option<u32> {
+        self.roster_trans
+    }
+
     pub fn server(&self) -> Option<&ServerInfo> {
         self.server.as_ref()
     }
@@ -1057,10 +1068,11 @@ impl Session {
             return;
         }
         self.ready = true;
-        self.send(
+        let trans = self.send(
             &Request::new(ClientHdr::UserGetList as u32),
             Some(Pending::UserList),
         );
+        self.roster_trans = Some(trans);
         self.events.push_back(Event::Ready);
     }
 

@@ -213,6 +213,7 @@ fn an_unanswered_login_times_out() {
 fn replies_find_their_requests() {
     let mut s = ready();
     // The post-login user list went out on trans 3: login 1, agree 2.
+    assert_eq!(s.roster_trans(), Some(3));
     let users = [
         &[0, 5, 0, 1, 0, 2, 0, 3, b'b', b'o', b'b'][..],
         &[0, 6, 0, 9, 0, 0, 0, 2, b'm', b'e', 0, 0x11, 0x22, 0x33][..],
