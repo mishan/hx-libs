@@ -9,6 +9,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use hxsession::request::Request;
 use hxsession::{Config, Event, Session};
 
 const SERVERS: &[(&str, &str)] = &[
@@ -232,8 +233,28 @@ fn news_answers_on_every_server() {
     }
 }
 
+/// What each rig server's file area holds at its root, by name, and a
+/// folder in it with something inside — or `None` where the server has
+/// no file area and says so. From GtkHx's rig seed (its
+/// `tests/COMPOSE.md`); a long-lived container that has drifted from its
+/// seed fails here first.
+fn file_area(server: &str) -> Option<(&'static [&'static str], Option<&'static str>)> {
+    match server {
+        "mhxd" => Some((
+            &["integration_seed.txt", "test.txt", "test_folder"],
+            Some("test_folder"),
+        )),
+        "janus" => Some((
+            &["integration_seed.txt", "test.txt", "test_folder"],
+            Some("test_folder"),
+        )),
+        "hlservd" => Some((&["test.txt"], None)),
+        _ => None,
+    }
+}
+
 #[test]
-fn the_root_folder_lists_on_every_server() {
+fn files_list_on_every_server() {
     for (name, addr) in servers() {
         let mut c = Client::login(name, addr, &nick(name, "f"));
         let t = c.s.file_list(&[]).unwrap();
@@ -241,15 +262,61 @@ fn the_root_folder_lists_on_every_server() {
             matches!(e, Event::FileList { trans, .. } | Event::Failed { trans, .. } if *trans == t)
         });
         eprintln!("{name}: root folder: {}", summary(&got));
-        // Into the first folder there is, if any.
-        if let Event::FileList { files, .. } = got {
-            if let Some(f) = files.iter().find(|f| f.folder) {
-                let t = c.s.file_list(&[f.name.as_str()]).unwrap();
-                let got = c.until("a folder's listing", |e| {
-                    matches!(e, Event::FileList { trans, .. } | Event::Failed { trans, .. } if *trans == t)
-                });
-                eprintln!("{name}: folder {:?}: {}", f.name, summary(&got));
-            }
+        let Some((names, folder)) = file_area(name) else {
+            assert!(
+                matches!(
+                    got,
+                    Event::Failed {
+                        reason: Some(_),
+                        ..
+                    }
+                ),
+                "{name}: {got:?}"
+            );
+            continue;
+        };
+        let Event::FileList { files, .. } = got else {
+            panic!("{name}: the root did not list: {got:?}")
+        };
+        for want in names {
+            assert!(
+                files.iter().any(|f| f.name == *want),
+                "{name}: no {want} in {files:?}"
+            );
+        }
+        // Every entry the server sent was read: the same listing, taken
+        // whole, has as many entry fields as there are files.
+        let raw = Request::new(200).field(0x00ca, vec![0, 0]);
+        let t = c.s.request(&raw).unwrap();
+        let Event::Reply { frame, .. } = c.until(
+            "the raw listing",
+            |e| matches!(e, Event::Reply { trans, .. } if *trans == t),
+        ) else {
+            unreachable!()
+        };
+        let entries = hxsession::fields(&frame)
+            .iter()
+            .filter(|(tag, _)| *tag == 0x00c8)
+            .count();
+        assert_eq!(entries, files.len(), "{name}: entries parsed");
+
+        if let Some(folder) = folder {
+            let f = files.iter().find(|f| f.name == folder).unwrap();
+            assert!(f.folder && f.size > 0, "{name}: {f:?}");
+            // Opened by the bytes the server gave its name.
+            let t = c.s.file_list_raw(&[&f.name_bytes]).unwrap();
+            let got = c.until("a folder's listing", |e| {
+                matches!(e, Event::FileList { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+            });
+            eprintln!("{name}: folder {folder:?}: {}", summary(&got));
+            let Event::FileList { files: inside, .. } = got else {
+                panic!("{name}: {folder} did not list: {got:?}")
+            };
+            assert_eq!(
+                inside.len() as u64,
+                f.size,
+                "{name}: {folder} holds what its entry said"
+            );
         }
     }
 }

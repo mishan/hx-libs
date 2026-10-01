@@ -36,9 +36,10 @@
 //! are the classic CR; the session converts both ways.
 //!
 //! What is not here yet: HOPE, the transport ciphers and compression,
-//! file transfers (a folder's listing is here; its contents are not), and the extensions (voice, video, inline media, chat
-//! history, GIF icons). [`Session::request`] sends any transaction and
-//! hands its reply back whole, for what has no method of its own.
+//! file transfers (a folder's listing is here; its contents are not),
+//! and the extensions (voice, video, inline media, chat history, GIF
+//! icons). [`Session::request`] sends any transaction and hands its reply
+//! back whole, for what has no method of its own.
 
 pub mod frame;
 pub mod request;
@@ -80,6 +81,10 @@ const MAX_NICK: usize = 31;
 const MAX_NEWS: usize = 65535;
 /// The field a folder listing carries one of per entry.
 const FILE_LIST_ENTRY: u16 = 0x00c8;
+/// Large-Files companions, each following the entry it belongs to: the
+/// exact size of a file, and the exact item count of a folder.
+const FILE_SIZE_64: u16 = 0x01f1;
+const FOLDER_ITEMS_64: u16 = 0x01f4;
 /// How many transactions a server may send before answering the login,
 /// as GtkHx allows. Past that it is not a slow server but a broken one.
 const MAX_EARLY: usize = 32;
@@ -168,19 +173,32 @@ pub struct User {
 /// One entry in a folder listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
+    /// The name, for showing.
     pub name: String,
+    /// The name as the server sent it, for naming the entry back to it:
+    /// a name decoded for show does not always encode back to the same
+    /// bytes, and a folder named by different ones is not found.
+    pub name_bytes: Vec<u8>,
     pub folder: bool,
-    /// Bytes for a file; for a folder, how many items it holds.
-    pub size: u32,
-    /// The classic Mac type and creator codes, e.g. "TEXT" and "ttxt".
-    pub type_code: String,
-    pub creator: String,
+    /// Bytes for a file; for a folder, how many items it holds. Exact past
+    /// 4 GiB only where the server sent the Large-Files companion fields,
+    /// which it does when the login offered [`cap::LARGE_FILES`]; otherwise
+    /// the classic field's `u32::MAX`.
+    pub size: u64,
+    /// The classic Mac type and creator codes as they are on the wire,
+    /// e.g. `*b"TEXT"` and `*b"ttxt"`. A folder's creator is usually zeros.
+    pub type_code: [u8; 4],
+    pub creator: [u8; 4],
 }
 
 /// One entry in a threaded-news listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewsItem {
+    /// The name, for showing.
     pub name: String,
+    /// The name as the server sent it, for naming it back; see
+    /// [`FileEntry::name_bytes`].
+    pub name_bytes: Vec<u8>,
     /// A bundle holds categories and bundles; a category holds articles.
     pub bundle: bool,
 }
@@ -630,39 +648,58 @@ impl Session {
         Ok(self.send(&r, Some(Pending::Quiet)))
     }
 
+    // Each path-taking request comes twice: by name, encoded as this
+    // session sends text, and by the bytes a listing gave (`name_bytes`),
+    // which name a thing back to the server exactly. Empty components are
+    // skipped, so `&[""]` is the root. A component longer than 255 bytes
+    // is `TooLong`.
+
     /// What a threaded-news bundle holds; the root is `&[]`.
     pub fn news_listing(&mut self, path: &[&str]) -> Result<u32, Error> {
-        self.ensure_ready()?;
         let path = self.path_out(path);
-        let path: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
-        let r = request::news_list(ClientHdr::NewsListDir, &path).ok_or(Error::TooLong)?;
+        self.news_listing_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    }
+
+    pub fn news_listing_raw(&mut self, path: &[&[u8]]) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::news_list(ClientHdr::NewsListDir, path).ok_or(Error::TooLong)?;
         Ok(self.send(&r, Some(Pending::NewsListing)))
     }
 
     /// The articles in a threaded-news category.
     pub fn news_category(&mut self, path: &[&str]) -> Result<u32, Error> {
-        self.ensure_ready()?;
         let path = self.path_out(path);
-        let path: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
-        let r = request::news_list(ClientHdr::NewsListCategory, &path).ok_or(Error::TooLong)?;
+        self.news_category_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    }
+
+    pub fn news_category_raw(&mut self, path: &[&[u8]]) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::news_list(ClientHdr::NewsListCategory, path).ok_or(Error::TooLong)?;
         Ok(self.send(&r, Some(Pending::NewsCategory)))
     }
 
     /// One article's text.
     pub fn news_article(&mut self, path: &[&str], id: u32) -> Result<u32, Error> {
-        self.ensure_ready()?;
         let path = self.path_out(path);
-        let path: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
-        let r = request::news_article(&path, id).ok_or(Error::TooLong)?;
+        self.news_article_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>(), id)
+    }
+
+    pub fn news_article_raw(&mut self, path: &[&[u8]], id: u32) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::news_article(path, id).ok_or(Error::TooLong)?;
         Ok(self.send(&r, Some(Pending::NewsArticle)))
     }
 
-    /// What the folder at `path` holds; the root is `&[]`.
+    /// What the folder at `path` holds; the root is `&[]`. The reply
+    /// does not say which folder it lists; the caller keeps the trans.
     pub fn file_list(&mut self, path: &[&str]) -> Result<u32, Error> {
-        self.ensure_ready()?;
         let path = self.path_out(path);
-        let path: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
-        let r = request::file_list(&path).ok_or(Error::TooLong)?;
+        self.file_list_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    }
+
+    pub fn file_list_raw(&mut self, path: &[&[u8]]) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::file_list(path).ok_or(Error::TooLong)?;
         Ok(self.send(&r, Some(Pending::FileList)))
     }
 
@@ -864,6 +901,7 @@ impl Session {
                     .into_iter()
                     .map(|e| NewsItem {
                         name: self.decode(&e.name),
+                        name_bytes: e.name,
                         bundle: e.kind == parse::NewsDirKind::Folder,
                     })
                     .collect();
@@ -900,25 +938,43 @@ impl Session {
                 });
             }
             Some(Pending::FileList) => {
-                let mut files = Vec::new();
+                let mut files: Vec<FileEntry> = Vec::new();
+                // Whether the last field was an entry, which a companion
+                // that follows belongs to. Matched by place, not count: a
+                // server sends one only for the entries that need it.
+                let mut after_entry = false;
                 for c in hxproto::wire::ChunkIter::over_message(&t.buf, len) {
-                    if c.tag != FILE_LIST_ENTRY {
-                        continue;
-                    }
-                    // hxproto's parser takes the field with its header, as
-                    // it sits in the frame.
-                    let mut field = Vec::with_capacity(4 + c.data.len());
-                    field.extend_from_slice(&c.tag.to_be_bytes());
-                    field.extend_from_slice(&(c.data.len() as u16).to_be_bytes());
-                    field.extend_from_slice(c.data);
-                    if let Some((e, _)) = parse::parse_file_list_entry(&field, 0) {
-                        files.push(FileEntry {
-                            name: self.decode(e.name),
-                            folder: e.ftype == parse::FTYPE_FLDR,
-                            size: e.fsize,
-                            type_code: self.decode(&e.ftype.to_be_bytes()),
-                            creator: self.decode(&e.fcreator.to_be_bytes()),
-                        });
+                    match c.tag {
+                        FILE_LIST_ENTRY => {
+                            after_entry = false;
+                            // hxproto's parser takes the field with its
+                            // header, as it sits in the frame.
+                            let mut field = Vec::with_capacity(4 + c.data.len());
+                            field.extend_from_slice(&c.tag.to_be_bytes());
+                            field.extend_from_slice(&(c.data.len() as u16).to_be_bytes());
+                            field.extend_from_slice(c.data);
+                            // A malformed entry is skipped; its neighbors
+                            // still list.
+                            if let Some((e, _)) = parse::parse_file_list_entry(&field, 0) {
+                                files.push(FileEntry {
+                                    name: self.decode(e.name),
+                                    name_bytes: e.name.to_vec(),
+                                    folder: e.ftype == parse::FTYPE_FLDR,
+                                    size: u64::from(e.fsize),
+                                    type_code: e.ftype.to_be_bytes(),
+                                    creator: e.fcreator.to_be_bytes(),
+                                });
+                                after_entry = true;
+                            }
+                        }
+                        FILE_SIZE_64 | FOLDER_ITEMS_64 if after_entry && c.data.len() == 8 => {
+                            let mut v = [0u8; 8];
+                            v.copy_from_slice(c.data);
+                            if let Some(last) = files.last_mut() {
+                                last.size = u64::from_be_bytes(v);
+                            }
+                        }
+                        _ => after_entry = false,
                     }
                 }
                 self.events.push_back(Event::FileList {
