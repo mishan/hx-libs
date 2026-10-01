@@ -666,3 +666,54 @@ fn fields_read_back_a_reply() {
         [(tag::NAME, b"x".to_vec()), (tag::UID, vec![0, 1])]
     );
 }
+
+#[test]
+fn a_folder_lists_its_files() {
+    let mut s = ready();
+    let t = s.file_list(&[]).unwrap();
+    let out = sent(&mut s);
+    assert_eq!(out[0].0, 200);
+    // The root still goes as a DIR, an empty one, as GtkHx sends it.
+    assert_eq!(out[0].2, [(tag::DIR, vec![0, 0])]);
+    let entry = |ftype: &[u8; 4], creator: &[u8; 4], size: u32, name: &[u8]| {
+        let mut e = Vec::new();
+        e.extend_from_slice(ftype);
+        e.extend_from_slice(creator);
+        e.extend_from_slice(&size.to_be_bytes());
+        e.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        e.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        e.extend_from_slice(name);
+        e
+    };
+    let a = entry(b"fldr", b"n/a ", 3, b"Uploads");
+    let b = entry(b"TEXT", b"ttxt", 1234, b"read me");
+    s.feed(&server(TASK, t, 0, &[(0x00c8, &a), (0x00c8, &b)]), T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::FileList {
+            trans: t,
+            files: vec![
+                FileEntry {
+                    name: "Uploads".into(),
+                    folder: true,
+                    size: 3,
+                    type_code: "fldr".into(),
+                    creator: "n/a ".into(),
+                },
+                FileEntry {
+                    name: "read me".into(),
+                    folder: false,
+                    size: 1234,
+                    type_code: "TEXT".into(),
+                    creator: "ttxt".into(),
+                },
+            ],
+        }]
+    );
+
+    s.file_list(&["Uploads", "new"]).unwrap();
+    assert_eq!(
+        sent(&mut s)[0].2,
+        [(tag::DIR, request::news_path(&[b"Uploads", b"new"]))]
+    );
+}

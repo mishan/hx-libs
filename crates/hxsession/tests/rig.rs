@@ -232,9 +232,32 @@ fn news_answers_on_every_server() {
     }
 }
 
+#[test]
+fn the_root_folder_lists_on_every_server() {
+    for (name, addr) in servers() {
+        let mut c = Client::login(name, addr, &nick(name, "f"));
+        let t = c.s.file_list(&[]).unwrap();
+        let got = c.until("the root listing", |e| {
+            matches!(e, Event::FileList { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+        });
+        eprintln!("{name}: root folder: {}", summary(&got));
+        // Into the first folder there is, if any.
+        if let Event::FileList { files, .. } = got {
+            if let Some(f) = files.iter().find(|f| f.folder) {
+                let t = c.s.file_list(&[f.name.as_str()]).unwrap();
+                let got = c.until("a folder's listing", |e| {
+                    matches!(e, Event::FileList { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+                });
+                eprintln!("{name}: folder {:?}: {}", f.name, summary(&got));
+            }
+        }
+    }
+}
+
 fn summary(e: &Event) -> String {
     match e {
         Event::NewsFile { text, .. } => format!("{} bytes", text.len()),
+        Event::FileList { files, .. } => format!("{} entries", files.len()),
         Event::NewsListing { items, .. } => format!("{} items", items.len()),
         Event::NewsCategory { articles, .. } => format!("{} articles", articles.len()),
         Event::NewsArticle { text, .. } => format!("{} bytes", text.len()),

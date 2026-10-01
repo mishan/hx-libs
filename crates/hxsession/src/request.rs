@@ -180,6 +180,15 @@ pub fn news_path(components: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// FILE_LIST (200) for a folder; the root is `&[]`. The folder always
+/// goes as a DIR, an empty one for the root, as GtkHx sends it.
+pub fn file_list(path: &[&[u8]]) -> Option<Request> {
+    let encoded = news_path(path);
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_file_list_chunks(&encoded, &mut chunks);
+    Request::from_built(ClientHdr::FileList, &chunks, hc)
+}
+
 /// NEWS_LISTDIR (370) or NEWS_LISTCATEGORY (371). The root is asked for
 /// with no path at all.
 pub fn news_list(opcode: ClientHdr, path: &[&[u8]]) -> Option<Request> {
