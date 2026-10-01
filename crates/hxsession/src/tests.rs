@@ -538,11 +538,11 @@ fn the_login_reply_is_the_first_reply_whatever_its_trans() {
 
 #[test]
 fn a_1_2_server_gets_the_name_even_when_an_agreement_came_first() {
-    // An empty one: no agree for a server that has no such opcode.
+    // One that says there is none is a 1.5 server hiding its version.
     let mut s = logging_in(Config::guest("me"));
     s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
     s.feed(&login_reply(None, None), T0);
-    assert_eq!(opcodes(&mut s), [304, 300]);
+    assert_eq!(opcodes(&mut s), [304, 121, 300]);
 
     // One with text is shown, and does not hold the session up.
     let mut s = logging_in(Config::guest("me"));
@@ -856,4 +856,276 @@ fn a_path_too_long_to_send_is_refused_not_cut() {
     assert_eq!(s.file_list(&[&long]), Err(Error::TooLong));
     assert_eq!(s.news_category(&[&long]), Err(Error::TooLong));
     assert!(s.take_outgoing().is_empty());
+}
+
+// ---- Raw mode ----------------------------------------------------------
+
+fn raw() -> Config {
+    Config {
+        raw: true,
+        ..Config::guest("me")
+    }
+}
+
+/// A transaction as the caller of a raw session builds it.
+fn caller(opcode: u32, trans: u32) -> Vec<u8> {
+    Request::new(opcode).pack(trans).unwrap()
+}
+
+#[test]
+fn raw_hands_over_the_login_reply_and_what_came_before_it() {
+    let mut s = logging_in(raw());
+    let selfinfo = server(0x162, 0, 0, &[]);
+    s.feed(&selfinfo, T0);
+    assert!(events(&mut s).is_empty());
+    let reply = login_reply(Some(190), None);
+    s.feed(&reply, T0);
+    let ev = events(&mut s);
+    assert_eq!(
+        ev[0],
+        Event::Reply {
+            trans: 1,
+            frame: reply
+        }
+    );
+    assert!(matches!(&ev[1], Event::LoggedIn(i) if i.version == 190));
+    assert_eq!(
+        ev[2],
+        Event::Unhandled {
+            opcode: 0x162,
+            frame: selfinfo
+        }
+    );
+    assert_eq!(ev.len(), 3);
+}
+
+#[test]
+fn raw_answers_an_empty_agreement_and_leaves_the_user_list_to_the_caller() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    events(&mut s);
+    let agreement = server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]);
+    s.feed(&agreement, T0);
+    let out = sent(&mut s);
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].0, out[0].1), (121, 2));
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::Unhandled {
+                opcode: 0x6d,
+                frame: agreement
+            },
+            Event::Ready
+        ]
+    );
+    assert_eq!(s.roster_trans(), None);
+    let refusal = server(TASK, 2, 1, &[(tag::TASK_ERROR, b"No.")]);
+    s.feed(&refusal, T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::Reply {
+            trans: 2,
+            frame: refusal
+        }]
+    );
+}
+
+#[test]
+fn raw_shows_an_agreement_and_answers_it_when_told() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    events(&mut s);
+    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
+    let ev = events(&mut s);
+    assert!(matches!(ev[0], Event::Unhandled { opcode: 0x6d, .. }));
+    assert_eq!(ev[1], Event::Agreement("Be nice.".into()));
+    assert!(s.take_outgoing().is_empty());
+    s.agree().unwrap();
+    assert_eq!(opcodes(&mut s), [121]);
+    assert_eq!(events(&mut s), [Event::Ready]);
+}
+
+#[test]
+fn raw_still_names_us_to_a_1_2_server_and_waits_on_no_agreement() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(None, None), T0);
+    let out = sent(&mut s);
+    assert_eq!(
+        out.iter().map(|o| (o.0, o.1)).collect::<Vec<_>>(),
+        [(304, 2)]
+    );
+    assert!(events(&mut s).contains(&Event::Ready));
+    assert_eq!(s.next_deadline(), None);
+}
+
+#[test]
+fn raw_sends_what_the_caller_built_and_hands_back_its_answer() {
+    let mut s = logging_in(raw());
+    // Not before the login is answered: the server would not take it.
+    assert_eq!(
+        s.send_raw(&caller(300, RAW_TRANS_BASE)),
+        Err(Error::NotReady)
+    );
+    s.feed(&login_reply(Some(190), None), T0);
+    events(&mut s);
+
+    let frame = caller(300, RAW_TRANS_BASE);
+    s.send_raw(&frame).unwrap();
+    assert_eq!(s.take_outgoing(), frame);
+
+    let refusal = server(TASK, RAW_TRANS_BASE, 1, &[(tag::TASK_ERROR, b"No.")]);
+    s.feed(&refusal, T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::Reply {
+            trans: RAW_TRANS_BASE,
+            frame: refusal
+        }]
+    );
+    let chat = server(0x6a, 0, 0, &[(tag::BODY, b"hi")]);
+    s.feed(&chat, T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::Unhandled {
+            opcode: 0x6a,
+            frame: chat
+        }]
+    );
+}
+
+#[test]
+fn raw_leaves_requests_and_the_keepalive_to_the_caller() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    assert_eq!(s.user_list(), Err(Error::NotReady));
+    assert_eq!(s.chat("hi"), Err(Error::NotReady));
+    assert_eq!(s.next_deadline(), None);
+    s.tick(T0 + 3_600_000);
+    assert!(s.take_outgoing().is_empty());
+}
+
+#[test]
+fn a_raw_login_sent_elsewhere_may_start_two_below_the_callers() {
+    let mut s = Session::logging_in(raw(), RAW_TRANS_BASE - 2, T0);
+    // A 1.2 server, with an agreement to answer: both of the session's own.
+    let mut reply = login_reply(None, None);
+    reply[4..8].copy_from_slice(&2u32.to_be_bytes());
+    s.feed(&reply, T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
+    s.agree().unwrap();
+    let trans: Vec<u32> = sent(&mut s).iter().map(|o| o.1).collect();
+    assert_eq!(trans, [RAW_TRANS_BASE - 2, RAW_TRANS_BASE - 1]);
+}
+
+#[test]
+#[should_panic(expected = "cannot start at")]
+fn a_raw_login_sent_elsewhere_may_not_start_among_the_callers() {
+    Session::logging_in(raw(), RAW_TRANS_BASE - 1, T0);
+}
+
+#[test]
+fn raw_takes_only_whole_transactions_numbered_as_the_callers() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    s.take_outgoing();
+    // The session's own numbers, a cut-off frame, a frame and a half.
+    assert_eq!(s.send_raw(&caller(300, 2)), Err(Error::Malformed));
+    let whole = caller(300, RAW_TRANS_BASE);
+    assert_eq!(s.send_raw(&whole[..21]), Err(Error::Malformed));
+    assert_eq!(
+        s.send_raw(&[whole.clone(), whole.clone()].concat()),
+        Err(Error::Malformed)
+    );
+    assert!(s.take_outgoing().is_empty());
+    s.send_raw(&whole).unwrap();
+
+    s.disconnected();
+    assert_eq!(s.send_raw(&whole), Err(Error::NotReady));
+    assert_eq!(ready().send_raw(&whole), Err(Error::NotReady), "not raw");
+}
+
+#[test]
+fn raw_agrees_as_whoever_the_caller_has_become() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
+    s.set_identity("renamed", 9);
+    s.agree().unwrap();
+    let out = sent(&mut s);
+    assert!(out[0].2.contains(&(tag::NAME, b"renamed".to_vec())));
+    assert!(out[0].2.contains(&(tag::ICON, 9u16.to_be_bytes().to_vec())));
+}
+
+#[test]
+fn raw_hands_over_a_refused_login_before_closing() {
+    let mut s = logging_in(raw());
+    let refusal = server(TASK, 1, 1, &[(tag::TASK_ERROR, b"No.")]);
+    s.feed(&refusal, T0);
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::Reply {
+                trans: 1,
+                frame: refusal
+            },
+            Event::Closed(Closed::LoginRefused(Some("No.".into())))
+        ]
+    );
+}
+
+#[test]
+fn raw_stops_waiting_for_an_agreement_without_sending_anything() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    events(&mut s);
+    s.tick(T0 + 2_000);
+    assert!(s.take_outgoing().is_empty());
+    assert_eq!(events(&mut s), [Event::Ready]);
+}
+
+#[test]
+fn raw_holds_an_early_agreement_for_the_login_reply() {
+    let mut s = logging_in(raw());
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    assert!(s.take_outgoing().is_empty());
+    s.feed(&login_reply(Some(190), None), T0);
+    assert_eq!(opcodes(&mut s), [121]);
+    let ev = events(&mut s);
+    assert!(matches!(ev[1], Event::LoggedIn(_)));
+    assert!(matches!(ev[2], Event::Unhandled { opcode: 0x6d, .. }));
+    assert_eq!(ev[3], Event::Ready);
+}
+
+#[test]
+fn a_transaction_too_large_to_take_closes_saying_how_large() {
+    let mut s = ready();
+    let mut huge = server(0x6a, 0, 0, &[]);
+    let claim = (frame::MAX_TRANSACTION as u32 + 1).to_be_bytes();
+    huge[12..16].copy_from_slice(&claim);
+    huge[16..20].copy_from_slice(&claim);
+    s.feed(&huge, T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::Closed(Closed::TooLarge(
+            frame::MAX_TRANSACTION as u32 + 1
+        ))]
+    );
+}
+
+#[test]
+fn the_session_says_when_the_stream_stopped_part_way() {
+    let mut s = Session::new(Config::guest("me"), T0);
+    assert!(!s.mid_transaction());
+    s.feed(b"TRTP", T0);
+    assert!(s.mid_transaction());
+
+    let mut s = ready();
+    let chat = server(0x6a, 0, 0, &[(tag::BODY, b"hello")]);
+    s.feed(&chat[..10], T0);
+    assert!(s.mid_transaction());
+    s.feed(&chat[10..], T0);
+    assert!(!s.mid_transaction());
 }
