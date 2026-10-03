@@ -190,10 +190,8 @@ impl Server {
             &chain,
             random,
         )?;
-        let transfer_keys = (cipher == Some(Cipher::ChaCha20Poly1305)).then(|| {
-            let (to_server, to_client) = chain.aead(&self.session_key);
-            TransferKeys::new(&self.session_key, &to_server, &to_client)
-        });
+        let transfer_keys = (cipher == Some(Cipher::ChaCha20Poly1305))
+            .then(|| TransferKeys::new(&self.session_key, &chain));
         Ok((
             transport,
             Negotiated {

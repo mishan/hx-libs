@@ -39,27 +39,29 @@ impl Chain {
 }
 
 /// What a file transfer over a ChaCha20-Poly1305 session derives its keys
-/// from. The session key stays in here.
+/// from: the session key and the HMAC chain's two links. They stay in here.
 #[derive(Clone)]
 pub struct TransferKeys {
     session_key: Vec<u8>,
-    to_server: [u8; 32],
-    to_client: [u8; 32],
+    encode: Vec<u8>,
+    decode: Vec<u8>,
 }
 
 impl TransferKeys {
-    pub(crate) fn new(session_key: &[u8], to_server: &AeadState, to_client: &AeadState) -> Self {
+    pub(crate) fn new(session_key: &[u8], chain: &Chain) -> Self {
         TransferKeys {
             session_key: session_key.to_vec(),
-            to_server: *to_server.key(),
-            to_client: *to_client.key(),
+            encode: chain.encode.clone(),
+            decode: chain.decode.clone(),
         }
     }
 
     /// The states of transfer `ref_num`, `(client → server, server →
     /// client)`.
     pub fn transfer(&self, ref_num: u32) -> (AeadState, AeadState) {
-        derive_transfer_keys(&self.session_key, &self.to_server, &self.to_client, ref_num)
+        let (to_server, to_client) =
+            derive_session_keys(&self.session_key, &self.encode, &self.decode);
+        derive_transfer_keys(&self.session_key, &to_server, &to_client, ref_num)
     }
 }
 

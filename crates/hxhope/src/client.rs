@@ -166,14 +166,14 @@ pub fn step2(
     };
     // The mode is the cipher's own: Blowfish is a stream, ChaCha20-Poly1305
     // records are AEAD (Janus says so; mhxd says nothing, which is
-    // STREAM). A server naming the other is not answered.
+    // STREAM), in whatever case. A server naming the other is not answered.
     let mode = field(reply, tag::S_CIPHER_MODE).unwrap_or(b"STREAM");
     if let Some(c) = cipher {
         let ours: &[u8] = match c {
             Cipher::Blowfish => b"STREAM",
             Cipher::ChaCha20Poly1305 => b"AEAD",
         };
-        if field(reply, tag::S_CIPHER_MODE).is_some_and(|m| m != ours) {
+        if field(reply, tag::S_CIPHER_MODE).is_some_and(|m| !m.eq_ignore_ascii_case(ours)) {
             return Err(Error::Unsupported(format!(
                 "cipher mode {:?} for {:?}",
                 String::from_utf8_lossy(mode),
@@ -229,10 +229,8 @@ pub fn step2(
         &chain,
         random,
     )?;
-    let transfer_keys = (cipher == Some(Cipher::ChaCha20Poly1305)).then(|| {
-        let (to_server, to_client) = chain.aead(session_key);
-        TransferKeys::new(session_key, &to_server, &to_client)
-    });
+    let transfer_keys =
+        (cipher == Some(Cipher::ChaCha20Poly1305)).then(|| TransferKeys::new(session_key, &chain));
     Ok(Established {
         step2,
         transport,

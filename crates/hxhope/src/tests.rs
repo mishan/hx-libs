@@ -508,7 +508,9 @@ fn a_cipher_mode_other_than_the_ciphers_own_fails() {
     let cases = [
         (&b"BLOWFISH"[..], None, true),
         (b"BLOWFISH", Some(&b"STREAM"[..]), true),
+        (b"BLOWFISH", Some(b"stream"), true),
         (b"BLOWFISH", Some(b"AEAD"), false),
+        (b"CHACHA20-POLY1305", Some(b"aead"), true),
         (b"CHACHA20-POLY1305", None, true),
         (b"CHACHA20-POLY1305", Some(b"AEAD"), true),
         (b"CHACHA20-POLY1305", Some(b"STREAM"), false),

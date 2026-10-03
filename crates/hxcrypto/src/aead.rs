@@ -23,8 +23,9 @@ pub const AEAD_DIR_SERVER_TO_CLIENT: u8 = 0x00;
 pub const AEAD_DIR_CLIENT_TO_SERVER: u8 = 0x01;
 
 /// AEAD state for one direction of a connection. Neither copied nor
-/// cloned, and its counter not settable: two states at one counter under
-/// one key would seal two records under one nonce.
+/// cloned, nor its key or counter reachable, so that two states at one
+/// counter under one key — two records under one nonce — take building
+/// both from the same key on purpose, not a copy by accident.
 pub struct AeadState {
     key: [u8; 32],
     counter: u64,
@@ -39,11 +40,6 @@ impl AeadState {
             counter: 0,
             dir,
         }
-    }
-
-    /// The key, for deriving others from it.
-    pub fn key(&self) -> &[u8; 32] {
-        &self.key
     }
 
     pub fn dir(&self) -> u8 {
@@ -213,19 +209,19 @@ pub fn derive_session_keys(
 
 /// The AEAD states of the file transfer `ref_num`, `(client → server,
 /// server → client)`, from the session key and the control connection's two
-/// directions' keys.
+/// directions' states.
 pub fn derive_transfer_keys(
     session_key: &[u8],
-    to_server_key: &[u8; 32],
-    to_client_key: &[u8; 32],
+    to_server: &AeadState,
+    to_client: &AeadState,
     ref_num: u32,
 ) -> (AeadState, AeadState) {
     // ft_base_key = HKDF(ikm = encode_key_256 || decode_key_256,
     //                     salt = session_key, info = "hope-file-transfer"),
     // the spec's encode key being the server's outbound one.
     let mut ikm = [0u8; 64];
-    ikm[..32].copy_from_slice(to_client_key);
-    ikm[32..].copy_from_slice(to_server_key);
+    ikm[..32].copy_from_slice(&to_client.key);
+    ikm[32..].copy_from_slice(&to_server.key);
     let mut base = [0u8; 32];
     assert!(hkdf_sha256(
         session_key,
@@ -333,8 +329,7 @@ mod tests {
         assert_eq!(hex(&to_server.key), SESSION_TO_SERVER);
         assert_eq!(hex(&to_client.key), SESSION_TO_CLIENT);
 
-        let (xe, xd) =
-            derive_transfer_keys(&[0xaa; 64], &to_server.key, &to_client.key, 0x01020304);
+        let (xe, xd) = derive_transfer_keys(&[0xaa; 64], &to_server, &to_client, 0x01020304);
         assert_eq!(xe.key, xd.key);
         assert_eq!(hex(&xe.key), TRANSFER);
     }
