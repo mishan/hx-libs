@@ -252,6 +252,7 @@ pub fn parse_voice_participants(blob: &[u8]) -> impl Iterator<Item = Participant
 /// by that spec and not defined, so they parse as `None` like any other
 /// mid a client must mirror without mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MidLabel {
     /// `a=mid:send` — the local client's send track.
     Send,
@@ -384,14 +385,26 @@ pub mod sdp {
         /// disabled slot after a participant leaves (RFC 8829 §5.2.2
         /// recycling).
         pub has_disabled_slot: bool,
-        /// True if the SDP advertises PCMU (`a=rtpmap:0 PCMU/8000`).
-        /// The spec requires it on every offer; we surface the
-        /// boolean so the runtime can reject offers that lack it.
+        /// True if there is a live audio section and every live audio
+        /// section maps PCMU (`a=rtpmap:0 PCMU/8000`), as the spec
+        /// requires of every offer.
         pub has_pcmu: bool,
-        /// True if the SDP advertises VP8 at the video extension's fixed
-        /// payload type (`a=rtpmap:96 VP8/90000`). Every video section
-        /// must carry it; there is no payload-type fallback.
+        /// True if there is a live video section and every live video
+        /// section maps VP8 at the video extension's fixed payload type
+        /// (`a=rtpmap:96 VP8/90000`). There is no payload-type fallback.
         pub has_vp8: bool,
+    }
+
+    /// The `a=rtpmap:` value each media kind must carry, audio then video.
+    const CODECS: [&[u8]; 2] = [b"0 PCMU/8000", b"96 VP8/90000"];
+
+    /// True if the `a=rtpmap:` value `rest` is `want`, optionally
+    /// followed by encoding parameters. Encoding names are
+    /// case-insensitive (RFC 4855 §3).
+    fn rtpmap_is(rest: &[u8], want: &[u8]) -> bool {
+        rest.len() >= want.len()
+            && rest[..want.len()].eq_ignore_ascii_case(want)
+            && matches!(rest.get(want.len()), None | Some(b'/' | b' ' | b'\t'))
     }
 
     /// Walk the SDP one line at a time and collect the subset of
@@ -400,6 +413,13 @@ pub mod sdp {
     /// real-world stacks vary).
     pub fn summarize(sdp: &[u8]) -> SdpSummary {
         let mut out = SdpSummary::default();
+        // Per media kind, indexed like CODECS: whether a live section
+        // was seen, and whether any live section failed to map its codec.
+        let mut live = [false; 2];
+        let mut unmapped = [false; 2];
+        // The live audio or video section the current line is in, and
+        // whether it has mapped its codec yet.
+        let mut section: Option<(usize, bool)> = None;
 
         for line in sdp.split(|&b| b == b'\n') {
             // Strip a trailing CR if present.
@@ -408,7 +428,24 @@ pub mod sdp {
                 _ => line,
             };
 
-            if let Some(rest) = line.strip_prefix(b"a=mid:") {
+            if line.starts_with(b"m=") {
+                if let Some((k, false)) = section.take() {
+                    unmapped[k] = true;
+                }
+                let kind = if line.starts_with(b"m=audio ") {
+                    Some(0)
+                } else if line.starts_with(b"m=video ") {
+                    Some(1)
+                } else {
+                    None
+                };
+                if line.starts_with(b"m=audio 0 ") || line.starts_with(b"m=video 0 ") {
+                    out.has_disabled_slot = true;
+                } else if let Some(k) = kind {
+                    live[k] = true;
+                    section = Some((k, false));
+                }
+            } else if let Some(rest) = line.strip_prefix(b"a=mid:") {
                 match parse_voice_mid_label(rest) {
                     Some(m) => out.mids.push(m),
                     None => out
@@ -421,15 +458,18 @@ pub mod sdp {
                     .filter(|s| !s.is_empty())
                     .map(|s| String::from_utf8_lossy(s).into_owned())
                     .collect();
-            } else if line.starts_with(b"m=audio 0 ") || line.starts_with(b"m=video 0 ") {
-                out.has_disabled_slot = true;
-            } else if line.starts_with(b"a=rtpmap:0 PCMU/8000") {
-                out.has_pcmu = true;
-            } else if line.starts_with(b"a=rtpmap:96 VP8/90000") {
-                out.has_vp8 = true;
+            } else if let Some(rest) = line.strip_prefix(b"a=rtpmap:") {
+                if let Some((k, mapped)) = &mut section {
+                    *mapped |= rtpmap_is(rest, CODECS[*k]);
+                }
             }
         }
+        if let Some((k, false)) = section {
+            unmapped[k] = true;
+        }
 
+        out.has_pcmu = live[0] && !unmapped[0];
+        out.has_vp8 = live[1] && !unmapped[1];
         out
     }
 }
@@ -985,7 +1025,7 @@ pub mod ice {
 /// copies them out before the parse call returns.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceReply<'a> {
-    pub cid: u32,
+    pub cid: Option<u32>,
     pub sdp: Option<&'a [u8]>,
     pub ice: Option<&'a [u8]>,
     pub codec: Option<&'a [u8]>,
@@ -1000,7 +1040,7 @@ pub fn parse_voice_reply(buf: &[u8], len: usize) -> VoiceReply<'_> {
     let mut out = VoiceReply::default();
     for chunk in ChunkIter::over_message(buf, len) {
         match chunk.tag {
-            tag::CHAT_ID => out.cid = chunk.as_uint(),
+            tag::CHAT_ID => out.cid = Some(chunk.as_uint()),
             tag::VOICE_SDP => out.sdp = Some(chunk.data),
             tag::VOICE_ICE => out.ice = Some(chunk.data),
             tag::VOICE_CODEC => out.codec = Some(chunk.data),
@@ -1287,8 +1327,10 @@ mod tests {
                    a=rtpmap:0 PCMU/8000\r\n\
                    m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
                    a=mid:user-23\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
                    m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
-                   a=mid:send\r\n";
+                   a=mid:send\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n";
         let s = sdp::summarize(sdp.as_bytes());
         assert_eq!(
             s.mids,
@@ -1317,6 +1359,7 @@ mod tests {
                    a=rtpmap:0 PCMU/8000\r\n\
                    m=audio 9 UDP/TLS/RTP/SAVPF 0\r\n\
                    a=mid:send\r\n\
+                   a=rtpmap:0 PCMU/8000\r\n\
                    m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
                    a=mid:cam-user-12\r\n\
                    a=rtpmap:96 VP8/90000\r\n\
@@ -1324,7 +1367,8 @@ mod tests {
                    a=mid:scr-user-23\r\n\
                    a=content:slides\r\n\
                    m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
-                   a=mid:cam-send\r\n";
+                   a=mid:cam-send\r\n\
+                   a=rtpmap:96 VP8/90000\r\n";
         let s = sdp::summarize(sdp.as_bytes());
         assert_eq!(
             s.mids,
@@ -1339,6 +1383,56 @@ mod tests {
         assert!(s.has_pcmu);
         assert!(s.has_vp8);
         assert!(s.has_disabled_slot, "m=video 0 is a disabled slot");
+    }
+
+    #[test]
+    fn sdp_summary_checks_codecs_per_live_section() {
+        const AUDIO: &str = "m=audio 9 UDP/TLS/RTP/SAVPF 0\na=rtpmap:0 PCMU/8000\n";
+        const VIDEO: &str = "m=video 9 UDP/TLS/RTP/SAVPF 96\na=rtpmap:96 VP8/90000\n";
+        let cases: &[(&str, &str, bool, bool)] = &[
+            ("both kinds mapped", &format!("{AUDIO}{VIDEO}"), true, true),
+            ("no sections at all", "v=0\n", false, false),
+            (
+                "codec names are case-insensitive",
+                "m=audio 9 RTP 0\na=rtpmap:0 pcmu/8000\nm=video 9 RTP 96\na=rtpmap:96 vp8/90000\n",
+                true,
+                true,
+            ),
+            (
+                "one live section without its codec",
+                &format!("{AUDIO}{VIDEO}m=audio 9 RTP 0\nm=video 9 RTP 96\n"),
+                false,
+                false,
+            ),
+            (
+                "a disabled section is not held to it",
+                &format!("{AUDIO}{VIDEO}m=audio 0 RTP 0\nm=video 0 RTP 96\n"),
+                true,
+                true,
+            ),
+            (
+                "the codec must be in its own kind of section",
+                "m=audio 9 RTP 0\na=rtpmap:96 VP8/90000\nm=video 9 RTP 96\na=rtpmap:0 PCMU/8000\n",
+                false,
+                false,
+            ),
+            (
+                "a session-level rtpmap counts for nothing",
+                "a=rtpmap:0 PCMU/8000\nm=audio 9 RTP 0\n",
+                false,
+                false,
+            ),
+            (
+                "the payload type and clock rate must match",
+                "m=audio 9 RTP 8\na=rtpmap:8 PCMU/8000\nm=video 9 RTP 96\na=rtpmap:96 VP8/900000\n",
+                false,
+                false,
+            ),
+        ];
+        for (name, sdp, pcmu, vp8) in cases {
+            let s = sdp::summarize(sdp.as_bytes());
+            assert_eq!((s.has_pcmu, s.has_vp8), (*pcmu, *vp8), "{name}");
+        }
     }
 
     #[test]
@@ -1763,7 +1857,7 @@ mod tests {
 
         let buf = frame(&body);
         let r = parse_voice_join_reply(&buf, buf.len());
-        assert_eq!(r.cid, 42);
+        assert_eq!(r.cid, Some(42));
         assert_eq!(r.sdp, Some(&b"v=0\r\n"[..]));
         assert_eq!(r.codec, Some(&b"PCMU"[..]));
         assert!(r.participants.is_some());
@@ -1780,7 +1874,7 @@ mod tests {
         body.extend(chunk(tag::VOICE_SDP, b"sdp body"));
         let buf = frame(&body);
         let r = parse_voice_reply(&buf, buf.len());
-        assert_eq!(r.cid, 7);
+        assert_eq!(r.cid, Some(7));
         assert_eq!(r.sdp, Some(&b"sdp body"[..]));
         assert!(r.codec.is_none());
         assert!(r.participants.is_none());
@@ -1793,7 +1887,7 @@ mod tests {
         body.extend(chunk(tag::VOICE_ICE, b"{\"candidate\":\"\"}"));
         let buf = frame(&body);
         let r = parse_voice_reply(&buf, buf.len());
-        assert_eq!(r.cid, 7);
+        assert_eq!(r.cid, Some(7));
         assert_eq!(r.ice, Some(&b"{\"candidate\":\"\"}"[..]));
     }
 
@@ -1810,10 +1904,10 @@ mod tests {
     #[test]
     fn voice_reply_empty_body() {
         // Empty reply body (the spec's "success reply, no fields"
-        // shape for 601 / 603 / 606): every field None / 0.
+        // shape for 601 / 603 / 606): every field None.
         let buf = frame(&[]);
         let r = parse_voice_reply(&buf, buf.len());
-        assert_eq!(r.cid, 0);
+        assert_eq!(r.cid, None);
         assert!(r.sdp.is_none());
         assert!(r.ice.is_none());
         assert!(r.codec.is_none());
