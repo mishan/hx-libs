@@ -347,11 +347,11 @@ pub fn parse_login(buf: &[u8], len: usize, servername: &mut [u8]) -> (LoginInfo,
                     out.video_camera = Some(l);
                     out.seen |= LOGIN_SEEN_VIDEO_CAMERA_LIMITS;
                 }
-                Some(l) => {
+                Some(l) if l.kind == crate::video::VideoKind::Screen => {
                     out.video_screen = Some(l);
                     out.seen |= LOGIN_SEEN_VIDEO_SCREEN_LIMITS;
                 }
-                None => {}
+                _ => {}
             },
             _ => {}
         }

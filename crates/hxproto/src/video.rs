@@ -228,15 +228,15 @@ pub fn build_video_start_chunks(
 
 /// Build chunks for `VIDEO_STOP` (608): `CHAT_ID`, plus `VIDEO_KIND` when
 /// `kind` is given. `None` stops every publication this client holds in
-/// the room. Scratch usage: 6 bytes.
+/// the room. Scratch usage: 6 bytes with a kind, 4 without.
 pub fn build_video_stop_chunks(
     cid: u32,
     kind: Option<VideoKind>,
     chunks: &mut [HxChunk],
     scratch: &mut [u8],
 ) -> usize {
-    let need = if kind.is_some() { 2 } else { 1 };
-    if chunks.len() < need || scratch.len() < 6 {
+    let (need, scratch_need) = if kind.is_some() { (2, 6) } else { (1, 4) };
+    if chunks.len() < need || scratch.len() < scratch_need {
         return 0;
     }
     chunks[0] = chat_id_chunk(cid, scratch);
@@ -324,7 +324,7 @@ pub fn build_video_subscribe_chunks(
 /// the caller's message buffer; absent fields stay `None`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct VideoReply<'a> {
-    pub cid: u32,
+    pub cid: Option<u32>,
     pub kind: Option<u16>,
     pub codec: Option<&'a [u8]>,
     pub publishers: Option<&'a [u8]>,
@@ -335,7 +335,7 @@ pub fn parse_video_reply(buf: &[u8], len: usize) -> VideoReply<'_> {
     let mut out = VideoReply::default();
     for chunk in ChunkIter::over_message(buf, len) {
         match chunk.tag {
-            tag::CHAT_ID => out.cid = chunk.as_uint(),
+            tag::CHAT_ID => out.cid = Some(chunk.as_uint()),
             // Exactly two bytes: a wider field is malformed, and reading
             // its low word would turn `00 01 00 01` into a camera.
             tag::VIDEO_KIND => {
@@ -459,12 +459,17 @@ mod tests {
     #[test]
     fn stop_omits_kind_to_stop_everything() {
         let mut chunks = [HxChunk::EMPTY; 2];
-        let mut scratch = [0u8; 6];
+        let mut scratch = [0u8; 4];
         assert_eq!(
             build_video_stop_chunks(7, None, &mut chunks, &mut scratch),
             1
         );
         assert_eq!(chunks[0].tag, tag::CHAT_ID);
+        assert_eq!(
+            build_video_stop_chunks(7, Some(VideoKind::Camera), &mut chunks, &mut scratch),
+            0
+        );
+        let mut scratch = [0u8; 6];
         let hc = build_video_stop_chunks(7, Some(VideoKind::Camera), &mut chunks, &mut scratch);
         assert_eq!(hc, 2);
         assert_eq!(bytes(&chunks[1]), &[0, 1]);
@@ -535,10 +540,18 @@ mod tests {
         body.extend(chunk(tag::VIDEO_CODEC, b"VP8"));
         let buf = frame(&body);
         let r = parse_video_reply(&buf, buf.len());
-        assert_eq!(r.cid, 77);
+        assert_eq!(r.cid, Some(77));
         assert_eq!(r.codec, Some(&b"VP8"[..]));
         assert_eq!(parse_video_publishers(r.publishers.unwrap()).count(), 1);
         assert_eq!(r.kind, None);
+    }
+
+    #[test]
+    fn missing_chat_id_is_not_the_public_chat() {
+        let buf = frame(&chunk(tag::VIDEO_CODEC, b"VP8"));
+        assert_eq!(parse_video_reply(&buf, buf.len()).cid, None);
+        let buf = frame(&chunk(tag::CHAT_ID, &0u32.to_be_bytes()));
+        assert_eq!(parse_video_reply(&buf, buf.len()).cid, Some(0));
     }
 
     #[test]
