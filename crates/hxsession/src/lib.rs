@@ -125,7 +125,9 @@ pub struct Config {
     pub keepalive_ms: u64,
     /// The caller has receive handlers of its own: every transaction
     /// reaches it whole, every reply as [`Event::Reply`] and everything
-    /// else as [`Event::Unhandled`]. The session still drives the login,
+    /// else as [`Event::Unhandled`]. The one exception is the reply to the
+    /// session's own keep-alive, refusals included: the caller never sent
+    /// it, so it is no news. The session still drives the login,
     /// the agreement and the keep-alive, and numbers every transaction;
     /// the user list and every request are the caller's, numbered by
     /// [`Session::take_trans`] and sent through [`Session::send_raw`].
