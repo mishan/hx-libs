@@ -9,6 +9,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "hope")]
+use hxhope::{Cipher, Compression};
 use hxsession::request::Request;
 use hxsession::{Config, Event, Session};
 
@@ -44,7 +46,7 @@ struct Client {
 }
 
 impl Client {
-    fn connect(name: &'static str, addr: &str, cfg: Config) -> Client {
+    fn connect(name: &'static str, addr: &str, s: Session) -> Client {
         let sock = TcpStream::connect(addr).unwrap_or_else(|e| panic!("{name} at {addr}: {e}"));
         sock.set_nodelay(true).unwrap();
         sock.set_read_timeout(Some(Duration::from_millis(20)))
@@ -52,7 +54,7 @@ impl Client {
         let start = Instant::now();
         Client {
             name,
-            s: Session::new(cfg, 0),
+            s,
             sock,
             start,
         }
@@ -114,7 +116,11 @@ impl Client {
     }
 
     fn login(name: &'static str, addr: &str, nick: &str) -> Client {
-        let mut c = Client::connect(name, addr, Config::guest(nick));
+        Client::login_as(name, addr, Session::new(Config::guest(nick), 0))
+    }
+
+    fn login_as(name: &'static str, addr: &str, s: Session) -> Client {
+        let mut c = Client::connect(name, addr, s);
         let first = c.until("the agreement or readiness", |e| {
             matches!(e, Event::Agreement(_) | Event::Ready)
         });
@@ -330,5 +336,94 @@ fn summary(e: &Event) -> String {
         Event::NewsArticle { text, .. } => format!("{} bytes", text.len()),
         Event::Failed { reason, .. } => format!("refused: {reason:?}"),
         other => format!("{other:?}"),
+    }
+}
+
+/// The HOPE logins the rig's servers take: mhxd's Blowfish and its zlib
+/// compression, its HMAC login over plaintext, and Janus's ChaCha20-Poly1305
+/// with and without its compressions (ZSTD too, in GtkHx's suite, which
+/// builds with it).
+#[cfg(feature = "hope")]
+const HOPE: &[(&str, Option<Cipher>, Option<Compression>)] = &[
+    ("mhxd", None, None),
+    ("mhxd", None, Some(Compression::Gzip)),
+    ("mhxd", Some(Cipher::Blowfish), None),
+    ("mhxd", Some(Cipher::Blowfish), Some(Compression::Gzip)),
+    ("janus", Some(Cipher::Blowfish), None),
+    ("janus", Some(Cipher::Blowfish), Some(Compression::Gzip)),
+    ("janus", Some(Cipher::ChaCha20Poly1305), None),
+    (
+        "janus",
+        Some(Cipher::ChaCha20Poly1305),
+        Some(Compression::Lz4),
+    ),
+    (
+        "janus",
+        Some(Cipher::ChaCha20Poly1305),
+        Some(Compression::Gzip),
+    ),
+];
+
+/// A HOPE session's chat reaches a plain one, and the plain one's comes
+/// back through the transport; the user list, the largest reply here,
+/// comes through it too.
+#[cfg(feature = "hope")]
+#[test]
+fn hope_logs_in_and_chats_on_every_server_that_has_it() {
+    let servers = servers();
+    for &(name, cipher, compression) in HOPE {
+        let Some(&(_, addr)) = servers.iter().find(|(n, _)| *n == name) else {
+            continue;
+        };
+        let what = format!("{name} {cipher:?} {compression:?}");
+        let offer = hxhope::client::Offer {
+            ciphers: cipher.into_iter().collect(),
+            compressions: compression.into_iter().collect(),
+            ..hxhope::client::Offer::new(*b"TEST")
+        };
+        let mut seed = std::process::id();
+        let random = Box::new(move |buf: &mut [u8]| {
+            for b in buf {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                *b = (seed >> 16) as u8;
+            }
+        });
+        let (nh, np) = (nick(name, "h"), nick(name, "p"));
+        let session = Session::with_hope(Config::guest(&nh), offer, random, 0);
+        let mut h = Client::login_as(name, addr, session);
+        let n = h.s.negotiated().expect("HOPE was negotiated");
+        assert_eq!((n.cipher, n.compression), (cipher, compression), "{what}");
+        let mut p = Client::login(name, addr, &np);
+
+        // p's agree may still be on its way when p is ready, and a list
+        // asked for before the server has it says nothing of p: ask again.
+        let deadline = Instant::now() + WAIT;
+        'listed: loop {
+            h.s.user_list().unwrap();
+            let Event::UserList(users) =
+                h.until("the user list", |e| matches!(e, Event::UserList(_)))
+            else {
+                unreachable!()
+            };
+            if users.iter().any(|u| u.name == np) {
+                break 'listed;
+            }
+            assert!(Instant::now() < deadline, "{what}: {np} never listed");
+        }
+        let line = format!("{nh} over HOPE");
+        h.s.chat(&line).unwrap();
+        h.flush();
+        p.until(
+            "the HOPE chat",
+            |e| matches!(e, Event::Chat { text, .. } if text.contains(&line)),
+        );
+        let back = format!("{np} back");
+        p.s.chat(&back).unwrap();
+        p.flush();
+        h.until(
+            "the chat back",
+            |e| matches!(e, Event::Chat { text, .. } if text.contains(&back)),
+        );
+        eprintln!("{what}: login, user list, chat both ways");
     }
 }

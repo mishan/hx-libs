@@ -11,7 +11,14 @@ publish = false
 # The end-to-end suite in tests/rig.rs, against GtkHx's Docker rig of real
 # servers. Off by default: CI has no rig.
 rig = []
+# HOPE, the secure login, and the ciphers and compressors it brings. Off by
+# default: a client that does not log in with HOPE (the browser client)
+# should not carry them.
+hope = ["dep:hxhope"]
+# HOPE's Zstandard compression, which needs a C toolchain for the target.
+zstd = ["hope", "hxhope/zstd"]
 
 [dependencies]
 # The emoji tables are a consumer's choice, not this crate's.
 hxproto = { path = "../hxproto", default-features = false }
+hxhope = { path = "../hxhope", optional = true }
