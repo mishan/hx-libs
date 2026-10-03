@@ -962,24 +962,23 @@ fn raw_still_names_us_to_a_1_2_server_and_waits_on_no_agreement() {
 #[test]
 fn raw_sends_what_the_caller_built_and_hands_back_its_answer() {
     let mut s = logging_in(raw());
-    // Not before the login is answered: the server would not take it.
-    assert_eq!(
-        s.send_raw(&caller(300, RAW_TRANS_BASE)),
-        Err(Error::NotReady)
-    );
+    // Numbered before the login is answered, but not sent until then: the
+    // server would not take it.
+    let trans = s.take_trans();
+    let frame = caller(300, trans);
+    assert_eq!(s.send_raw(&frame), Err(Error::NotReady));
     s.feed(&login_reply(Some(190), None), T0);
     events(&mut s);
 
-    let frame = caller(300, RAW_TRANS_BASE);
     s.send_raw(&frame).unwrap();
     assert_eq!(s.take_outgoing(), frame);
 
-    let refusal = server(TASK, RAW_TRANS_BASE, 1, &[(tag::TASK_ERROR, b"No.")]);
+    let refusal = server(TASK, trans, 1, &[(tag::TASK_ERROR, b"No.")]);
     s.feed(&refusal, T0);
     assert_eq!(
         events(&mut s),
         [Event::Reply {
-            trans: RAW_TRANS_BASE,
+            trans,
             frame: refusal
         }]
     );
@@ -995,45 +994,70 @@ fn raw_sends_what_the_caller_built_and_hands_back_its_answer() {
 }
 
 #[test]
-fn raw_leaves_requests_and_the_keepalive_to_the_caller() {
+fn raw_leaves_requests_to_the_caller_but_keeps_the_connection_alive() {
     let mut s = logging_in(raw());
     s.feed(&login_reply(Some(190), None), T0);
     s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
     sent(&mut s);
+    events(&mut s);
     assert_eq!(s.user_list(), Err(Error::NotReady));
     assert_eq!(s.chat("hi"), Err(Error::NotReady));
+
+    // What the caller sends puts the ping off, as the session's own does,
+    // from the next reading of the clock.
+    let t = s.take_trans();
+    s.send_raw(&caller(300, t)).unwrap();
+    s.take_outgoing();
+    s.tick(T0 + 30_000);
+    assert_eq!(s.next_deadline(), Some(T0 + 90_000));
+    s.tick(T0 + 90_000);
+    let ping = sent(&mut s);
+    assert_eq!(ping.len(), 1);
+    assert_eq!(ping[0].0, 500);
+    // Its answer, even a refusal, is the session's alone.
+    s.feed(&server(TASK, ping[0].1, 1, &[(tag::TASK_ERROR, b"?")]), T0);
+    assert!(events(&mut s).is_empty());
+
+    // A 1.2 server is not pinged in raw mode either.
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(None, None), T0);
     assert_eq!(s.next_deadline(), None);
-    s.tick(T0 + 3_600_000);
-    assert!(s.take_outgoing().is_empty());
 }
 
 #[test]
-fn a_raw_login_sent_elsewhere_may_start_two_below_the_callers() {
-    let mut s = Session::logging_in(raw(), RAW_TRANS_BASE - 2, T0);
-    // A 1.2 server, with an agreement to answer: both of the session's own.
-    let mut reply = login_reply(None, None);
+fn a_trans_taken_before_the_magic_is_not_the_logins() {
+    let mut s = Session::new(raw(), T0);
+    let early = s.take_trans();
+    s.take_outgoing();
+    s.feed(SERVER_MAGIC, T0);
+    let login = sent(&mut s);
+    assert_eq!((login[0].0, login[0].1), (107, 1));
+    assert_ne!(early, 1);
+}
+
+#[test]
+fn a_raw_session_and_its_caller_number_from_one_counter() {
+    // As after HOPE's two steps, the login on 1 and the second on 2.
+    let mut s = Session::logging_in(raw(), 3, T0);
+    assert_eq!(s.take_trans(), 3);
+    let mut reply = login_reply(Some(190), None);
     reply[4..8].copy_from_slice(&2u32.to_be_bytes());
     s.feed(&reply, T0);
     s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
+    assert_eq!(s.take_trans(), 4);
     s.agree().unwrap();
+    assert_eq!(s.take_trans(), 6);
     let trans: Vec<u32> = sent(&mut s).iter().map(|o| o.1).collect();
-    assert_eq!(trans, [RAW_TRANS_BASE - 2, RAW_TRANS_BASE - 1]);
+    assert_eq!(trans, [5]);
 }
 
 #[test]
-#[should_panic(expected = "cannot start at")]
-fn a_raw_login_sent_elsewhere_may_not_start_among_the_callers() {
-    Session::logging_in(raw(), RAW_TRANS_BASE - 1, T0);
-}
-
-#[test]
-fn raw_takes_only_whole_transactions_numbered_as_the_callers() {
+fn raw_takes_only_whole_transactions() {
     let mut s = logging_in(raw());
     s.feed(&login_reply(Some(190), None), T0);
     s.take_outgoing();
-    // The session's own numbers, a cut-off frame, a frame and a half.
-    assert_eq!(s.send_raw(&caller(300, 2)), Err(Error::Malformed));
-    let whole = caller(300, RAW_TRANS_BASE);
+    // A cut-off frame, a frame and a half.
+    let whole = caller(300, s.take_trans());
     assert_eq!(s.send_raw(&whole[..21]), Err(Error::Malformed));
     assert_eq!(
         s.send_raw(&[whole.clone(), whole.clone()].concat()),

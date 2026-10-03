@@ -36,9 +36,9 @@
 //! are the classic CR; the session converts both ways.
 //!
 //! A client with receive handlers of its own sets [`Config::raw`]: the
-//! session then keeps the handshake, the login and the agreement, and
-//! hands everything else over whole. That is how a client moves onto the
-//! session a piece at a time.
+//! session then keeps the handshake, the login, the agreement, the
+//! transaction ids and the keep-alive, and hands everything else over
+//! whole. That is how a client moves onto the session a piece at a time.
 //!
 //! What is not here yet: HOPE, the transport ciphers and compression,
 //! file transfers (a folder's listing is here; its contents are not),
@@ -79,10 +79,6 @@ pub mod cap {
 
 /// The trans the login goes out on, as GtkHx sends it.
 const LOGIN_TRANS: u32 = 1;
-/// In raw mode the session numbers its own transactions — the login, the
-/// agreement, a 1.2 server's user change — below this, and the caller its
-/// own from here up.
-pub const RAW_TRANS_BASE: u32 = 16;
 /// Longest chat or message body, as GtkHx caps the ones it receives.
 const MAX_BODY: usize = 8192;
 const MAX_NAME: usize = 128;
@@ -129,10 +125,12 @@ pub struct Config {
     pub keepalive_ms: u64,
     /// The caller has receive handlers of its own: every transaction
     /// reaches it whole, every reply as [`Event::Reply`] and everything
-    /// else as [`Event::Unhandled`]. The session still drives the login
-    /// and the agreement, but sends nothing of its own after them; the
-    /// user list, the keep-alive and every request are the caller's,
-    /// through [`Session::send_raw`].
+    /// else as [`Event::Unhandled`]. The one exception is the reply to the
+    /// session's own keep-alive, refusals included: the caller never sent
+    /// it, so it is no news. The session still drives the login,
+    /// the agreement and the keep-alive, and numbers every transaction;
+    /// the user list and every request are the caller's, numbered by
+    /// [`Session::take_trans`] and sent through [`Session::send_raw`].
     pub raw: bool,
 }
 
@@ -352,7 +350,7 @@ pub enum Error {
     /// [`Session::agree`] with no agreement waiting for an answer.
     NoAgreement,
     /// [`Session::send_raw`] given something that is not one whole
-    /// transaction numbered from [`RAW_TRANS_BASE`].
+    /// transaction.
     Malformed,
 }
 
@@ -431,7 +429,7 @@ impl Session {
             early: Vec::new(),
             out: CLIENT_MAGIC.to_vec(),
             events: VecDeque::new(),
-            trans: LOGIN_TRANS,
+            trans: LOGIN_TRANS + 1,
             pending: HashMap::new(),
             server: None,
             utf8: false,
@@ -450,13 +448,8 @@ impl Session {
 
     /// A session whose login the caller has already sent, as HOPE does in
     /// two steps of its own: the next reply it is fed is the login's, and
-    /// it numbers what it sends after that from `next_trans` — in raw
-    /// mode, at most two below [`RAW_TRANS_BASE`], as it may send two.
+    /// it numbers what it sends after that from `next_trans`.
     pub fn logging_in(cfg: Config, next_trans: u32, now_ms: u64) -> Self {
-        assert!(
-            !cfg.raw || next_trans.max(1) <= RAW_TRANS_BASE - 2,
-            "a raw session numbers its own below {RAW_TRANS_BASE}, so cannot start at {next_trans}"
-        );
         let mut s = Session::new(cfg, now_ms);
         s.out.clear();
         s.state = State::Login;
@@ -549,7 +542,6 @@ impl Session {
                 caps,
             );
             self.send_frame(&login, LOGIN_TRANS);
-            self.trans = LOGIN_TRANS + 1;
         }
         if self.state == State::Closed {
             return;
@@ -769,19 +761,30 @@ impl Session {
         Ok(self.send(&r, Some(Pending::FileList)))
     }
 
-    /// One whole transaction the caller built and numbered from
-    /// [`RAW_TRANS_BASE`], sent as it is; raw mode only, once logged in.
-    /// It may go before the agreement is answered, which a 1.5+ server
-    /// may hold against it.
+    /// The trans for a transaction the caller builds itself, for
+    /// [`Session::send_raw`]. Nothing else the session sends uses it.
+    /// It may be taken before the login is answered: the caller can
+    /// number a request before the session lets it go.
+    pub fn take_trans(&mut self) -> u32 {
+        let trans = self.trans;
+        // 0 is a trans like any other to a server, but the original client
+        // never used it, and skipping it costs nothing.
+        self.trans = self.trans.wrapping_add(1).max(1);
+        trans
+    }
+
+    /// One whole transaction the caller built on a trans from
+    /// [`Session::take_trans`], sent as it is; raw mode only, once logged
+    /// in. It may go before the agreement is answered, which a 1.5+
+    /// server may hold against it.
     pub fn send_raw(&mut self, frame: &[u8]) -> Result<(), Error> {
         if !self.cfg.raw || self.state != State::LoggedIn {
             return Err(Error::NotReady);
         }
-        let header = |at: usize| {
+        let len = |at: usize| {
             u32::from_be_bytes([frame[at], frame[at + 1], frame[at + 2], frame[at + 3]])
         };
-        if frame.len() < 22 || header(4) < RAW_TRANS_BASE || header(16) as usize != frame.len() - 20
-        {
+        if frame.len() < 22 || len(16) as usize != frame.len() - 20 {
             return Err(Error::Malformed);
         }
         self.out.extend_from_slice(frame);
@@ -946,11 +949,14 @@ impl Session {
         }
         let pending = self.pending.remove(&t.trans);
         if self.cfg.raw {
-            // The session's own too, so the caller sees their refusals.
-            self.events.push_back(Event::Reply {
-                trans: t.trans,
-                frame: t.buf,
-            });
+            // The session's own too, so the caller sees their refusals;
+            // all but the keep-alive's, which are no news to anyone.
+            if pending != Some(Pending::Keepalive) {
+                self.events.push_back(Event::Reply {
+                    trans: t.trans,
+                    frame: t.buf,
+                });
+            }
             return;
         }
         let len = t.buf.len();
@@ -1201,7 +1207,7 @@ impl Session {
     /// Whether this server is kept alive: a 1.5+ server (mhxd's gate is
     /// 150), as GtkHx does. Older servers are sent nothing unasked.
     fn pings(&self) -> bool {
-        !self.cfg.raw && self.version() >= 150
+        self.version() >= 150
     }
 
     /// Read the clock: the time only moves forward, and a send since the
@@ -1240,14 +1246,7 @@ impl Session {
 
     /// Send on the next trans, remembering what its reply is for.
     fn send(&mut self, req: &Request, pending: Option<Pending>) -> u32 {
-        let trans = self.trans;
-        // 0 is a trans like any other to a server, but the original client
-        // never used it, and skipping it costs nothing.
-        self.trans = self.trans.wrapping_add(1).max(1);
-        assert!(
-            !self.cfg.raw || trans < RAW_TRANS_BASE,
-            "the session's own trans {trans} reached the caller's"
-        );
+        let trans = self.take_trans();
         if let Some(p) = pending {
             if self.pending.len() as u32 >= MAX_PENDING {
                 let newest = trans;
