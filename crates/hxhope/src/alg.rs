@@ -108,7 +108,8 @@ pub fn encode_list(labels: &[&[u8]]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The labels of an encoded list, or `None` for one that does not parse.
+/// The labels of an encoded list, or `None` for one that does not parse
+/// or carries bytes past its last label.
 pub fn parse_list(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
     // A list has a handful of entries; a count far past that is a reply
     // trying to make us allocate.
@@ -125,7 +126,7 @@ pub fn parse_list(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
         out.push(label.to_vec());
         rest = &tail[len as usize..];
     }
-    Some(out)
+    rest.is_empty().then_some(out)
 }
 
 #[cfg(test)]
@@ -151,6 +152,8 @@ mod tests {
             b"\x00\x03\x05hello",
             b"\x00\x01\x09short",
             b"\xff\xff",
+            b"\x00\x00junk",
+            b"\x00\x01\x04GZIPx",
         ] {
             assert_eq!(parse_list(bad), None, "{bad:?}");
         }

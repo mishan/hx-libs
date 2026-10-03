@@ -135,18 +135,18 @@ pub fn step2(
 ) -> Result<Established, Error> {
     let session_key = field(reply, tag::SESSION_KEY)
         .ok_or_else(|| Error::Malformed("the server answered with no session key".into()))?;
-    let mac = choice(reply, tag::MAC_ALG, "MAC", false, Mac::from_label)?
-        .ok_or_else(|| Error::Malformed("the server chose no MAC".into()))?;
+    // The server picks from what was offered; a pick from outside it is
+    // not answered.
+    let mac = choice(reply, tag::MAC_ALG, "MAC", false, |l| {
+        Mac::from_label(l).filter(|m| offer.macs.contains(m))
+    })?
+    .ok_or_else(|| Error::Malformed("the server chose no MAC".into()))?;
     // An absent or zero-length field is no cipher; a list naming none is
     // not something a server sends, and is taken for a broken reply rather
     // than a quiet downgrade to plaintext.
-    let cipher = choice(
-        reply,
-        tag::S_CIPHER_ALG,
-        "cipher",
-        false,
-        Cipher::from_label,
-    )?;
+    let cipher = choice(reply, tag::S_CIPHER_ALG, "cipher", false, |l| {
+        Cipher::from_label(l).filter(|c| offer.ciphers.contains(c))
+    })?;
     // A compression goes on only when it was asked for. Having offered
     // some, a server choosing one not offered fails the login; one that
     // offered none ignores whatever the server says. "NONE", as mhxd's own
@@ -164,7 +164,23 @@ pub fn step2(
         })?
         .flatten()
     };
+    // The mode is the cipher's own: Blowfish is a stream, ChaCha20-Poly1305
+    // records are AEAD (Janus says so; mhxd says nothing, which is
+    // STREAM). A server naming the other is not answered.
     let mode = field(reply, tag::S_CIPHER_MODE).unwrap_or(b"STREAM");
+    if let Some(c) = cipher {
+        let ours: &[u8] = match c {
+            Cipher::Blowfish => b"STREAM",
+            Cipher::ChaCha20Poly1305 => b"AEAD",
+        };
+        if field(reply, tag::S_CIPHER_MODE).is_some_and(|m| m != ours) {
+            return Err(Error::Unsupported(format!(
+                "cipher mode {:?} for {:?}",
+                String::from_utf8_lossy(mode),
+                c
+            )));
+        }
+    }
 
     let chain = Chain::new(mac, who.password, session_key);
     // A server that echoes the MAC's name as the login wants the login as

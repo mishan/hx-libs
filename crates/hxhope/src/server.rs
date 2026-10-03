@@ -12,7 +12,7 @@ use hxproto::messages::tag as hl;
 use crate::alg::{encode_list, parse_list, Cipher, Compression, Mac};
 use crate::keys::{Chain, TransferKeys};
 use crate::transport::{Random, Role, Transport};
-use crate::{field, obfuscate, opcode, pack, tag, Error, Negotiated, LOGIN};
+use crate::{field, opcode, pack, tag, Error, Negotiated, LOGIN};
 
 /// The reply's opcode.
 const TASK: u32 = 0x0001_0000;
@@ -209,8 +209,15 @@ impl Server {
 impl Step2 {
     /// Whether this step 2 logs in as `login`; an empty login is the guest
     /// account's. A server asks of each account it has, as mhxd does.
+    ///
+    /// The step-1 reply asked for the login as a MAC, and only that is
+    /// taken, as mhxd takes it: an obfuscated name is no more than the name,
+    /// and a reply stripped of its request on the way would otherwise get
+    /// one. A step 2 with no login at all is the guest, as on mhxd.
     pub fn names(&self, server: &Server, login: &[u8]) -> bool {
+        if self.login.is_empty() {
+            return login.is_empty();
+        }
         same(&self.login, &server.mac.mac(login, &server.session_key))
-            || same(&self.login, &obfuscate(login))
     }
 }

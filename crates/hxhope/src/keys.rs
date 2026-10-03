@@ -51,8 +51,8 @@ impl TransferKeys {
     pub(crate) fn new(session_key: &[u8], to_server: &AeadState, to_client: &AeadState) -> Self {
         TransferKeys {
             session_key: session_key.to_vec(),
-            to_server: to_server.key,
-            to_client: to_client.key,
+            to_server: *to_server.key(),
+            to_client: *to_client.key(),
         }
     }
 

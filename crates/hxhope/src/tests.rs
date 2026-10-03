@@ -452,3 +452,98 @@ fn a_cipher_list_naming_none_fails() {
     let est = client::step2(&offer, &reply(&[]), &WHO, 2, cycle(&[0])).unwrap();
     assert_eq!(est.negotiated.cipher, None);
 }
+
+/// A step-1 reply naming `mac`, `cipher` and, when given, a cipher mode.
+fn reply_choosing(mac: &[u8], cipher: &[u8], mode: Option<&[u8]>) -> Vec<u8> {
+    let mac = crate::alg::encode_list(&[mac]).unwrap();
+    let cipher = crate::alg::encode_list(&[cipher]).unwrap();
+    let mut fields: Vec<(u16, &[u8])> = vec![
+        (tag::MAC_ALG, &mac),
+        (tag::S_CIPHER_ALG, &cipher),
+        (tag::SESSION_KEY, &[1; 64]),
+    ];
+    if let Some(m) = mode {
+        fields.push((tag::S_CIPHER_MODE, m));
+    }
+    pack(0x0001_0000, 1, &fields).unwrap()
+}
+
+/// A server's pick from outside what was offered is not answered.
+#[test]
+fn a_choice_that_was_not_offered_fails() {
+    let offer = Offer {
+        macs: vec![Mac::Sha1],
+        ciphers: vec![Cipher::Blowfish],
+        ..Offer::new(*b"TEST")
+    };
+    let step2 = |mac: &[u8], cipher: &[u8]| {
+        client::step2(
+            &offer,
+            &reply_choosing(mac, cipher, None),
+            &WHO,
+            2,
+            cycle(&[0]),
+        )
+    };
+    assert!(step2(b"HMAC-SHA1", b"BLOWFISH").is_ok());
+    assert!(matches!(
+        step2(b"HMAC-MD5", b"BLOWFISH"),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        step2(b"HMAC-SHA1", b"CHACHA20-POLY1305"),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+/// Each cipher's mode is its own, as Janus names it: STREAM for Blowfish,
+/// AEAD for ChaCha20-Poly1305, and none said is fine (mhxd). The other
+/// fails, since nothing here would run it.
+#[test]
+fn a_cipher_mode_other_than_the_ciphers_own_fails() {
+    let offer = Offer {
+        ciphers: vec![Cipher::Blowfish, Cipher::ChaCha20Poly1305],
+        ..Offer::new(*b"TEST")
+    };
+    let cases = [
+        (&b"BLOWFISH"[..], None, true),
+        (b"BLOWFISH", Some(&b"STREAM"[..]), true),
+        (b"BLOWFISH", Some(b"AEAD"), false),
+        (b"CHACHA20-POLY1305", None, true),
+        (b"CHACHA20-POLY1305", Some(b"AEAD"), true),
+        (b"CHACHA20-POLY1305", Some(b"STREAM"), false),
+    ];
+    for (cipher, mode, ok) in cases {
+        let r = client::step2(
+            &offer,
+            &reply_choosing(b"HMAC-SHA256", cipher, mode),
+            &WHO,
+            2,
+            cycle(&[0]),
+        );
+        assert_eq!(r.is_ok(), ok, "{cipher:?} {mode:?}");
+    }
+}
+
+/// The server asked for the login as a MAC and takes only that; no login
+/// at all is the guest, as on mhxd.
+#[test]
+fn a_server_takes_the_login_only_as_a_mac() {
+    let offer = Offer::new(*b"TEST");
+    let policy = Policy {
+        macs: Mac::ALL.to_vec(),
+        ciphers: vec![],
+        compressions: vec![],
+        require_cipher: false,
+    };
+    let (srv, _) = server::answer(&policy, &client::step1(&offer, 1).unwrap(), [2; 64], 1).unwrap();
+    let step2 = |login: &[u8]| {
+        let mac = Mac::Sha256.mac(b"pw", &[2; 64]);
+        let fields: Vec<(u16, &[u8])> = vec![(0x0069, login), (0x006a, &mac)];
+        srv.step2(&pack(107, 2, &fields).unwrap()).unwrap()
+    };
+    assert!(step2(&Mac::Sha256.mac(b"guest", &[2; 64])).names(&srv, b"guest"));
+    assert!(!step2(&crate::obfuscate(b"guest")).names(&srv, b"guest"));
+    assert!(step2(b"").names(&srv, b""));
+    assert!(!step2(b"").names(&srv, b"guest"));
+}

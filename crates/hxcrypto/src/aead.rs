@@ -22,15 +22,39 @@ pub const AEAD_DIR_SERVER_TO_CLIENT: u8 = 0x00;
 /// Direction byte for nonce: client → server.
 pub const AEAD_DIR_CLIENT_TO_SERVER: u8 = 0x01;
 
-/// AEAD state for one direction of a connection.
-#[derive(Clone, Copy)]
+/// AEAD state for one direction of a connection. Neither copied nor
+/// cloned, and its counter not settable: two states at one counter under
+/// one key would seal two records under one nonce.
 pub struct AeadState {
-    pub key: [u8; 32],
-    pub counter: u64,
-    pub dir: u8,
+    key: [u8; 32],
+    counter: u64,
+    dir: u8,
 }
 
 impl AeadState {
+    /// A direction's state, at the first record.
+    pub fn new(key: [u8; 32], dir: u8) -> Self {
+        AeadState {
+            key,
+            counter: 0,
+            dir,
+        }
+    }
+
+    /// The key, for deriving others from it.
+    pub fn key(&self) -> &[u8; 32] {
+        &self.key
+    }
+
+    pub fn dir(&self) -> u8 {
+        self.dir
+    }
+
+    /// How many records have been sealed or opened.
+    pub fn counter(&self) -> u64 {
+        self.counter
+    }
+
     fn build_nonce(&self) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[0] = self.dir;
@@ -157,14 +181,6 @@ fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) -> bool {
 
 // ---- Key derivation -----------------------------------------------------
 
-fn state(key: [u8; 32], dir: u8) -> AeadState {
-    AeadState {
-        key,
-        counter: 0,
-        dir,
-    }
-}
-
 /// A session's two AEAD states, `(client → server, server → client)`, from
 /// its HOPE session key and the two keys of the HMAC chain as the spec names
 /// them. The labels are wire-pinned: they are what keeps the two directions'
@@ -190,8 +206,8 @@ pub fn derive_session_keys(
         &mut to_server
     ));
     (
-        state(to_server, AEAD_DIR_CLIENT_TO_SERVER),
-        state(to_client, AEAD_DIR_SERVER_TO_CLIENT),
+        AeadState::new(to_server, AEAD_DIR_CLIENT_TO_SERVER),
+        AeadState::new(to_client, AEAD_DIR_SERVER_TO_CLIENT),
     )
 }
 
@@ -228,8 +244,8 @@ pub fn derive_transfer_keys(
         &mut key
     ));
     (
-        state(key, AEAD_DIR_CLIENT_TO_SERVER),
-        state(key, AEAD_DIR_SERVER_TO_CLIENT),
+        AeadState::new(key, AEAD_DIR_CLIENT_TO_SERVER),
+        AeadState::new(key, AEAD_DIR_SERVER_TO_CLIENT),
     )
 }
 

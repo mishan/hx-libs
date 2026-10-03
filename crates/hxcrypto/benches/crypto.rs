@@ -80,11 +80,7 @@ fn bench_hope_rekey(c: &mut Criterion) {
 }
 
 fn aead_state() -> AeadState {
-    AeadState {
-        key: [7u8; 32],
-        counter: 0,
-        dir: AEAD_DIR_CLIENT_TO_SERVER,
-    }
+    AeadState::new([7u8; 32], AEAD_DIR_CLIENT_TO_SERVER)
 }
 
 fn bench_aead(c: &mut Criterion) {
@@ -103,8 +99,8 @@ fn bench_aead(c: &mut Criterion) {
     let mut g = c.benchmark_group("aead_open");
     for n in SIZES {
         // Open needs a record sealed at the counter it expects, so seal a
-        // run of records up front and open them in order, wrapping by
-        // resetting both ends' counters together.
+        // run of records up front and open them in order, wrapping with a
+        // fresh opener at the first.
         const RECORDS: u64 = 64;
         let mut sealer = aead_state();
         let pt = vec![0x5au8; n];
@@ -121,9 +117,9 @@ fn bench_aead(c: &mut Criterion) {
         g.throughput(Throughput::Bytes(n as u64));
         g.bench_function(BenchmarkId::from_parameter(n), |b| {
             b.iter(|| {
-                let i = opener.counter % RECORDS;
+                let i = opener.counter() % RECORDS;
                 if i == 0 {
-                    opener.counter = 0;
+                    opener = aead_state();
                 }
                 opener
                     .open(black_box(&framed[i as usize]), &mut out)
