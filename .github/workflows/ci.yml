@@ -37,11 +37,20 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # hxsession's HOPE is a feature, off by default, and Zstandard one on
+      # top of it, so each way is checked: without HOPE, with it, and with
+      # Zstandard (which brings HOPE).
       - name: Clippy (warnings denied)
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --locked --features hxsession/hope -- -D warnings
+          cargo clippy --workspace --all-targets --locked --features hxsession/zstd -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --locked
+          cargo test --locked -p hxsession --features hxsession/hope
+          cargo test --locked -p hxhope -p hxsession --features hxsession/zstd
 
   # The codecs are meant to run in a browser as well, so the crates with no
   # platform dependencies have to keep building for wasm32. hxproto is
@@ -63,7 +72,9 @@ jobs:
           cargo build --locked --target wasm32-unknown-unknown -p hxproto
           cargo build --locked --target wasm32-unknown-unknown -p hxproto --no-default-features
           cargo build --locked --target wasm32-unknown-unknown -p hxfiles-xfer
+          cargo build --locked --target wasm32-unknown-unknown -p hxcrypto -p hxhope
           cargo build --locked --target wasm32-unknown-unknown -p hxsession
+          cargo build --locked --target wasm32-unknown-unknown -p hxsession --features hope
 
   # `rust-version` is GtkHx's floor, Debian stable's rustc, and it only
   # means something if a build on that toolchain is what checks it.
@@ -77,4 +88,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Tests on the MSRV
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --locked
+          cargo test --locked -p hxsession --features hxsession/hope

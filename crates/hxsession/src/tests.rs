@@ -1036,22 +1036,6 @@ fn a_trans_taken_before_the_magic_is_not_the_logins() {
 }
 
 #[test]
-fn a_raw_session_and_its_caller_number_from_one_counter() {
-    // As after HOPE's two steps, the login on 1 and the second on 2.
-    let mut s = Session::logging_in(raw(), 3, T0);
-    assert_eq!(s.take_trans(), 3);
-    let mut reply = login_reply(Some(190), None);
-    reply[4..8].copy_from_slice(&2u32.to_be_bytes());
-    s.feed(&reply, T0);
-    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
-    assert_eq!(s.take_trans(), 4);
-    s.agree().unwrap();
-    assert_eq!(s.take_trans(), 6);
-    let trans: Vec<u32> = sent(&mut s).iter().map(|o| o.1).collect();
-    assert_eq!(trans, [5]);
-}
-
-#[test]
 fn raw_takes_only_whole_transactions() {
     let mut s = logging_in(raw());
     s.feed(&login_reply(Some(190), None), T0);
@@ -1152,4 +1136,240 @@ fn the_session_says_when_the_stream_stopped_part_way() {
     assert!(s.mid_transaction());
     s.feed(&chat[10..], T0);
     assert!(!s.mid_transaction());
+}
+
+// ---- HOPE ----------------------------------------------------------------
+
+#[cfg(feature = "hope")]
+mod hope {
+    use super::*;
+
+    use hxhope::server::Policy;
+    use hxhope::{Cipher, Compression, Mac, Transport};
+
+    /// Marks about one transaction in five, either way.
+    fn random() -> hxhope::Random {
+        let mut i = 0usize;
+        Box::new(move |buf: &mut [u8]| {
+            for b in buf {
+                *b = [0x20, 0x0c, 0, 0x10, 0, 0, 0x70, 0, 0x30][i % 9];
+                i += 1;
+            }
+        })
+    }
+
+    fn offer(cipher: Option<Cipher>, compression: Option<Compression>) -> hxhope::client::Offer {
+        hxhope::client::Offer {
+            ciphers: cipher.into_iter().collect(),
+            compressions: compression.into_iter().collect(),
+            ..hxhope::client::Offer::new(*b"TEST")
+        }
+    }
+
+    fn policy() -> Policy {
+        Policy {
+            macs: Mac::ALL.to_vec(),
+            ciphers: vec![Cipher::Blowfish, Cipher::ChaCha20Poly1305],
+            compressions: [Compression::Gzip, Compression::Lz4, Compression::Zstd]
+                .into_iter()
+                .filter(|c| c.available())
+                .collect(),
+            require_cipher: false,
+        }
+    }
+
+    /// The far side of a HOPE login: hxhope's server, and once step 2 is in,
+    /// its transport.
+    struct HopeServer {
+        reader: FrameReader,
+        transport: Option<Transport>,
+    }
+
+    impl HopeServer {
+        fn new() -> Self {
+            HopeServer {
+                reader: FrameReader::new(),
+                transport: None,
+            }
+        }
+
+        /// What the session sent since last asked, as transactions.
+        fn hear(&mut self, s: &mut Session) -> Vec<Transaction> {
+            let wire = s.take_outgoing();
+            let wire = wire.strip_prefix(CLIENT_MAGIC.as_slice()).unwrap_or(&wire);
+            let mut plain = Vec::new();
+            match self.transport.as_mut() {
+                Some(t) => t.decode(wire, &mut plain).unwrap(),
+                None => plain.extend_from_slice(wire),
+            }
+            self.reader.push(&plain);
+            std::iter::from_fn(|| self.reader.next_transaction().unwrap()).collect()
+        }
+
+        fn say(&mut self, s: &mut Session, plain: &[u8]) {
+            let wire = match self.transport.as_mut() {
+                Some(t) => t.encode(plain).unwrap(),
+                None => plain.to_vec(),
+            };
+            s.feed(&wire, T0);
+        }
+
+        /// Answer the magic and step 1, take step 2 and accept it, and answer
+        /// it as the login. Returns step 1's and step 2's trans.
+        fn log_in(&mut self, s: &mut Session, policy: &Policy) -> (u32, u32) {
+            s.feed(SERVER_MAGIC, T0);
+            let step1 = self.hear(s).remove(0);
+            let (hs, reply) =
+                hxhope::server::answer(policy, &step1.buf, [7; 64], step1.trans).unwrap();
+            self.say(s, &reply);
+            let step2 = self.hear(s).remove(0);
+            let fields = hs.step2(&step2.buf).unwrap();
+            assert!(fields.names(&hs, b""), "the guest's login");
+            let (t, _) = hs.accept(&fields, b"", random()).unwrap();
+            self.transport = Some(t);
+            self.say(s, &login_reply(Some(190), None));
+            (step1.trans, step2.trans)
+        }
+    }
+
+    #[test]
+    fn hope_logs_in_and_chats_through_every_transport() {
+        let mut compressions = vec![None, Some(Compression::Gzip), Some(Compression::Lz4)];
+        if cfg!(feature = "zstd") {
+            compressions.push(Some(Compression::Zstd));
+        }
+        for cipher in [None, Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+            for &compression in &compressions {
+                let what = format!("{cipher:?} {compression:?}");
+                let mut s = Session::with_hope(
+                    Config::guest("me"),
+                    offer(cipher, compression),
+                    random(),
+                    T0,
+                );
+                let mut srv = HopeServer::new();
+                assert_eq!(srv.log_in(&mut s, &policy()), (1, 2), "{what}");
+                let n = s.negotiated().expect("negotiated");
+                assert_eq!((n.cipher, n.compression), (cipher, compression), "{what}");
+                srv.say(&mut s, &server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[0, 1])]));
+                let agree = srv.hear(&mut s);
+                assert_eq!(
+                    agree.iter().map(|t| (t.type_, t.trans)).collect::<Vec<_>>(),
+                    [(121, 3), (300, 4)],
+                    "{what}: the agree and the user list, numbered on from step 2"
+                );
+                for i in 0..20u8 {
+                    srv.say(&mut s, &server(0x6a, 0, 0, &[(tag::BODY, &[b'a' + i; 40])]));
+                    s.chat(&format!("line {i}")).unwrap();
+                }
+                let chats = events(&mut s)
+                    .into_iter()
+                    .filter(|e| matches!(e, Event::Chat { .. }))
+                    .count();
+                assert_eq!(chats, 20, "{what}");
+                assert_eq!(srv.hear(&mut s).len(), 20, "{what}");
+                assert!(!s.mid_transaction() && !s.is_closed(), "{what}");
+            }
+        }
+    }
+
+    /// Step 2 goes out as it is, ahead of the transport; a trace of what is
+    /// about to go out sees it.
+    #[test]
+    fn step_2_is_in_what_is_about_to_go_out() {
+        let mut s = Session::with_hope(
+            Config::guest("me"),
+            offer(Some(Cipher::Blowfish), None),
+            random(),
+            T0,
+        );
+        s.take_outgoing();
+        s.feed(SERVER_MAGIC, T0);
+        let step1 = s.take_outgoing();
+        let (_, reply) = hxhope::server::answer(&policy(), &step1, [7; 64], 1).unwrap();
+        s.feed(&reply, T0);
+        let pending = s.pending_plaintext();
+        assert_eq!(pending, s.take_outgoing(), "step 2 is plaintext");
+        assert_eq!(u32::from_be_bytes(pending[4..8].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn a_hope_session_and_its_raw_caller_number_from_one_counter() {
+        let mut s = Session::with_hope(raw(), offer(Some(Cipher::Blowfish), None), random(), T0);
+        assert_eq!(s.login_trans(), 2);
+        let early = s.take_trans();
+        assert_eq!(early, 3, "numbered past both steps before either goes");
+        let mut srv = HopeServer::new();
+        srv.log_in(&mut s, &policy());
+        let replies: Vec<u32> = events(&mut s)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Reply { trans, .. } => Some(trans),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            [1],
+            "step 2's reply is the login's; step 1's is not handed over"
+        );
+        s.send_raw(&caller(300, early)).unwrap();
+        let trans: Vec<u32> = srv.hear(&mut s).iter().map(|t| t.trans).collect();
+        assert_eq!(trans, [early]);
+    }
+
+    #[test]
+    fn a_hope_login_the_server_will_not_have_closes() {
+        // Refused at step 1, with the reason.
+        let mut s = Session::with_hope(Config::guest("me"), offer(None, None), random(), T0);
+        s.take_outgoing();
+        s.feed(SERVER_MAGIC, T0);
+        s.take_outgoing();
+        s.feed(
+            &server(TASK, 1, 1, &[(tag::TASK_ERROR, b"No HOPE here.")]),
+            T0,
+        );
+        assert_eq!(
+            events(&mut s),
+            [Event::Closed(Closed::LoginRefused(Some(
+                "No HOPE here.".into()
+            )))]
+        );
+
+        // Answered as a plain login: no session key, so no HOPE.
+        let mut s = Session::with_hope(Config::guest("me"), offer(None, None), random(), T0);
+        s.take_outgoing();
+        s.feed(SERVER_MAGIC, T0);
+        s.take_outgoing();
+        s.feed(&login_reply(Some(190), None), T0);
+        assert!(matches!(
+            &events(&mut s)[..],
+            [Event::Closed(Closed::Protocol(_))]
+        ));
+    }
+
+    #[test]
+    fn a_hope_transport_that_stops_making_sense_closes() {
+        let mut s = Session::with_hope(
+            Config::guest("me"),
+            offer(Some(Cipher::ChaCha20Poly1305), None),
+            random(),
+            T0,
+        );
+        let mut srv = HopeServer::new();
+        srv.log_in(&mut s, &policy());
+        events(&mut s);
+        let mut record = srv
+            .transport
+            .as_mut()
+            .unwrap()
+            .encode(&server(0x6a, 0, 0, &[]))
+            .unwrap();
+        record[10] ^= 1;
+        s.feed(&record, T0);
+        assert!(matches!(
+            &events(&mut s)[..],
+            [Event::Closed(Closed::Protocol(_))]
+        ));
+    }
 }

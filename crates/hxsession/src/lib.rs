@@ -40,13 +40,20 @@
 //! transaction ids and the keep-alive, and hands everything else over
 //! whole. That is how a client moves onto the session a piece at a time.
 //!
-//! What is not here yet: HOPE, the transport ciphers and compression,
-//! file transfers (a folder's listing is here; its contents are not),
-//! and the extensions (voice, video, inline media, chat history, GIF
-//! icons). [`Session::request`] sends any transaction and hands its reply
+//! With the `hope` feature, `Session::with_hope` logs in with HOPE, the
+//! secure login, and runs the rest of the connection through the cipher
+//! and compression it agrees (hx-libs' `hxhope`): `feed` takes the
+//! socket's bytes and `take_outgoing` gives them, whatever the transport.
+//! A client that has no use for HOPE leaves the feature off, and with it
+//! the ciphers and compressors.
+//!
+//! What is not here yet: file transfers (a folder's listing is here; its
+//! contents are not), and the extensions (voice, video, inline media, chat
+//! history, GIF icons). [`Session::request`] sends any transaction and hands its reply
 //! back whole, for what has no method of its own.
 
 pub mod frame;
+mod hope;
 pub mod request;
 
 use std::collections::{HashMap, VecDeque};
@@ -358,6 +365,8 @@ pub enum Error {
 enum State {
     /// Waiting for the server's magic.
     Magic,
+    /// HOPE's step 1 sent, waiting for its reply.
+    HopeStep1,
     /// Login sent, waiting for its reply.
     Login,
     LoggedIn,
@@ -414,6 +423,17 @@ pub struct Session {
     unstamped: bool,
     /// Inside `feed` or `tick`: `now` is the current time.
     clocked: bool,
+    /// The trans the login's reply answers: HOPE's step 2, or the LOGIN.
+    login_trans: u32,
+    /// HOPE's offer and its randomness, until step 2 goes.
+    hope: Option<hope::Pending>,
+    /// What HOPE agreed, and the transport it runs through. `out` is
+    /// plaintext for it; `before_transport` was queued before it began,
+    /// and goes as it is.
+    #[cfg(feature = "hope")]
+    negotiated: Option<hope::Negotiated>,
+    transport: Option<hope::Transport>,
+    before_transport: Vec<u8>,
 }
 
 impl Session {
@@ -443,23 +463,60 @@ impl Session {
             last_sent: now_ms,
             unstamped: false,
             clocked: false,
+            login_trans: LOGIN_TRANS,
+            hope: None,
+            #[cfg(feature = "hope")]
+            negotiated: None,
+            transport: None,
+            before_transport: Vec::new(),
         }
     }
 
-    /// A session whose login the caller has already sent, as HOPE does in
-    /// two steps of its own: the next reply it is fed is the login's, and
-    /// it numbers what it sends after that from `next_trans`.
-    pub fn logging_in(cfg: Config, next_trans: u32, now_ms: u64) -> Self {
+    /// A session that logs in with HOPE: `offer` in step 1 on the login's
+    /// trans, the credentials in step 2 on the next, and from step 2's
+    /// reply on, everything through the transport the server chose.
+    /// `random` decides where Blowfish's rekey markers go.
+    #[cfg(feature = "hope")]
+    pub fn with_hope(
+        cfg: Config,
+        offer: hxhope::client::Offer,
+        random: hxhope::Random,
+        now_ms: u64,
+    ) -> Self {
         let mut s = Session::new(cfg, now_ms);
-        s.out.clear();
-        s.state = State::Login;
-        s.trans = next_trans.max(1);
+        s.login_trans = s.take_trans();
+        s.hope = Some((offer, random));
         s
     }
 
     /// Bytes to write to the socket, in order. Empty when there is nothing.
     pub fn take_outgoing(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.out)
+        let plain = std::mem::take(&mut self.out);
+        let mut bytes = std::mem::take(&mut self.before_transport);
+        match self.transport.as_mut().map(|t| t.encode(&plain)) {
+            None => bytes.extend_from_slice(&plain),
+            Some(Ok(encoded)) => bytes.extend_from_slice(&encoded),
+            Some(Err(e)) => self.close(Closed::Protocol(e.to_string())),
+        }
+        bytes
+    }
+
+    /// What [`Session::take_outgoing`] is about to send, before a HOPE
+    /// transport makes ciphertext of it: for a protocol trace.
+    pub fn pending_plaintext(&self) -> Vec<u8> {
+        [&self.before_transport[..], &self.out[..]].concat()
+    }
+
+    /// The trans the login goes out on, which its reply carries: HOPE's
+    /// step 2 under [`Session::with_hope`].
+    pub fn login_trans(&self) -> u32 {
+        self.login_trans
+    }
+
+    /// What HOPE agreed, once step 2 has gone.
+    #[cfg(feature = "hope")]
+    pub fn negotiated(&self) -> Option<&hxhope::Negotiated> {
+        self.negotiated.as_ref()
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -487,14 +544,16 @@ impl Session {
     /// Whether a transport that ends now ends part way through a
     /// transaction: cut off, rather than closed.
     pub fn mid_transaction(&self) -> bool {
-        !self.reader.is_idle() || (self.state == State::Magic && !self.magic.is_empty())
+        !self.reader.is_idle()
+            || (self.state == State::Magic && !self.magic.is_empty())
+            || self.transport.as_ref().is_some_and(|t| !t.idle())
     }
 
     /// When [`Session::tick`] next has something to do.
     pub fn next_deadline(&self) -> Option<u64> {
         match self.state {
             State::Closed => None,
-            State::Magic | State::Login => self.handshake_deadline,
+            State::Magic | State::HopeStep1 | State::Login => self.handshake_deadline,
             State::LoggedIn => {
                 let keepalive = self.keepalive_due();
                 match (self.agreement_deadline, keepalive) {
@@ -511,7 +570,16 @@ impl Session {
     pub fn feed(&mut self, bytes: &[u8], now_ms: u64) {
         self.clock(now_ms);
         self.clocked = true;
-        self.feed_clocked(bytes);
+        match self.transport.as_mut() {
+            None => self.feed_clocked(bytes),
+            Some(t) => {
+                let mut plain = Vec::new();
+                match t.decode(bytes, &mut plain) {
+                    Ok(()) => self.feed_clocked(&plain),
+                    Err(e) => self.close(Closed::Protocol(e.to_string())),
+                }
+            }
+        }
         self.clocked = false;
     }
 
@@ -530,18 +598,29 @@ impl Session {
                 self.close(Closed::BadMagic(got));
                 return;
             }
-            self.state = State::Login;
-            let caps = self.cfg.caps;
-            // Credentials go as typed, in UTF-8, as GtkHx sends them; a
-            // server compares them as bytes.
-            let login = request::login(
-                self.cfg.login.as_bytes(),
-                self.cfg.password.as_bytes(),
-                self.cfg.icon,
-                self.cfg.version,
-                caps,
-            );
-            self.send_frame(&login, LOGIN_TRANS);
+            if let Some(pending) = &self.hope {
+                match hope::step1(pending, LOGIN_TRANS) {
+                    Ok(step1) => {
+                        self.out.extend_from_slice(&step1);
+                        self.stamp_sent();
+                        self.state = State::HopeStep1;
+                    }
+                    Err(e) => self.close(Closed::Protocol(e)),
+                }
+            } else {
+                self.state = State::Login;
+                let caps = self.cfg.caps;
+                // Credentials go as typed, in UTF-8, as GtkHx sends them; a
+                // server compares them as bytes.
+                let login = request::login(
+                    self.cfg.login.as_bytes(),
+                    self.cfg.password.as_bytes(),
+                    self.cfg.icon,
+                    self.cfg.version,
+                    caps,
+                );
+                self.send_frame(&login, LOGIN_TRANS);
+            }
         }
         if self.state == State::Closed {
             return;
@@ -585,7 +664,7 @@ impl Session {
     fn tick_clocked(&mut self, now_ms: u64) {
         match self.state {
             State::Closed => {}
-            State::Magic | State::Login => {
+            State::Magic | State::HopeStep1 | State::Login => {
                 if self.handshake_deadline.is_some_and(|d| now_ms >= d) {
                     self.close(Closed::Timeout);
                 }
@@ -816,7 +895,7 @@ impl Session {
 
     fn dispatch(&mut self, t: Transaction) {
         let kind = route(t.type_);
-        if self.state == State::Login && kind != HandlerKind::Task {
+        if matches!(self.state, State::HopeStep1 | State::Login) && kind != HandlerKind::Task {
             // Some servers (RetroMac, MacDomain) send their self-info or
             // the agreement before answering the login. Nothing can act on
             // them until it is answered, so they wait for it.
@@ -943,6 +1022,11 @@ impl Session {
     fn reply(&mut self, t: Transaction) {
         // The first reply is the login's, whatever trans it carries: some
         // servers answer it on 0, and GtkHx takes it the same way.
+        #[cfg(feature = "hope")]
+        if self.state == State::HopeStep1 {
+            self.hope_reply(t);
+            return;
+        }
         if self.state == State::Login {
             self.login_reply(t);
             return;
@@ -1163,6 +1247,40 @@ impl Session {
         }
         if version == 0 {
             self.after_agreement();
+        }
+    }
+
+    /// HOPE's step-1 reply: send step 2, and run what follows through the
+    /// transport the server chose.
+    #[cfg(feature = "hope")]
+    fn hope_reply(&mut self, t: Transaction) {
+        if t.is_error() {
+            let reason =
+                parse::parse_task_error(&t.buf, t.buf.len(), MAX_BODY).map(|r| text_in(&r));
+            self.close(Closed::LoginRefused(reason));
+            return;
+        }
+        let pending = self.hope.take().expect("step 1 went with an offer");
+        let who = hope::Login {
+            login: self.cfg.login.as_bytes(),
+            password: self.cfg.password.as_bytes(),
+            name: self.cfg.nick.as_bytes(),
+            icon: self.cfg.icon,
+            version: self.cfg.version,
+            caps: self.cfg.caps,
+        };
+        match hope::step2(pending, &t.buf, &who, self.login_trans) {
+            Ok((step2, transport, negotiated)) => {
+                // Everything queued so far goes as it is; after step 2,
+                // through the transport.
+                self.before_transport.append(&mut self.out);
+                self.before_transport.extend_from_slice(&step2);
+                self.stamp_sent();
+                self.transport = Some(transport);
+                self.negotiated = Some(negotiated);
+                self.state = State::Login;
+            }
+            Err(e) => self.close(Closed::Protocol(e)),
         }
     }
 

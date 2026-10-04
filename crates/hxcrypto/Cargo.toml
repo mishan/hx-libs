@@ -1,0 +1,34 @@
+[package]
+rust-version.workspace = true
+name = "hxcrypto"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "The crypto behind HOPE: HMAC and the legacy hashes, Blowfish OFB-64, ChaCha20-Poly1305 and its HKDF keys"
+publish = false
+
+[lib]
+# The benches are criterion targets; without this, `cargo bench` also runs
+# the lib under libtest, which rejects criterion's flags.
+bench = false
+
+[dependencies]
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+digest = "0.10"
+blowfish = "0.10"
+cipher = "0.5"
+# Without the default `getrandom` feature: nothing here draws a random key
+# or nonce, and getrandom refuses to build for wasm32-unknown-unknown
+# without a backend chosen.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf = "0.12"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "crypto"
+harness = false

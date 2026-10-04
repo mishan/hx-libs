@@ -1,0 +1,20 @@
+[package]
+rust-version.workspace = true
+name = "hxhope"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "HOPE, the Hotline secure login, with no I/O of its own: the handshake as either side plays it, its keys, and the transport it negotiates"
+publish = false
+
+[features]
+# Zstandard compression: a C library, so left out of a build that has no C
+# toolchain for its target (a browser's wasm32).
+zstd = ["dep:zstd"]
+
+[dependencies]
+hxcrypto = { path = "../hxcrypto" }
+hxproto = { path = "../hxproto", default-features = false }
+flate2 = "1"
+lz4_flex = "0.11"
+zstd = { version = "0.13", optional = true, default-features = false }
