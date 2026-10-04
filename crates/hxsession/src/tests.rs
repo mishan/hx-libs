@@ -342,7 +342,8 @@ fn pushes_become_events() {
             Event::Chat {
                 cid: 0,
                 uid: 5,
-                text: "    bob:  hi".into()
+                text: "    bob:  hi".into(),
+                media: None
             },
             Event::Message {
                 uid: 5,
@@ -390,7 +391,8 @@ fn text_follows_the_negotiated_encoding() {
     assert!(events(&mut s).contains(&Event::Chat {
         cid: 0,
         uid: 0,
-        text: "café".into()
+        text: "café".into(),
+        media: None
     }));
 }
 
@@ -860,6 +862,8 @@ fn a_path_too_long_to_send_is_refused_not_cut() {
 
 // ---- Raw mode ----------------------------------------------------------
 
+/// Raw, handling no domain unless asked: as raw was before there were
+/// domains.
 fn raw() -> Config {
     Config {
         raw: true,
@@ -1138,6 +1142,426 @@ fn the_session_says_when_the_stream_stopped_part_way() {
     assert!(!s.mid_transaction());
 }
 
+// ---- Chat ----------------------------------------------------------------
+
+/// A raw session through an empty agreement, handling `handled`, its login
+/// having agreed to `caps`.
+fn raw_ready(handled: Handled, caps: u16) -> Session {
+    let mut s = logging_in(Config {
+        handled,
+        caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA | cap::CHAT_HISTORY,
+        ..raw()
+    });
+    s.feed(&login_reply(Some(190), Some(caps)), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    events(&mut s);
+    s
+}
+
+#[test]
+fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
+    let chat = server(
+        0x6a,
+        0,
+        0,
+        &[(tag::BODY, b"\rbob:  hi"), (tag::UID, &[0, 5])],
+    );
+    let invite = server(
+        0x71,
+        0,
+        0,
+        &[
+            (tag::CHAT_ID, &[0, 0, 0, 9]),
+            (tag::UID, &[0, 5]),
+            (tag::NAME, b"bob"),
+        ],
+    );
+    let subject = server(
+        0x77,
+        0,
+        0,
+        &[(tag::CHAT_ID, &[0, 0, 0, 9]), (tag::CHAT_SUBJECT, b"Plans")],
+    );
+    let user = server(0x12d, 0, 0, &[(tag::UID, &[0, 5]), (tag::NAME, b"bob")]);
+    let whole = |opcode: u32, frame: &[u8]| Event::Unhandled {
+        opcode,
+        frame: frame.to_vec(),
+    };
+    let cases = [
+        (
+            Handled::NONE,
+            vec![
+                whole(0x6a, &chat),
+                whole(0x71, &invite),
+                whole(0x77, &subject),
+                whole(0x12d, &user),
+            ],
+        ),
+        (
+            Handled::CHAT,
+            vec![
+                Event::Chat {
+                    cid: 0,
+                    uid: 5,
+                    text: "bob:  hi".into(),
+                    media: None,
+                },
+                Event::ChatInvite {
+                    cid: 9,
+                    uid: 5,
+                    name: "bob".into(),
+                },
+                Event::ChatSubject {
+                    cid: 9,
+                    subject: "Plans".into(),
+                },
+                whole(0x12d, &user),
+            ],
+        ),
+    ];
+    for (handled, want) in cases {
+        let mut s = raw_ready(handled, 0);
+        for frame in [&chat, &invite, &subject, &user] {
+            s.feed(frame, T0);
+        }
+        assert_eq!(events(&mut s), want, "{handled:?}");
+    }
+}
+
+#[test]
+fn names_and_subjects_read_in_either_encoding() {
+    let mut s = raw_ready(Handled::CHAT, 0);
+    // 0x8E is Mac Roman é; "é" in UTF-8 is not Mac Roman.
+    for name in [&b"Ren\x8E"[..], "René".as_bytes()] {
+        s.feed(
+            &server(
+                0x71,
+                0,
+                0,
+                &[(tag::CHAT_ID, &[0, 0, 0, 1]), (tag::NAME, name)],
+            ),
+            T0,
+        );
+        s.feed(
+            &server(
+                0x77,
+                0,
+                0,
+                &[(tag::CHAT_ID, &[0, 0, 0, 1]), (tag::CHAT_SUBJECT, name)],
+            ),
+            T0,
+        );
+        assert_eq!(
+            events(&mut s),
+            [
+                Event::ChatInvite {
+                    cid: 1,
+                    uid: 0,
+                    name: "René".into()
+                },
+                Event::ChatSubject {
+                    cid: 1,
+                    subject: "René".into()
+                },
+            ]
+        );
+    }
+}
+
+#[test]
+fn a_chat_line_carries_its_media_where_it_was_agreed() {
+    let id: (u16, &[u8]) = (tag::CHAT_MEDIA_ID, b"h1");
+    let mime: (u16, &[u8]) = (tag::CHAT_MEDIA_TYPE, b"image/png");
+    let width: (u16, &[u8]) = (tag::CHAT_MEDIA_WIDTH, &[0, 0, 3, 32]);
+    let body: (u16, &[u8]) = (tag::BODY, b"look");
+    let png = ChatMedia {
+        id: b"h1".to_vec(),
+        mime: b"image/png".to_vec(),
+        width: Some(800),
+        height: None,
+        bytes: None,
+    };
+    let cases = [
+        (
+            "present",
+            cap::INLINE_MEDIA,
+            vec![body, id, mime, width],
+            Some(Some(png)),
+        ),
+        ("absent", cap::INLINE_MEDIA, vec![body], Some(None)),
+        ("orphaned id", cap::INLINE_MEDIA, vec![body, id], None),
+        ("orphaned type", cap::INLINE_MEDIA, vec![body, mime], None),
+        ("not agreed", 0, vec![body, id], Some(None)),
+    ];
+    for (what, caps, fields, want) in cases {
+        let mut s = raw_ready(Handled::CHAT, caps);
+        s.feed(&server(0x6a, 0, 0, &fields), T0);
+        let got = events(&mut s);
+        match want {
+            Some(media) => assert_eq!(
+                got,
+                [Event::Chat {
+                    cid: 0,
+                    uid: 0,
+                    text: "look".into(),
+                    media
+                }],
+                "{what}"
+            ),
+            None => assert!(got.is_empty(), "{what}: dropped whole"),
+        }
+    }
+}
+
+/// A history entry as a server packs it.
+fn history_entry(id: u64, flags: u16, nick: &[u8], text: &[u8]) -> Vec<u8> {
+    [
+        &id.to_be_bytes()[..],
+        &1_700_000_000i64.to_be_bytes(),
+        &flags.to_be_bytes(),
+        &7u16.to_be_bytes(),
+        &(nick.len() as u16).to_be_bytes(),
+        nick,
+        &(text.len() as u16).to_be_bytes(),
+        text,
+    ]
+    .concat()
+}
+
+#[test]
+fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
+    let mut s = raw_ready(Handled::CHAT, cap::CHAT_HISTORY);
+    let (history, invite, other) = (s.take_trans(), s.take_trans(), s.take_trans());
+    s.expect(history, Expect::ChatHistory { cid: 4 }).unwrap();
+    s.expect(invite, Expect::ChatInvite).unwrap();
+    for t in [history, invite, other] {
+        s.send_raw(&caller(700, t)).unwrap();
+    }
+
+    let first = history_entry(10, 0, b"ann", b"one\rtwo \x1b[1m");
+    let second = history_entry(11, 1, b"Ren\x8E", "caf\u{e9}".as_bytes());
+    s.feed(
+        &server(
+            TASK,
+            history,
+            0,
+            &[
+                (tag::HISTORY_ENTRY, &first),
+                (tag::HISTORY_ENTRY, &first[..20]),
+                (tag::HISTORY_ENTRY, &second),
+                (tag::HISTORY_HAS_MORE, &[1]),
+                // Says nothing, so changes nothing.
+                (tag::HISTORY_HAS_MORE, &[]),
+            ],
+        ),
+        T0,
+    );
+    s.feed(&server(TASK, invite, 0, &[]), T0);
+    let reply = server(TASK, other, 0, &[]);
+    s.feed(&reply, T0);
+    let entry = |message_id, flags, nick: &str, text: &str| HistoryEntry {
+        message_id,
+        timestamp: 1_700_000_000,
+        flags,
+        icon: 7,
+        nick: nick.into(),
+        text: text.into(),
+    };
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::ChatHistory {
+                trans: history,
+                cid: 4,
+                entries: vec![
+                    entry(10, 0, "ann", "one\ntwo [[1m"),
+                    entry(11, 1, "René", "café"),
+                ],
+                has_more: true,
+            },
+            Event::Reply {
+                trans: other,
+                frame: reply
+            },
+        ]
+    );
+}
+
+/// A reply to `trans` that never finishes: its first part, then the same
+/// trans starting over with a different size.
+fn cut_short(trans: u32) -> Vec<u8> {
+    let frag = |total: u32| {
+        let head = [TASK, trans, 0, total, 10].map(u32::to_be_bytes).concat();
+        [head, vec![0; 10]].concat()
+    };
+    [frag(40), frag(41)].concat()
+}
+
+#[test]
+fn a_cut_short_reply_to_the_keep_alive_is_no_news() {
+    let mut s = ready();
+    s.tick(T0 + 60_000);
+    let ping = sent(&mut s);
+    assert_eq!(ping[0].0, 500);
+    s.feed(&cut_short(ping[0].1), T0 + 60_000);
+    assert_eq!(events(&mut s), []);
+}
+
+/// The session's own agree, cut short, has no whole frame to hand a raw
+/// caller, and a failure on a trans the caller never sent is nothing it
+/// could act on: it hears nothing, as it hears nothing of an agree that
+/// works until its frame arrives.
+#[test]
+fn a_raw_caller_hears_nothing_of_the_sessions_own_reply_cut_short() {
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    let agree = sent(&mut s);
+    assert_eq!(agree[0].0, 121);
+    events(&mut s);
+    s.feed(&cut_short(agree[0].1), T0);
+    assert_eq!(events(&mut s), []);
+}
+
+#[test]
+fn only_a_raw_caller_expects_and_only_on_its_own_trans() {
+    let mut s = ready();
+    assert_eq!(s.expect(99, Expect::ChatInvite), Err(Error::NotReady));
+
+    let mut s = logging_in(raw());
+    s.feed(&login_reply(Some(190), None), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    let agree = sent(&mut s)[0].1;
+    events(&mut s);
+    assert_eq!(s.expect(agree, Expect::ChatInvite), Err(Error::InUse));
+    // Still the session's: its refusal reaches the caller whole.
+    let refusal = server(TASK, agree, 1, &[(tag::TASK_ERROR, b"No.")]);
+    s.feed(&refusal, T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::Reply {
+            trans: agree,
+            frame: refusal
+        }]
+    );
+    let mine = s.take_trans();
+    assert_eq!(s.expect(mine, Expect::ChatInvite), Ok(()));
+    assert_eq!(s.expect(mine, Expect::ChatInvite), Err(Error::InUse));
+}
+
+#[test]
+fn an_expected_reply_that_fails_says_why() {
+    let mut s = raw_ready(Handled::CHAT, 0);
+    let (refused, cut) = (s.take_trans(), s.take_trans());
+    s.expect(refused, Expect::ChatInvite).unwrap();
+    s.expect(cut, Expect::ChatHistory { cid: 0 }).unwrap();
+    s.feed(
+        &server(TASK, refused, 1, &[(tag::TASK_ERROR, b"Not here.")]),
+        T0,
+    );
+    s.feed(&cut_short(cut), T0);
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::Failed {
+                trans: refused,
+                reason: Some("Not here.".into())
+            },
+            Event::Failed {
+                trans: cut,
+                reason: Some("the server's reply was cut short".into())
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_tap_hands_over_each_transaction_before_what_it_sets_off() {
+    let mut s = raw_ready(Handled::CHAT, 0);
+    s.set_tap(true);
+    let chat = server(0x6a, 0, 0, &[(tag::BODY, b"hi")]);
+    let user = server(0x12d, 0, 0, &[]);
+    s.feed(&[chat.clone(), user.clone()].concat(), T0);
+    let ev = events(&mut s);
+    assert_eq!(ev[0], Event::Received(chat));
+    assert!(matches!(ev[1], Event::Chat { .. }));
+    assert_eq!(ev[2], Event::Received(user.clone()));
+    assert_eq!(
+        ev[3],
+        Event::Unhandled {
+            opcode: 0x12d,
+            frame: user
+        }
+    );
+    assert_eq!(ev.len(), 4);
+}
+
+#[test]
+fn history_needs_the_server_to_have_agreed() {
+    let mut s = ready();
+    assert_eq!(s.chat_history(0, 0, 0, 50), Err(Error::NotAgreed));
+    assert_eq!(sent(&mut s), []);
+}
+
+#[test]
+fn chat_requests_go_as_gtkhx_sends_them() {
+    let mut s = logging_in(Config {
+        caps: cap::TEXT_ENCODING | cap::CHAT_HISTORY,
+        ..Config::guest("me")
+    });
+    s.feed(
+        &login_reply(Some(190), Some(cap::TEXT_ENCODING | cap::CHAT_HISTORY)),
+        T0,
+    );
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    events(&mut s);
+    let cid = (tag::CHAT_ID, vec![0, 0, 0, 9]);
+    let want: Vec<Sent> = vec![
+        (112, s.chat_create(5).unwrap(), vec![(tag::UID, vec![0, 5])]),
+        (
+            113,
+            s.chat_invite(9, 5).unwrap(),
+            vec![cid.clone(), (tag::UID, vec![0, 5])],
+        ),
+        (114, s.chat_decline(9).unwrap(), vec![cid.clone()]),
+        (115, s.chat_join(9).unwrap(), vec![cid.clone()]),
+        (116, s.chat_part(9).unwrap(), vec![cid.clone()]),
+        (
+            120,
+            s.chat_subject(9, "café").unwrap(),
+            vec![cid, (tag::CHAT_SUBJECT, "café".as_bytes().to_vec())],
+        ),
+        (
+            700,
+            s.chat_history(0, 0, 0, 50).unwrap(),
+            vec![
+                (tag::CHANNEL_ID, vec![0, 0, 0, 0]),
+                (tag::HISTORY_LIMIT, vec![0, 50]),
+            ],
+        ),
+    ];
+    assert_eq!(sent(&mut s), want);
+
+    // The history's reply is read; the invite's says nothing unless refused.
+    let (invite, history) = (want[1].1, want[6].1);
+    s.feed(&server(TASK, invite, 0, &[]), T0);
+    s.feed(
+        &server(TASK, history, 0, &[(tag::HISTORY_HAS_MORE, &[0])]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [Event::ChatHistory {
+            trans: history,
+            cid: 0,
+            entries: vec![],
+            has_more: false
+        }]
+    );
+}
+
 // ---- HOPE ----------------------------------------------------------------
 
 #[cfg(feature = "hope")]
@@ -1316,6 +1740,23 @@ mod hope {
         s.send_raw(&caller(300, early)).unwrap();
         let trans: Vec<u32> = srv.hear(&mut s).iter().map(|t| t.trans).collect();
         assert_eq!(trans, [early]);
+    }
+
+    #[test]
+    fn a_tap_under_hope_hands_over_plaintext() {
+        let mut s = Session::with_hope(
+            Config::guest("me"),
+            offer(Some(Cipher::ChaCha20Poly1305), Some(Compression::Gzip)),
+            random(),
+            T0,
+        );
+        s.set_tap(true);
+        let mut srv = HopeServer::new();
+        srv.log_in(&mut s, &policy());
+        events(&mut s);
+        let chat = server(0x6a, 0, 0, &[(tag::BODY, b"hi")]);
+        srv.say(&mut s, &chat);
+        assert_eq!(events(&mut s)[0], Event::Received(chat));
     }
 
     #[test]

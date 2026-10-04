@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "hope")]
 use hxhope::{Cipher, Compression};
+use hxproto::messages::tag;
 use hxsession::request::Request;
-use hxsession::{Config, Event, Session};
+use hxsession::{cap, Config, Event, Session};
 
 const SERVERS: &[(&str, &str)] = &[
     ("mhxd", "127.0.0.1:5500"),
@@ -130,6 +131,24 @@ impl Client {
             c.until("the session to be ready", |e| matches!(e, Event::Ready));
         }
         c
+    }
+}
+
+/// The uid `nick` has, as `c` is told in the user list it asks for.
+fn uid_of(c: &mut Client, nick: &str) -> u16 {
+    // Asked again until it is there: the other's agree may still be on its
+    // way.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        c.s.user_list().unwrap();
+        let Event::UserList(users) = c.until("the user list", |e| matches!(e, Event::UserList(_)))
+        else {
+            unreachable!()
+        };
+        if let Some(u) = users.iter().find(|u| u.name == nick) {
+            return u.uid;
+        }
+        assert!(Instant::now() < deadline, "{}: {nick} never listed", c.name);
     }
 }
 
@@ -324,6 +343,155 @@ fn files_list_on_every_server() {
                 "{name}: {folder} holds what its entry said"
             );
         }
+    }
+}
+
+/// A 4×4 red PNG, small enough to send whole.
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00, 0x00, 0x26, 0x93, 0x09,
+    0x29, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+    0x47, 0x0c, 0xc4, 0x71, 0x00, 0xae, 0x93, 0x0f, 0xf1, 0x38, 0x5e, 0x8c, 0x11, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// Private chat between two sessions: the invitation a new chat sends, a
+/// decline and an invitation again, the join, a subject and a line in
+/// it. Where the server keeps chat history, a public line read back from
+/// it; where it relays pictures, one carried on a chat line.
+#[test]
+fn chat_invitations_subjects_history_and_media_on_every_server() {
+    for (name, addr) in servers() {
+        let (na, nb) = (nick(name, "c"), nick(name, "d"));
+        let caps = cap::TEXT_ENCODING | cap::CHAT_HISTORY | cap::INLINE_MEDIA;
+        let session = |nick: &str| {
+            Session::new(
+                Config {
+                    caps,
+                    ..Config::guest(nick)
+                },
+                0,
+            )
+        };
+        let mut a = Client::login_as(name, addr, session(&na));
+        let mut b = Client::login_as(name, addr, session(&nb));
+        let agreed = a.s.server().unwrap().caps;
+        let b_uid = uid_of(&mut a, &nb);
+
+        let line = format!("{na} for the record");
+        a.s.chat(&line).unwrap();
+        a.flush();
+        b.until(
+            "the public line",
+            |e| matches!(e, Event::Chat { cid: 0, text, .. } if text.contains(&line)),
+        );
+        if agreed & cap::CHAT_HISTORY != 0 {
+            let t = a.s.chat_history(0, 0, 0, 50).unwrap();
+            let got = a.until("the history", |e| {
+                matches!(e, Event::ChatHistory { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+            });
+            let Event::ChatHistory {
+                cid: 0, entries, ..
+            } = got
+            else {
+                panic!("{name}: {got:?}")
+            };
+            assert!(
+                entries.iter().any(|e| e.text.contains(&line)),
+                "{name}: {line:?} not in {entries:?}"
+            );
+            eprintln!("{name}: history of {} lines", entries.len());
+        }
+
+        if agreed & cap::INLINE_MEDIA != 0 {
+            let upload = Request::new(750)
+                .field(tag::CHAT_MEDIA_PAYLOAD, PNG)
+                .field(tag::CHAT_MEDIA_DECLARED_TYPE, &b"image/png"[..])
+                .field(tag::CHAT_MEDIA_PART_FINAL, vec![1]);
+            let t = a.s.request(&upload).unwrap();
+            let Event::Reply { frame, .. } = a.until("the upload", |e| {
+                matches!(e, Event::Reply { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+            }) else {
+                panic!("{name}: the picture was refused")
+            };
+            let field = |want: u16| {
+                hxsession::fields(&frame)
+                    .into_iter()
+                    .find(|(t, _)| *t == want)
+                    .map(|(_, d)| d)
+                    .unwrap_or_else(|| panic!("{name}: no {want:#x} in the upload's reply"))
+            };
+            let (id, mime) = (field(tag::CHAT_MEDIA_ID), field(tag::CHAT_MEDIA_TYPE));
+            let seen = format!("{na} attached");
+            let chat = Request::new(105)
+                .field(tag::BODY, seen.as_bytes())
+                .field(tag::CHAT_MEDIA_ID, id.clone())
+                .field(tag::CHAT_MEDIA_TYPE, mime.clone());
+            a.s.request(&chat).unwrap();
+            a.flush();
+            let Event::Chat { media, .. } = b.until(
+                "the line with the picture",
+                |e| matches!(e, Event::Chat { text, .. } if text.contains(&seen)),
+            ) else {
+                unreachable!()
+            };
+            let media = media.unwrap_or_else(|| panic!("{name}: the line came without it"));
+            assert_eq!((media.id, media.mime), (id, mime), "{name}");
+            eprintln!("{name}: a picture on a chat line");
+        }
+
+        let t = a.s.chat_create(b_uid).unwrap();
+        let got = a.until("the new chat", |e| {
+            matches!(e, Event::Reply { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+        });
+        let Event::Reply { frame, .. } = got else {
+            eprintln!("{name}: private chat: {}", summary(&got));
+            continue;
+        };
+        let cid = hxsession::fields(&frame)
+            .into_iter()
+            .find(|(t, _)| *t == tag::CHAT_ID)
+            .map(|(_, d)| d.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)))
+            .unwrap_or_else(|| panic!("{name}: the new chat has no id"));
+        let invited = |b: &mut Client| {
+            b.until(
+                "the invitation",
+                |e| matches!(e, Event::ChatInvite { cid: c, name, .. } if *c == cid && *name == na),
+            )
+        };
+        invited(&mut b);
+        b.s.chat_decline(cid).unwrap();
+        b.flush();
+        a.s.chat_invite(cid, b_uid).unwrap();
+        a.flush();
+        invited(&mut b);
+        let t = b.s.chat_join(cid).unwrap();
+        b.until(
+            "the join",
+            |e| matches!(e, Event::Reply { trans, .. } if *trans == t),
+        );
+
+        let subject = format!("{na}'s plans, café");
+        a.s.chat_subject(cid, &subject).unwrap();
+        a.flush();
+        b.until(
+            "the subject",
+            |e| matches!(e, Event::ChatSubject { cid: c, subject: s } if *c == cid && *s == subject),
+        );
+        let inside = format!("{na} in private");
+        a.s.chat_in(cid, &inside, 0).unwrap();
+        a.flush();
+        b.until(
+            "the private line",
+            |e| matches!(e, Event::Chat { cid: c, text, .. } if *c == cid && text.contains(&inside)),
+        );
+        b.s.chat_part(cid).unwrap();
+        b.flush();
+        a.until(
+            "b leaving the chat",
+            |e| matches!(e, Event::UserLeft { cid: c, .. } if *c == cid),
+        );
+        eprintln!("{name}: invitation, decline, invitation, join, subject, line, part");
     }
 }
 

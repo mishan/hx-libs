@@ -137,6 +137,54 @@ pub fn chat(body: &[u8], cid: u32, style: u16) -> Option<Request> {
     Request::from_built(ClientHdr::Chat, &chunks, hc)
 }
 
+/// CHAT_CREATE (112): a private chat with `uid`.
+pub fn chat_create(uid: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY];
+    let mut scratch = [0u8; 2];
+    let hc = build::build_chat_create_chunks(uid, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::ChatCreate, &chunks, hc)
+}
+
+/// CHAT_INVITE (113): `uid` into chat `cid`.
+pub fn chat_invite(cid: u32, uid: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY];
+    let mut scratch = [0u8; 6];
+    let hc = build::build_chat_invite_chunks(cid, uid, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::ChatInvite, &chunks, hc)
+}
+
+/// CHAT_JOIN (115), CHAT_PART (116) or CHAT_DECLINE (114), which carry
+/// only the chat.
+pub fn chat_id_only(opcode: ClientHdr, cid: u32) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY];
+    let mut scratch = [0u8; 4];
+    let hc = build::build_chat_join_chunks(cid, &mut chunks, &mut scratch);
+    Request::from_built(opcode, &chunks, hc)
+}
+
+/// CHAT_SUBJECT (120).
+pub fn chat_subject(cid: u32, subject: &[u8]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY];
+    let mut scratch = [0u8; 4];
+    let req = build::ChatSubjectRequest { cid, subject };
+    let hc = build::build_chat_subject_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::ChatSubject, &chunks, hc)
+}
+
+/// GET_CHAT_HISTORY (700); a cursor or limit of 0 is left out.
+pub fn chat_history(cid: u32, before: u64, after: u64, limit: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY; 4];
+    let mut scratch = [0u8; 22];
+    let req = build::GetChatHistoryRequest {
+        channel_id: cid,
+        before,
+        after,
+        limit,
+    };
+    let hc = build::build_get_chat_history_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::GetChatHistory, &chunks, hc)
+}
+
 /// MSG (108): a private message.
 pub fn msg(uid: u16, body: &[u8]) -> Option<Request> {
     let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY];

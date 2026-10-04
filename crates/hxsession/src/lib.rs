@@ -37,8 +37,9 @@
 //!
 //! A client with receive handlers of its own sets [`Config::raw`]: the
 //! session then keeps the handshake, the login, the agreement, the
-//! transaction ids and the keep-alive, and hands everything else over
-//! whole. That is how a client moves onto the session a piece at a time.
+//! transaction ids and the keep-alive, and the domains named in
+//! [`Config::handled`], and hands everything else over whole. That is how
+//! a client moves onto the session a piece at a time.
 //!
 //! With the `hope` feature, `Session::with_hope` logs in with HOPE, the
 //! secure login, and runs the rest of the connection through the cipher
@@ -48,9 +49,10 @@
 //! the ciphers and compressors.
 //!
 //! What is not here yet: file transfers (a folder's listing is here; its
-//! contents are not), and the extensions (voice, video, inline media, chat
-//! history, GIF icons). [`Session::request`] sends any transaction and hands its reply
-//! back whole, for what has no method of its own.
+//! contents are not), and the extensions other than chat history and the
+//! media a chat line carries (voice, video, uploading and fetching media,
+//! GIF icons). [`Session::request`] sends any transaction and hands its
+//! reply back whole, for what has no method of its own.
 
 pub mod frame;
 mod hope;
@@ -59,6 +61,7 @@ pub mod request;
 use std::collections::{HashMap, VecDeque};
 
 use hxproto::dispatch::{route, HandlerKind};
+use hxproto::inline_media;
 use hxproto::messages::{tag, ClientHdr};
 use hxproto::parse;
 
@@ -90,6 +93,7 @@ const LOGIN_TRANS: u32 = 1;
 const MAX_BODY: usize = 8192;
 const MAX_NAME: usize = 128;
 const MAX_NICK: usize = 31;
+const MAX_SUBJECT: usize = 255;
 const MAX_NEWS: usize = 65535;
 /// The field a folder listing carries one of per entry.
 const FILE_LIST_ENTRY: u16 = 0x00c8;
@@ -115,10 +119,11 @@ pub struct Config {
     /// Sent as the login's version; [`CLIENT_VERSION`] unless a test needs
     /// to look like something older.
     pub version: u16,
-    /// Capabilities to offer. The session itself understands only
-    /// [`cap::TEXT_ENCODING`]; offering others means the caller handles
-    /// what they bring, through [`Session::request`] and
-    /// [`Event::Unhandled`].
+    /// Capabilities to offer. The session itself understands
+    /// [`cap::TEXT_ENCODING`], the media a chat line carries under
+    /// [`cap::INLINE_MEDIA`], and [`cap::CHAT_HISTORY`]; offering others
+    /// means the caller handles what they bring, through
+    /// [`Session::request`] and [`Event::Unhandled`].
     pub caps: u16,
     /// Give up if the login has not been answered by then. `u64::MAX`
     /// never does.
@@ -130,15 +135,37 @@ pub struct Config {
     /// Ping a 1.5+ server after this long without sending anything.
     /// `u64::MAX` never does.
     pub keepalive_ms: u64,
-    /// The caller has receive handlers of its own: every transaction
-    /// reaches it whole, every reply as [`Event::Reply`] and everything
-    /// else as [`Event::Unhandled`]. The one exception is the reply to the
-    /// session's own keep-alive, refusals included: the caller never sent
-    /// it, so it is no news. The session still drives the login,
-    /// the agreement and the keep-alive, and numbers every transaction;
-    /// the user list and every request are the caller's, numbered by
-    /// [`Session::take_trans`] and sent through [`Session::send_raw`].
+    /// The caller has receive handlers of its own. Every transaction
+    /// reaches it whole: replies as [`Event::Reply`], everything else as
+    /// [`Event::Unhandled`]. The exceptions are the domains
+    /// [`Config::handled`] names, the replies the caller
+    /// [`Session::expect`]s, and the reply to the session's own
+    /// keep-alive, refusals included, which the caller never sent and so
+    /// is no news. The session still drives the login, the agreement and
+    /// the keep-alive, and numbers every transaction; the user list and
+    /// every request are the caller's, numbered by [`Session::take_trans`]
+    /// and sent through [`Session::send_raw`].
     pub raw: bool,
+    /// In raw mode, the domains the session handles as it does when not
+    /// raw, so that what they bring arrives as events rather than whole.
+    /// None, unless the caller asks. A session that is not raw handles
+    /// every domain it knows, whatever this says.
+    pub handled: Handled,
+}
+
+/// Domains of what a server sends unasked, for [`Config::handled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Handled(u32);
+
+impl Handled {
+    pub const NONE: Handled = Handled(0);
+    /// Chat lines, invitations to private chat, and chat subjects.
+    pub const CHAT: Handled = Handled(1);
+    pub const ALL: Handled = Handled(u32::MAX);
+
+    pub fn contains(self, other: Handled) -> bool {
+        self.0 & other.0 == other.0
+    }
 }
 
 impl Config {
@@ -154,6 +181,7 @@ impl Config {
             agreement_wait_ms: 2_000,
             keepalive_ms: 60_000,
             raw: false,
+            handled: Handled::NONE,
         }
     }
 
@@ -238,6 +266,62 @@ pub struct Article {
     pub seconds: u32,
 }
 
+/// The picture a chat line carries, under [`cap::INLINE_MEDIA`]: the
+/// handle to fetch it by and what the server says of it. The sizes are
+/// hints for a placeholder, not to be trusted over the picture itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMedia {
+    pub id: Vec<u8>,
+    /// The MIME type, as the server sent it.
+    pub mime: Vec<u8>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bytes: Option<u32>,
+}
+
+/// One line of a chat's history, under [`cap::CHAT_HISTORY`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub message_id: u64,
+    /// Seconds since 1970, UTC.
+    pub timestamp: i64,
+    /// 1 an emote, 2 from the server, 4 deleted.
+    pub flags: u16,
+    pub icon: u16,
+    pub nick: String,
+    pub text: String,
+}
+
+impl HistoryEntry {
+    /// One entry as a history reply packs it; `None` when it does not hold
+    /// together. Its line breaks and control bytes are read as a live chat
+    /// line's are.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        let e = parse::parse_history_entry(data)?;
+        let mut text = e.message.to_vec();
+        hxproto::sanitize::cr2lf(&mut text);
+        hxproto::sanitize::strip_ansi(&mut text);
+        Some(HistoryEntry {
+            message_id: e.message_id,
+            timestamp: e.timestamp,
+            flags: e.flags,
+            icon: e.icon_id,
+            nick: text_in(e.nick),
+            text: text_in(&text),
+        })
+    }
+}
+
+/// What the reply to a raw caller's request is to become:
+/// [`Session::expect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// A request for chat `cid`'s history: an [`Event::ChatHistory`].
+    ChatHistory { cid: u32 },
+    /// An invitation to private chat: nothing, once it worked.
+    ChatInvite,
+}
+
 /// Why the session ended. The caller closes the socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Closed {
@@ -267,10 +351,31 @@ pub enum Event {
     /// The session is logged in and has sent what a server expects after
     /// the login; requests may follow.
     Ready,
+    /// A chat line. One that came with half of its media is dropped, as
+    /// the extension says.
     Chat {
         cid: u32,
         uid: u16,
         text: String,
+        media: Option<ChatMedia>,
+    },
+    /// An invitation to private chat `cid`, from `uid`.
+    ChatInvite {
+        cid: u32,
+        uid: u16,
+        name: String,
+    },
+    ChatSubject {
+        cid: u32,
+        subject: String,
+    },
+    /// The reply to a request for a chat's history; `has_more` when there
+    /// is more before what it holds.
+    ChatHistory {
+        trans: u32,
+        cid: u32,
+        entries: Vec<HistoryEntry>,
+        has_more: bool,
     },
     /// A private message.
     Message {
@@ -339,11 +444,16 @@ pub enum Event {
         frame: Vec<u8>,
     },
     /// A transaction this session has no use for, whole; [`fields`] reads
-    /// it. In raw mode, everything the server sends unasked.
+    /// it. In raw mode, everything the server sends unasked that
+    /// [`Config::handled`] leaves to the caller.
     Unhandled {
         opcode: u32,
         frame: Vec<u8>,
     },
+    /// With [`Session::set_tap`], each transaction as it arrived, before
+    /// the session acts on it, in plaintext whatever the transport: for a
+    /// protocol trace.
+    Received(Vec<u8>),
     Closed(Closed),
 }
 
@@ -359,6 +469,10 @@ pub enum Error {
     /// [`Session::send_raw`] given something that is not one whole
     /// transaction.
     Malformed,
+    /// The server did not agree to the capability the request needs.
+    NotAgreed,
+    /// [`Session::expect`] on a trans already awaiting its reply.
+    InUse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +504,7 @@ enum Pending {
     /// not news.
     Keepalive,
     Raw,
+    Expected(Expect),
 }
 
 pub struct Session {
@@ -434,6 +549,7 @@ pub struct Session {
     negotiated: Option<hope::Negotiated>,
     transport: Option<hope::Transport>,
     before_transport: Vec<u8>,
+    tap: bool,
 }
 
 impl Session {
@@ -469,6 +585,7 @@ impl Session {
             negotiated: None,
             transport: None,
             before_transport: Vec::new(),
+            tap: false,
         }
     }
 
@@ -517,6 +634,12 @@ impl Session {
     #[cfg(feature = "hope")]
     pub fn negotiated(&self) -> Option<&hxhope::Negotiated> {
         self.negotiated.as_ref()
+    }
+
+    /// Whether each transaction is also handed over as it arrives, as
+    /// [`Event::Received`].
+    pub fn set_tap(&mut self, on: bool) {
+        self.tap = on;
     }
 
     pub fn poll_event(&mut self) -> Option<Event> {
@@ -629,15 +752,25 @@ impl Session {
         loop {
             let next = self.reader.next_transaction();
             for trans in self.reader.take_abandoned() {
-                if self.pending.remove(&trans).is_some() {
-                    self.events.push_back(Event::Failed {
+                match self.pending.remove(&trans) {
+                    // The keep-alive's failure is no news, as with a whole
+                    // reply. A raw caller hears of any other reply only as
+                    // the whole frame, which a cut-short one never becomes;
+                    // a failure on a trans it neither sent nor expected (the
+                    // session's own agree, say) is nothing it can act on.
+                    None | Some(Pending::Keepalive) => {}
+                    Some(p) if self.cfg.raw && !matches!(p, Pending::Expected(_)) => {}
+                    Some(_) => self.events.push_back(Event::Failed {
                         trans,
                         reason: Some("the server's reply was cut short".into()),
-                    });
+                    }),
                 }
             }
             match next {
                 Ok(Some(t)) => {
+                    if self.tap {
+                        self.events.push_back(Event::Received(t.buf.clone()));
+                    }
                     self.dispatch(t);
                     if self.state == State::Closed {
                         return;
@@ -768,6 +901,69 @@ impl Session {
         Ok(self.send(&r, None))
     }
 
+    /// Open a private chat with `uid`. Its reply, which names the chat,
+    /// comes back whole, as [`Event::Reply`].
+    pub fn chat_create(&mut self, uid: u16) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::chat_create(uid).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Raw)))
+    }
+
+    /// Invite `uid` into private chat `cid`.
+    pub fn chat_invite(&mut self, cid: u32, uid: u16) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::chat_invite(cid, uid).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Expected(Expect::ChatInvite))))
+    }
+
+    /// Join private chat `cid`. Its reply, which lists who is in it and
+    /// its subject, comes back whole, as [`Event::Reply`].
+    pub fn chat_join(&mut self, cid: u32) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::chat_id_only(ClientHdr::ChatJoin, cid).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Raw)))
+    }
+
+    /// Leave private chat `cid`.
+    pub fn chat_part(&mut self, cid: u32) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::chat_id_only(ClientHdr::ChatPart, cid).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
+    }
+
+    /// Turn down an invitation to private chat `cid`.
+    pub fn chat_decline(&mut self, cid: u32) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::chat_id_only(ClientHdr::ChatDecline, cid).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
+    }
+
+    pub fn chat_subject(&mut self, cid: u32, subject: &str) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let subject = text_out(subject, self.utf8);
+        let r = request::chat_subject(cid, &subject).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
+    }
+
+    /// Up to `limit` lines of chat `cid`'s history, older than
+    /// `before` or newer than `after`; 0 leaves each to the server. Only
+    /// where the server agreed to [`cap::CHAT_HISTORY`]: an older one may
+    /// refuse an opcode it does not know, or hang up on it.
+    pub fn chat_history(
+        &mut self,
+        cid: u32,
+        before: u64,
+        after: u64,
+        limit: u16,
+    ) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        if !self.agreed(cap::CHAT_HISTORY) {
+            return Err(Error::NotAgreed);
+        }
+        let r = request::chat_history(cid, before, after, limit).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Expected(Expect::ChatHistory { cid }))))
+    }
+
     /// 1.2 flat news, all of it.
     pub fn news_file(&mut self) -> Result<u32, Error> {
         self.ensure_ready()?;
@@ -871,6 +1067,22 @@ impl Session {
         Ok(())
     }
 
+    /// The reply to the raw transaction on `trans` becomes what `what`
+    /// says, or [`Event::Failed`]: never [`Event::Reply`]. Before the
+    /// transaction goes, so that its reply cannot come first.
+    /// Raw mode only, and on a trans of the caller's own: one the session
+    /// awaits a reply on is not the caller's to take over.
+    pub fn expect(&mut self, trans: u32, what: Expect) -> Result<(), Error> {
+        if !self.cfg.raw {
+            return Err(Error::NotReady);
+        }
+        if self.pending.contains_key(&trans) {
+            return Err(Error::InUse);
+        }
+        self.remember(trans, Pending::Expected(what));
+        Ok(())
+    }
+
     /// Any transaction. Its reply comes back as [`Event::Reply`], or
     /// [`Event::Failed`].
     pub fn request(&mut self, req: &Request) -> Result<u32, Error> {
@@ -908,7 +1120,7 @@ impl Session {
             self.early.push(t);
             return;
         }
-        if self.cfg.raw && kind != HandlerKind::Task {
+        if self.cfg.raw && kind != HandlerKind::Task && !self.handles(kind) {
             // Handed over before it is acted on: it came before what
             // answering it sets off.
             self.events.push_back(Event::Unhandled {
@@ -924,12 +1136,45 @@ impl Session {
         match kind {
             HandlerKind::Task => self.reply(t),
             HandlerKind::Chat => {
+                let media = if self.agreed(cap::INLINE_MEDIA) {
+                    let fields = hxproto::wire::ChunkIter::over_message(&t.buf, len);
+                    match inline_media::extract_chat_media_meta(fields) {
+                        Ok(m) => m.map(|m| ChatMedia {
+                            id: m.id.to_vec(),
+                            mime: m.type_.to_vec(),
+                            width: m.width,
+                            height: m.height,
+                            bytes: m.bytes,
+                        }),
+                        Err(inline_media::MediaMetaError::OnlyOnePresent) => return,
+                    }
+                } else {
+                    None
+                };
                 let c = parse::parse_chat(&t.buf, len, MAX_BODY);
                 let text = self.decode(c.text());
                 self.events.push_back(Event::Chat {
                     cid: c.cid,
                     uid: c.uid,
                     text,
+                    media,
+                });
+            }
+            HandlerKind::ChatInvite => {
+                let i = parse::parse_chat_invite(&t.buf, len, MAX_NICK);
+                let name = self.decode(&i.name);
+                self.events.push_back(Event::ChatInvite {
+                    cid: i.cid,
+                    uid: i.uid,
+                    name,
+                });
+            }
+            HandlerKind::ChatSubject => {
+                let s = parse::parse_chat_subject(&t.buf, len, MAX_SUBJECT);
+                let subject = self.decode(&s.subject);
+                self.events.push_back(Event::ChatSubject {
+                    cid: s.cid,
+                    subject,
                 });
             }
             HandlerKind::Msg => {
@@ -1032,7 +1277,7 @@ impl Session {
             return;
         }
         let pending = self.pending.remove(&t.trans);
-        if self.cfg.raw {
+        if self.cfg.raw && !matches!(pending, Some(Pending::Expected(_))) {
             // The session's own too, so the caller sees their refusals;
             // all but the keep-alive's, which are no news to anyone.
             if pending != Some(Pending::Keepalive) {
@@ -1184,8 +1429,34 @@ impl Session {
                 trans: t.trans,
                 frame: t.buf,
             }),
+            Some(Pending::Expected(Expect::ChatHistory { cid })) => {
+                let mut entries = Vec::new();
+                let mut has_more = false;
+                for c in hxproto::wire::ChunkIter::over_message(&t.buf, len) {
+                    match c.tag {
+                        // A malformed entry is skipped; its neighbors
+                        // still read.
+                        tag::HISTORY_ENTRY => entries.extend(HistoryEntry::parse(c.data)),
+                        tag::HISTORY_HAS_MORE => {
+                            if let Some(&b) = c.data.first() {
+                                has_more = b != 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.events.push_back(Event::ChatHistory {
+                    trans: t.trans,
+                    cid,
+                    entries,
+                    has_more,
+                });
+            }
             // Answered, and nothing in the answer to read.
-            Some(Pending::Quiet) | Some(Pending::Keepalive) | None => {}
+            Some(Pending::Quiet)
+            | Some(Pending::Keepalive)
+            | Some(Pending::Expected(Expect::ChatInvite))
+            | None => {}
         }
     }
 
@@ -1322,6 +1593,19 @@ impl Session {
         self.server.as_ref().map_or(0, |s| s.version)
     }
 
+    fn agreed(&self, bit: u16) -> bool {
+        self.server.as_ref().is_some_and(|s| s.caps & bit != 0)
+    }
+
+    /// Whether a raw session acts on `kind` itself.
+    fn handles(&self, kind: HandlerKind) -> bool {
+        let domain = match kind {
+            HandlerKind::Chat | HandlerKind::ChatInvite | HandlerKind::ChatSubject => Handled::CHAT,
+            _ => return false,
+        };
+        self.cfg.handled.contains(domain)
+    }
+
     /// Whether this server is kept alive: a 1.5+ server (mhxd's gate is
     /// 150), as GtkHx does. Older servers are sent nothing unasked.
     fn pings(&self) -> bool {
@@ -1366,15 +1650,19 @@ impl Session {
     fn send(&mut self, req: &Request, pending: Option<Pending>) -> u32 {
         let trans = self.take_trans();
         if let Some(p) = pending {
-            if self.pending.len() as u32 >= MAX_PENDING {
-                let newest = trans;
-                self.pending
-                    .retain(|t, _| newest.wrapping_sub(*t) < MAX_PENDING / 2);
-            }
-            self.pending.insert(trans, p);
+            self.remember(trans, p);
         }
         self.send_frame(req, trans);
         trans
+    }
+
+    fn remember(&mut self, trans: u32, p: Pending) {
+        if self.pending.len() as u32 >= MAX_PENDING {
+            let newest = trans;
+            self.pending
+                .retain(|t, _| newest.wrapping_sub(*t) < MAX_PENDING / 2);
+        }
+        self.pending.insert(trans, p);
     }
 
     fn send_frame(&mut self, req: &Request, trans: u32) {
