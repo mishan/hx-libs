@@ -220,6 +220,55 @@ fn log_in_chat_and_message_on_every_server() {
 }
 
 #[test]
+fn a_broadcast_reaches_everyone_on_every_server() {
+    for (name, addr) in servers() {
+        let (na, nb) = (nick(name, "s"), nick(name, "r"));
+        // The rig's hxd-ng has no account that may broadcast: there, the
+        // refusal is what is checked.
+        let cfg = if name == "hxd-ng" {
+            Config::guest(&na)
+        } else {
+            Config::account(&na, "admin", "")
+        };
+        let mut a = Client::login_as(name, addr, Session::new(cfg, 0));
+        let mut b = Client::login(name, addr, &nb);
+
+        let text = format!("{nb}: rebooting, café");
+        let t =
+            a.s.request(&Request::new(0x163).field(tag::BODY, text.clone().into_bytes()))
+                .unwrap();
+        let deadline = Instant::now() + WAIT;
+        let outcome = 'wait: loop {
+            for e in b.step() {
+                if let Event::Broadcast {
+                    from, text: got, ..
+                } = e
+                {
+                    if got == text {
+                        break 'wait format!("from {from:?}");
+                    }
+                }
+            }
+            for e in a.step() {
+                if let Event::Failed { trans, reason } = e {
+                    if trans == t {
+                        assert_eq!(name, "hxd-ng", "{name}: refused: {reason:?}");
+                        let reason =
+                            reason.unwrap_or_else(|| panic!("{name}: refused without a reason"));
+                        break 'wait format!("refused: {reason}");
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name}: the broadcast went nowhere"
+            );
+        };
+        eprintln!("{name}: broadcast {outcome}");
+    }
+}
+
+#[test]
 fn news_answers_on_every_server() {
     for (name, addr) in servers() {
         let mut c = Client::login(name, addr, &nick(name, "n"));
