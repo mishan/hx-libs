@@ -229,22 +229,26 @@ fn replies_find_their_requests() {
     );
     assert_eq!(
         events(&mut s),
-        [Event::UserList(vec![
-            User {
-                uid: 5,
-                icon: 1,
-                status: Some(2),
-                name: "bob".into(),
-                color: None
-            },
-            User {
-                uid: 6,
-                icon: 9,
-                status: Some(0),
-                name: "me".into(),
-                color: Some(0x112233)
-            },
-        ])]
+        [Event::UserList {
+            trans: 3,
+            users: vec![
+                User {
+                    uid: 5,
+                    icon: 1,
+                    status: Some(2),
+                    name: "bob".into(),
+                    color: None
+                },
+                User {
+                    uid: 6,
+                    icon: 9,
+                    status: Some(0),
+                    name: "me".into(),
+                    color: Some(0x112233)
+                },
+            ],
+            subject: None,
+        }]
     );
 
     let info = s.user_info(5).unwrap();
@@ -1184,45 +1188,64 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
         &[(tag::CHAT_ID, &[0, 0, 0, 9]), (tag::CHAT_SUBJECT, b"Plans")],
     );
     let user = server(0x12d, 0, 0, &[(tag::UID, &[0, 5]), (tag::NAME, b"bob")]);
+    let part = server(
+        0x76,
+        0,
+        0,
+        &[(tag::UID, &[0, 5]), (tag::CHAT_ID, &[0, 0, 0, 9])],
+    );
     let whole = |opcode: u32, frame: &[u8]| Event::Unhandled {
         opcode,
         frame: frame.to_vec(),
     };
+    let chat_events = [
+        Event::Chat {
+            cid: 0,
+            uid: 5,
+            text: "bob:  hi".into(),
+            media: None,
+        },
+        Event::ChatInvite {
+            cid: 9,
+            uid: 5,
+            name: "bob".into(),
+        },
+        Event::ChatSubject {
+            cid: 9,
+            subject: "Plans".into(),
+        },
+    ];
+    let user_events = [
+        Event::UserChanged {
+            cid: 0,
+            user: User {
+                uid: 5,
+                icon: 0,
+                status: None,
+                name: "bob".into(),
+                color: None,
+            },
+        },
+        Event::UserLeft { cid: 9, uid: 5 },
+    ];
+    let chat_whole = [
+        whole(0x6a, &chat),
+        whole(0x71, &invite),
+        whole(0x77, &subject),
+    ];
+    let users_whole = [whole(0x12d, &user), whole(0x76, &part)];
     let cases = [
+        (Handled::NONE, [&chat_whole[..], &users_whole].concat()),
+        (Handled::CHAT, [&chat_events[..], &users_whole].concat()),
+        (Handled::USERS, [&chat_whole[..], &user_events].concat()),
         (
-            Handled::NONE,
-            vec![
-                whole(0x6a, &chat),
-                whole(0x71, &invite),
-                whole(0x77, &subject),
-                whole(0x12d, &user),
-            ],
-        ),
-        (
-            Handled::CHAT,
-            vec![
-                Event::Chat {
-                    cid: 0,
-                    uid: 5,
-                    text: "bob:  hi".into(),
-                    media: None,
-                },
-                Event::ChatInvite {
-                    cid: 9,
-                    uid: 5,
-                    name: "bob".into(),
-                },
-                Event::ChatSubject {
-                    cid: 9,
-                    subject: "Plans".into(),
-                },
-                whole(0x12d, &user),
-            ],
+            Handled::CHAT | Handled::USERS,
+            [&chat_events[..], &user_events].concat(),
         ),
     ];
     for (handled, want) in cases {
         let mut s = raw_ready(handled, 0);
-        for frame in [&chat, &invite, &subject, &user] {
+        for frame in [&chat, &invite, &subject, &user, &part] {
             s.feed(frame, T0);
         }
         assert_eq!(events(&mut s), want, "{handled:?}");
@@ -1385,6 +1408,198 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
                 frame: reply
             },
         ]
+    );
+}
+
+#[test]
+fn the_user_list_and_a_chat_s_create_and_join_replies_become_events() {
+    let mut s = raw_ready(Handled::USERS, 0);
+    let [list, create, join, bare] = [(); 4].map(|_| s.take_trans());
+    s.expect(list, Expect::UserList).unwrap();
+    s.expect(create, Expect::ChatCreate).unwrap();
+    s.expect(join, Expect::ChatJoin { cid: 9 }).unwrap();
+    s.expect(bare, Expect::ChatJoin { cid: 4 }).unwrap();
+    for (opcode, t) in [(300, list), (112, create), (115, join), (115, bare)] {
+        s.send_raw(&caller(opcode, t)).unwrap();
+    }
+    let ann = &[0, 5, 0, 1, 0, 2, 0, 3, b'a', b'n', b'n'][..];
+    let rene = &[
+        0, 6, 0, 9, 0, 0, 0, 4, b'R', b'e', b'n', 0x8e, 0, 0x11, 0x22, 0x33,
+    ][..];
+    s.feed(
+        &server(
+            TASK,
+            list,
+            0,
+            &[(tag::USER_LIST, ann), (tag::USER_LIST, &ann[..5])],
+        ),
+        T0,
+    );
+    s.feed(
+        &server(
+            TASK,
+            create,
+            0,
+            &[
+                (tag::CHAT_ID, &[0, 0, 0, 9]),
+                (tag::UID, &[0, 6]),
+                (tag::ICON, &[0, 9]),
+                (tag::NAME, b"Ren\x8E"),
+            ],
+        ),
+        T0,
+    );
+    s.feed(
+        &server(
+            TASK,
+            join,
+            0,
+            &[
+                (tag::USER_LIST, ann),
+                (tag::USER_LIST, rene),
+                (tag::CHAT_SUBJECT, b"Caf\x8E"),
+            ],
+        ),
+        T0,
+    );
+    s.feed(&server(TASK, bare, 0, &[]), T0);
+    let user = |uid, icon, status, name: &str, color| User {
+        uid,
+        icon,
+        status,
+        name: name.into(),
+        color,
+    };
+    let (ann, rene) = (
+        user(5, 1, Some(2), "ann", None),
+        user(6, 9, Some(0), "René", Some(0x112233)),
+    );
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::UserList {
+                trans: list,
+                users: vec![ann.clone()],
+                subject: None,
+            },
+            Event::ChatCreated {
+                trans: create,
+                cid: 9,
+                user: user(6, 9, None, "René", None),
+            },
+            Event::ChatJoined {
+                trans: join,
+                cid: 9,
+                users: vec![ann, rene],
+                subject: Some("Café".into()),
+            },
+            Event::ChatJoined {
+                trans: bare,
+                cid: 4,
+                users: vec![],
+                subject: None,
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_name_or_subject_ends_at_its_first_nul_before_it_is_decoded() {
+    // What follows the NUL is not UTF-8; read whole, the name would be
+    // taken for Mac Roman.
+    let name = &b"Ren\xC3\xA9\0\xFF"[..];
+    let mut s = raw_ready(Handled::CHAT | Handled::USERS, 0);
+    let [list, join] = [(); 2].map(|_| s.take_trans());
+    s.expect(list, Expect::UserList).unwrap();
+    s.expect(join, Expect::ChatJoin { cid: 9 }).unwrap();
+    for (opcode, t) in [(300, list), (115, join)] {
+        s.send_raw(&caller(opcode, t)).unwrap();
+    }
+    let record = [&[0, 5, 0, 1, 0, 0, 0, name.len() as u8][..], name].concat();
+    let cid = &[0, 0, 0, 9][..];
+    let pushes = [
+        server(0x71, 0, 0, &[(tag::CHAT_ID, cid), (tag::NAME, name)]),
+        server(
+            0x77,
+            0,
+            0,
+            &[(tag::CHAT_ID, cid), (tag::CHAT_SUBJECT, name)],
+        ),
+        server(0x12d, 0, 0, &[(tag::UID, &[0, 5]), (tag::NAME, name)]),
+        server(
+            TASK,
+            list,
+            0,
+            &[(tag::USER_LIST, &record), (tag::CHAT_SUBJECT, name)],
+        ),
+        server(TASK, join, 0, &[(tag::CHAT_SUBJECT, name)]),
+    ];
+    for p in &pushes {
+        s.feed(p, T0);
+    }
+    let rene = User {
+        uid: 5,
+        icon: 1,
+        status: Some(0),
+        name: "René".into(),
+        color: None,
+    };
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::ChatInvite {
+                cid: 9,
+                uid: 0,
+                name: "René".into()
+            },
+            Event::ChatSubject {
+                cid: 9,
+                subject: "René".into()
+            },
+            Event::UserChanged {
+                cid: 0,
+                user: User {
+                    icon: 0,
+                    status: None,
+                    ..rene.clone()
+                }
+            },
+            Event::UserList {
+                trans: list,
+                users: vec![rene],
+                subject: Some("René".into()),
+            },
+            Event::ChatJoined {
+                trans: join,
+                cid: 9,
+                users: vec![],
+                subject: Some("René".into()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_joined_chat_s_subject_is_cut_to_255_bytes_before_it_is_decoded() {
+    let mut s = raw_ready(Handled::USERS, 0);
+    let join = s.take_trans();
+    s.expect(join, Expect::ChatJoin { cid: 9 }).unwrap();
+    s.send_raw(&caller(115, join)).unwrap();
+    // The cut falls inside the é, which leaves a byte that is not UTF-8:
+    // the subject reads as Mac Roman, where 0xC3 is √.
+    let subject = ["a".repeat(254), "é".into()].concat();
+    s.feed(
+        &server(TASK, join, 0, &[(tag::CHAT_SUBJECT, subject.as_bytes())]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [Event::ChatJoined {
+            trans: join,
+            cid: 9,
+            users: vec![],
+            subject: Some(["a".repeat(254), "√".into()].concat()),
+        }]
     );
 }
 

@@ -141,7 +141,8 @@ fn uid_of(c: &mut Client, nick: &str) -> u16 {
     let deadline = Instant::now() + WAIT;
     loop {
         c.s.user_list().unwrap();
-        let Event::UserList(users) = c.until("the user list", |e| matches!(e, Event::UserList(_)))
+        let Event::UserList { users, .. } =
+            c.until("the user list", |e| matches!(e, Event::UserList { .. }))
         else {
             unreachable!()
         };
@@ -167,9 +168,9 @@ fn log_in_chat_and_message_on_every_server() {
 
         // Each appears in the list the other asks for.
         b.s.user_list().unwrap();
-        let Event::UserList(users) = b.until(
+        let Event::UserList { users, .. } = b.until(
             "the user list",
-            |e| matches!(e, Event::UserList(u) if u.iter().any(|u| u.name == na)),
+            |e| matches!(e, Event::UserList { users, .. } if users.iter().any(|u| u.name == na)),
         ) else {
             unreachable!()
         };
@@ -442,17 +443,14 @@ fn chat_invitations_subjects_history_and_media_on_every_server() {
 
         let t = a.s.chat_create(b_uid).unwrap();
         let got = a.until("the new chat", |e| {
-            matches!(e, Event::Reply { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+            matches!(e, Event::ChatCreated { trans, .. } | Event::Failed { trans, .. } if *trans == t)
         });
-        let Event::Reply { frame, .. } = got else {
+        let Event::ChatCreated { cid, user, .. } = got else {
             eprintln!("{name}: private chat: {}", summary(&got));
             continue;
         };
-        let cid = hxsession::fields(&frame)
-            .into_iter()
-            .find(|(t, _)| *t == tag::CHAT_ID)
-            .map(|(_, d)| d.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)))
-            .unwrap_or_else(|| panic!("{name}: the new chat has no id"));
+        assert_ne!(cid, 0, "{name}: the new chat has no id");
+        assert_eq!(user.name, na, "{name}");
         let invited = |b: &mut Client| {
             b.until(
                 "the invitation",
@@ -466,9 +464,19 @@ fn chat_invitations_subjects_history_and_media_on_every_server() {
         a.flush();
         invited(&mut b);
         let t = b.s.chat_join(cid).unwrap();
-        b.until(
+        let Event::ChatJoined {
+            cid: joined, users, ..
+        } = b.until(
             "the join",
-            |e| matches!(e, Event::Reply { trans, .. } if *trans == t),
+            |e| matches!(e, Event::ChatJoined { trans, .. } if *trans == t),
+        )
+        else {
+            unreachable!()
+        };
+        assert_eq!(joined, cid, "{name}");
+        assert!(
+            users.iter().any(|u| u.name == na),
+            "{name}: {na} not in {users:?}"
         );
 
         let subject = format!("{na}'s plans, café");
@@ -568,8 +576,8 @@ fn hope_logs_in_and_chats_on_every_server_that_has_it() {
         let deadline = Instant::now() + WAIT;
         'listed: loop {
             h.s.user_list().unwrap();
-            let Event::UserList(users) =
-                h.until("the user list", |e| matches!(e, Event::UserList(_)))
+            let Event::UserList { users, .. } =
+                h.until("the user list", |e| matches!(e, Event::UserList { .. }))
             else {
                 unreachable!()
             };

@@ -161,10 +161,21 @@ impl Handled {
     pub const NONE: Handled = Handled(0);
     /// Chat lines, invitations to private chat, and chat subjects.
     pub const CHAT: Handled = Handled(1);
+    /// Users arriving, changing and leaving, on the server and in each
+    /// private chat.
+    pub const USERS: Handled = Handled(2);
     pub const ALL: Handled = Handled(u32::MAX);
 
     pub fn contains(self, other: Handled) -> bool {
         self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for Handled {
+    type Output = Handled;
+
+    fn bitor(self, other: Handled) -> Handled {
+        Handled(self.0 | other.0)
     }
 }
 
@@ -320,6 +331,12 @@ pub enum Expect {
     ChatHistory { cid: u32 },
     /// An invitation to private chat: nothing, once it worked.
     ChatInvite,
+    /// A request for the user list: an [`Event::UserList`].
+    UserList,
+    /// A new private chat: an [`Event::ChatCreated`].
+    ChatCreate,
+    /// Joining private chat `cid`: an [`Event::ChatJoined`].
+    ChatJoin { cid: u32 },
 }
 
 /// Why the session ended. The caller closes the socket.
@@ -387,8 +404,27 @@ pub enum Event {
     Broadcast(String),
     /// The server's parting words before it disconnects us.
     Disconnecting(String),
-    /// The reply to [`Session::user_list`], or the one sent after login.
-    UserList(Vec<User>),
+    /// The reply to [`Session::user_list`], or the one sent after login;
+    /// the public chat's subject, when the server sent one.
+    UserList {
+        trans: u32,
+        users: Vec<User>,
+        subject: Option<String>,
+    },
+    /// The reply to [`Session::chat_create`]: the new chat, and us in it.
+    ChatCreated {
+        trans: u32,
+        cid: u32,
+        user: User,
+    },
+    /// The reply to [`Session::chat_join`]: who is in the chat, and its
+    /// subject when the server sent one.
+    ChatJoined {
+        trans: u32,
+        cid: u32,
+        users: Vec<User>,
+        subject: Option<String>,
+    },
     UserChanged {
         cid: u32,
         user: User,
@@ -490,7 +526,6 @@ enum State {
 /// What a sent request's reply should become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
-    UserList,
     UserInfo,
     NewsFile,
     NewsListing,
@@ -880,7 +915,7 @@ impl Session {
         self.ensure_ready()?;
         Ok(self.send(
             &Request::new(ClientHdr::UserGetList as u32),
-            Some(Pending::UserList),
+            Some(Pending::Expected(Expect::UserList)),
         ))
     }
 
@@ -901,12 +936,11 @@ impl Session {
         Ok(self.send(&r, None))
     }
 
-    /// Open a private chat with `uid`. Its reply, which names the chat,
-    /// comes back whole, as [`Event::Reply`].
+    /// Open a private chat with `uid`.
     pub fn chat_create(&mut self, uid: u16) -> Result<u32, Error> {
         self.ensure_ready()?;
         let r = request::chat_create(uid).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::Raw)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::ChatCreate))))
     }
 
     /// Invite `uid` into private chat `cid`.
@@ -916,12 +950,11 @@ impl Session {
         Ok(self.send(&r, Some(Pending::Expected(Expect::ChatInvite))))
     }
 
-    /// Join private chat `cid`. Its reply, which lists who is in it and
-    /// its subject, comes back whole, as [`Event::Reply`].
+    /// Join private chat `cid`.
     pub fn chat_join(&mut self, cid: u32) -> Result<u32, Error> {
         self.ensure_ready()?;
         let r = request::chat_id_only(ClientHdr::ChatJoin, cid).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::Raw)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::ChatJoin { cid }))))
     }
 
     /// Leave private chat `cid`.
@@ -1162,7 +1195,7 @@ impl Session {
             }
             HandlerKind::ChatInvite => {
                 let i = parse::parse_chat_invite(&t.buf, len, MAX_NICK);
-                let name = self.decode(&i.name);
+                let name = field_text(&i.name);
                 self.events.push_back(Event::ChatInvite {
                     cid: i.cid,
                     uid: i.uid,
@@ -1171,7 +1204,7 @@ impl Session {
             }
             HandlerKind::ChatSubject => {
                 let s = parse::parse_chat_subject(&t.buf, len, MAX_SUBJECT);
-                let subject = self.decode(&s.subject);
+                let subject = field_text(&s.subject);
                 self.events.push_back(Event::ChatSubject {
                     cid: s.cid,
                     subject,
@@ -1200,15 +1233,10 @@ impl Session {
             }
             HandlerKind::UserChange => {
                 let c = parse::parse_user_change(&t.buf, len, MAX_NICK);
-                let user = User {
-                    uid: c.uid,
-                    icon: c.icon,
-                    status: c.got_color.then_some(c.color),
-                    name: self.decode(&c.name),
-                    color: c.got_nick_color.then_some(c.nick_color),
-                };
-                self.events
-                    .push_back(Event::UserChanged { cid: c.cid, user });
+                self.events.push_back(Event::UserChanged {
+                    cid: c.cid,
+                    user: changed_user(&c),
+                });
             }
             HandlerKind::UserPart => {
                 let p = parse::parse_user_part(&t.buf, len);
@@ -1302,23 +1330,28 @@ impl Session {
             return;
         }
         match pending {
-            Some(Pending::UserList) => {
-                let mut users = Vec::new();
-                for c in hxproto::wire::ChunkIter::over_message(&t.buf, len) {
-                    if c.tag != tag::USER_LIST {
-                        continue;
-                    }
-                    if let Some(r) = parse::parse_user_list_record(c.data, MAX_NICK) {
-                        users.push(User {
-                            uid: r.uid,
-                            icon: r.icon,
-                            status: Some(r.color),
-                            name: self.decode(&r.name),
-                            color: r.nick_color,
-                        });
-                    }
-                }
-                self.events.push_back(Event::UserList(users));
+            Some(Pending::Expected(Expect::UserList)) => {
+                self.events.push_back(Event::UserList {
+                    trans: t.trans,
+                    users: listed_users(&t.buf),
+                    subject: listed_subject(&t.buf),
+                });
+            }
+            Some(Pending::Expected(Expect::ChatCreate)) => {
+                let c = parse::parse_user_change(&t.buf, len, MAX_NICK);
+                self.events.push_back(Event::ChatCreated {
+                    trans: t.trans,
+                    cid: c.cid,
+                    user: changed_user(&c),
+                });
+            }
+            Some(Pending::Expected(Expect::ChatJoin { cid })) => {
+                self.events.push_back(Event::ChatJoined {
+                    trans: t.trans,
+                    cid,
+                    users: listed_users(&t.buf),
+                    subject: listed_subject(&t.buf),
+                });
             }
             Some(Pending::UserInfo) => {
                 let i = parse::parse_user_info(&t.buf, len, MAX_NICK, 4096);
@@ -1581,7 +1614,7 @@ impl Session {
         }
         let trans = self.send(
             &Request::new(ClientHdr::UserGetList as u32),
-            Some(Pending::UserList),
+            Some(Pending::Expected(Expect::UserList)),
         );
         self.roster_trans = Some(trans);
         self.events.push_back(Event::Ready);
@@ -1601,6 +1634,7 @@ impl Session {
     fn handles(&self, kind: HandlerKind) -> bool {
         let domain = match kind {
             HandlerKind::Chat | HandlerKind::ChatInvite | HandlerKind::ChatSubject => Handled::CHAT,
+            HandlerKind::UserChange | HandlerKind::UserPart => Handled::USERS,
             _ => return false,
         };
         self.cfg.handled.contains(domain)
@@ -1704,6 +1738,48 @@ fn text_out(text: &str, utf8: bool) -> Vec<u8> {
     } else {
         hxproto::text::from_utf8(text)
     }
+}
+
+/// A user as a user change, or a new chat's reply, describes them.
+fn changed_user(c: &parse::UserChange) -> User {
+    User {
+        uid: c.uid,
+        icon: c.icon,
+        status: c.got_color.then_some(c.color),
+        name: field_text(&c.name),
+        color: c.got_nick_color.then_some(c.nick_color),
+    }
+}
+
+/// The users a user list, or a join's reply, lists. A malformed entry is
+/// skipped; its neighbors still list.
+fn listed_users(frame: &[u8]) -> Vec<User> {
+    hxproto::wire::ChunkIter::over_message(frame, frame.len())
+        .filter(|c| c.tag == tag::USER_LIST)
+        .filter_map(|c| parse::parse_user_list_record(c.data, MAX_NICK))
+        .map(|r| User {
+            uid: r.uid,
+            icon: r.icon,
+            status: Some(r.color),
+            name: field_text(&r.name),
+            color: r.nick_color,
+        })
+        .collect()
+}
+
+/// The subject a user list, or a join's reply, carries: the last one sent,
+/// capped before decoding as a subject change is.
+fn listed_subject(frame: &[u8]) -> Option<String> {
+    hxproto::wire::ChunkIter::over_message(frame, frame.len())
+        .filter(|c| c.tag == tag::CHAT_SUBJECT)
+        .last()
+        .map(|c| field_text(&c.data[..c.data.len().min(MAX_SUBJECT)]))
+}
+
+/// A name or subject: up to its first NUL, as GtkHx has always cut them,
+/// then decoded, so what follows the NUL cannot change how the rest reads.
+fn field_text(bytes: &[u8]) -> String {
+    text_in(bytes.split(|&b| b == 0).next().unwrap_or_default())
 }
 
 fn text_in(bytes: &[u8]) -> String {
