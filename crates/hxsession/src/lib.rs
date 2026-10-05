@@ -164,6 +164,8 @@ impl Handled {
     /// Users arriving, changing and leaving, on the server and in each
     /// private chat.
     pub const USERS: Handled = Handled(2);
+    /// Private messages, broadcasts, and the server's parting words.
+    pub const MSG: Handled = Handled(4);
     pub const ALL: Handled = Handled(u32::MAX);
 
     pub fn contains(self, other: Handled) -> bool {
@@ -337,6 +339,8 @@ pub enum Expect {
     ChatCreate,
     /// Joining private chat `cid`: an [`Event::ChatJoined`].
     ChatJoin { cid: u32 },
+    /// A private message: nothing, once it worked.
+    Message,
 }
 
 /// Why the session ended. The caller closes the socket.
@@ -394,14 +398,22 @@ pub enum Event {
         entries: Vec<HistoryEntry>,
         has_more: bool,
     },
-    /// A private message.
+    /// A private message, and the picture it carries where the server
+    /// agreed to inline media. One that came with half of its media is
+    /// dropped, as a chat line is.
     Message {
         uid: u16,
         from: String,
         text: String,
+        media: Option<ChatMedia>,
     },
-    /// A broadcast, or a message from the server itself.
-    Broadcast(String),
+    /// A broadcast, or a message from the server itself; who sent it, when
+    /// the server says.
+    Broadcast {
+        uid: u16,
+        from: String,
+        text: String,
+    },
     /// The server's parting words before it disconnects us.
     Disconnecting(String),
     /// The reply to [`Session::user_list`], or the one sent after login;
@@ -1169,20 +1181,8 @@ impl Session {
         match kind {
             HandlerKind::Task => self.reply(t),
             HandlerKind::Chat => {
-                let media = if self.agreed(cap::INLINE_MEDIA) {
-                    let fields = hxproto::wire::ChunkIter::over_message(&t.buf, len);
-                    match inline_media::extract_chat_media_meta(fields) {
-                        Ok(m) => m.map(|m| ChatMedia {
-                            id: m.id.to_vec(),
-                            mime: m.type_.to_vec(),
-                            width: m.width,
-                            height: m.height,
-                            bytes: m.bytes,
-                        }),
-                        Err(inline_media::MediaMetaError::OnlyOnePresent) => return,
-                    }
-                } else {
-                    None
+                let Ok(media) = self.media(&t.buf) else {
+                    return;
                 };
                 let c = parse::parse_chat(&t.buf, len, MAX_BODY);
                 let text = self.decode(c.text());
@@ -1212,17 +1212,21 @@ impl Session {
             }
             HandlerKind::Msg => {
                 let m = parse::parse_msg(&t.buf, len, MAX_NAME, MAX_BODY);
-                let text = self.decode(&m.msg);
+                let (from, text) = (field_text(&m.name), self.decode(&m.msg));
                 // A broadcast arrives as its own opcode, or as a message
                 // from uid 0 on servers that have no such opcode.
                 if t.type_ == 0x163 || m.uid == 0 {
-                    self.events.push_back(Event::Broadcast(text));
-                } else {
-                    let from = self.decode(&m.name);
+                    self.events.push_back(Event::Broadcast {
+                        uid: m.uid,
+                        from,
+                        text,
+                    });
+                } else if let Ok(media) = self.media(&t.buf) {
                     self.events.push_back(Event::Message {
                         uid: m.uid,
                         from,
                         text,
+                        media,
                     });
                 }
             }
@@ -1355,7 +1359,7 @@ impl Session {
             }
             Some(Pending::UserInfo) => {
                 let i = parse::parse_user_info(&t.buf, len, MAX_NICK, 4096);
-                let (name, info) = (self.decode(&i.name), self.decode(&i.info));
+                let (name, info) = (field_text(&i.name), self.decode(&i.info));
                 self.events.push_back(Event::UserInfo {
                     trans: t.trans,
                     name,
@@ -1489,6 +1493,7 @@ impl Session {
             Some(Pending::Quiet)
             | Some(Pending::Keepalive)
             | Some(Pending::Expected(Expect::ChatInvite))
+            | Some(Pending::Expected(Expect::Message))
             | None => {}
         }
     }
@@ -1630,11 +1635,32 @@ impl Session {
         self.server.as_ref().is_some_and(|s| s.caps & bit != 0)
     }
 
+    /// The picture a chat line or a message carries, where inline media was
+    /// agreed; `Err` when only half of it came, and the whole is dropped,
+    /// as the extension says.
+    fn media(&self, frame: &[u8]) -> Result<Option<ChatMedia>, ()> {
+        if !self.agreed(cap::INLINE_MEDIA) {
+            return Ok(None);
+        }
+        let fields = hxproto::wire::ChunkIter::over_message(frame, frame.len());
+        match inline_media::extract_chat_media_meta(fields) {
+            Ok(m) => Ok(m.map(|m| ChatMedia {
+                id: m.id.to_vec(),
+                mime: m.type_.to_vec(),
+                width: m.width,
+                height: m.height,
+                bytes: m.bytes,
+            })),
+            Err(inline_media::MediaMetaError::OnlyOnePresent) => Err(()),
+        }
+    }
+
     /// Whether a raw session acts on `kind` itself.
     fn handles(&self, kind: HandlerKind) -> bool {
         let domain = match kind {
             HandlerKind::Chat | HandlerKind::ChatInvite | HandlerKind::ChatSubject => Handled::CHAT,
             HandlerKind::UserChange | HandlerKind::UserPart => Handled::USERS,
+            HandlerKind::Msg | HandlerKind::PoliteQuit => Handled::MSG,
             _ => return false,
         };
         self.cfg.handled.contains(domain)

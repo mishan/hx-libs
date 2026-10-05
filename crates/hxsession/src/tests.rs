@@ -352,9 +352,14 @@ fn pushes_become_events() {
             Event::Message {
                 uid: 5,
                 from: "bob".into(),
-                text: "psst".into()
+                text: "psst".into(),
+                media: None
             },
-            Event::Broadcast("Rebooting".into()),
+            Event::Broadcast {
+                uid: 0,
+                from: String::new(),
+                text: "Rebooting".into()
+            },
             Event::UserChanged {
                 cid: 0,
                 user: User {
@@ -1188,6 +1193,17 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
         &[(tag::CHAT_ID, &[0, 0, 0, 9]), (tag::CHAT_SUBJECT, b"Plans")],
     );
     let user = server(0x12d, 0, 0, &[(tag::UID, &[0, 5]), (tag::NAME, b"bob")]);
+    let msg = server(
+        0x68,
+        0,
+        0,
+        &[
+            (tag::UID, &[0, 5]),
+            (tag::NAME, b"bob"),
+            (tag::BODY, b"psst"),
+        ],
+    );
+    let quit = server(0x6f, 0, 0, &[(tag::BODY, b"Bye.")]);
     let part = server(
         0x76,
         0,
@@ -1234,18 +1250,41 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
         whole(0x77, &subject),
     ];
     let users_whole = [whole(0x12d, &user), whole(0x76, &part)];
+    let msg_events = [
+        Event::Message {
+            uid: 5,
+            from: "bob".into(),
+            text: "psst".into(),
+            media: None,
+        },
+        Event::Disconnecting("Bye.".into()),
+    ];
+    let msg_whole = [whole(0x68, &msg), whole(0x6f, &quit)];
     let cases = [
-        (Handled::NONE, [&chat_whole[..], &users_whole].concat()),
-        (Handled::CHAT, [&chat_events[..], &users_whole].concat()),
-        (Handled::USERS, [&chat_whole[..], &user_events].concat()),
         (
-            Handled::CHAT | Handled::USERS,
-            [&chat_events[..], &user_events].concat(),
+            Handled::NONE,
+            [&chat_whole[..], &users_whole, &msg_whole].concat(),
+        ),
+        (
+            Handled::CHAT,
+            [&chat_events[..], &users_whole, &msg_whole].concat(),
+        ),
+        (
+            Handled::USERS,
+            [&chat_whole[..], &user_events, &msg_whole].concat(),
+        ),
+        (
+            Handled::MSG,
+            [&chat_whole[..], &users_whole, &msg_events].concat(),
+        ),
+        (
+            Handled::CHAT | Handled::USERS | Handled::MSG,
+            [&chat_events[..], &user_events, &msg_events].concat(),
         ),
     ];
     for (handled, want) in cases {
         let mut s = raw_ready(handled, 0);
-        for frame in [&chat, &invite, &subject, &user, &part] {
+        for frame in [&chat, &invite, &subject, &user, &part, &msg, &quit] {
             s.feed(frame, T0);
         }
         assert_eq!(events(&mut s), want, "{handled:?}");
@@ -1337,6 +1376,106 @@ fn a_chat_line_carries_its_media_where_it_was_agreed() {
     }
 }
 
+#[test]
+fn a_message_carries_its_media_where_it_was_agreed() {
+    let from: [(u16, &[u8]); 3] = [
+        (tag::UID, &[0, 5]),
+        (tag::NAME, b"bob"),
+        (tag::BODY, b"look"),
+    ];
+    let id: (u16, &[u8]) = (tag::CHAT_MEDIA_ID, b"h1");
+    let mime: (u16, &[u8]) = (tag::CHAT_MEDIA_TYPE, b"image/png");
+    let png = ChatMedia {
+        id: b"h1".to_vec(),
+        mime: b"image/png".to_vec(),
+        width: None,
+        height: None,
+        bytes: None,
+    };
+    let cases = [
+        (
+            "present",
+            cap::INLINE_MEDIA,
+            vec![id, mime],
+            Some(Some(png)),
+        ),
+        ("orphaned id", cap::INLINE_MEDIA, vec![id], None),
+        ("not agreed", 0, vec![id], Some(None)),
+    ];
+    for (what, caps, media_fields, want) in cases {
+        let mut s = raw_ready(Handled::MSG, caps);
+        s.feed(
+            &server(0x68, 0, 0, &[&from[..], &media_fields].concat()),
+            T0,
+        );
+        let got = events(&mut s);
+        match want {
+            Some(media) => assert_eq!(
+                got,
+                [Event::Message {
+                    uid: 5,
+                    from: "bob".into(),
+                    text: "look".into(),
+                    media
+                }],
+                "{what}"
+            ),
+            None => assert!(got.is_empty(), "{what}: dropped whole"),
+        }
+    }
+}
+
+#[test]
+fn a_broadcast_names_its_sender_when_the_server_does() {
+    let mut s = raw_ready(Handled::MSG, 0);
+    let fields: [(u16, &[u8]); 3] = [
+        (tag::UID, &[0, 5]),
+        (tag::NAME, b"admin"),
+        (tag::BODY, b"Rebooting"),
+    ];
+    s.feed(&server(0x163, 0, 0, &fields), T0);
+    s.feed(&server(0x68, 0, 0, &fields[2..]), T0);
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::Broadcast {
+                uid: 5,
+                from: "admin".into(),
+                text: "Rebooting".into()
+            },
+            Event::Broadcast {
+                uid: 0,
+                from: String::new(),
+                text: "Rebooting".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_sender_s_name_and_a_user_s_info_name_end_at_their_first_nul() {
+    // As a nickname does: what follows the NUL is not UTF-8.
+    let name = &b"Ren\xC3\xA9\0\xFF"[..];
+    let mut s = ready();
+    let t = s.user_info(5).unwrap();
+    s.feed(
+        &server(
+            0x68,
+            0,
+            0,
+            &[(tag::UID, &[0, 5]), (tag::NAME, name), (tag::BODY, b"hi")],
+        ),
+        T0,
+    );
+    s.feed(&server(TASK, t, 0, &[(tag::NAME, name)]), T0);
+    let got = events(&mut s);
+    assert!(
+        matches!(&got[..], [Event::Message { from, .. }, Event::UserInfo { name, .. }]
+            if from == "René" && name == "René"),
+        "{got:?}"
+    );
+}
+
 /// A history entry as a server packs it.
 fn history_entry(id: u64, flags: u16, nick: &[u8], text: &[u8]) -> Vec<u8> {
     [
@@ -1355,10 +1494,11 @@ fn history_entry(id: u64, flags: u16, nick: &[u8], text: &[u8]) -> Vec<u8> {
 #[test]
 fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
     let mut s = raw_ready(Handled::CHAT, cap::CHAT_HISTORY);
-    let (history, invite, other) = (s.take_trans(), s.take_trans(), s.take_trans());
+    let [history, invite, message, other] = [(); 4].map(|_| s.take_trans());
     s.expect(history, Expect::ChatHistory { cid: 4 }).unwrap();
     s.expect(invite, Expect::ChatInvite).unwrap();
-    for t in [history, invite, other] {
+    s.expect(message, Expect::Message).unwrap();
+    for t in [history, invite, message, other] {
         s.send_raw(&caller(700, t)).unwrap();
     }
 
@@ -1381,6 +1521,7 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
         T0,
     );
     s.feed(&server(TASK, invite, 0, &[]), T0);
+    s.feed(&server(TASK, message, 0, &[]), T0);
     let reply = server(TASK, other, 0, &[]);
     s.feed(&reply, T0);
     let entry = |message_id, flags, nick: &str, text: &str| HistoryEntry {
