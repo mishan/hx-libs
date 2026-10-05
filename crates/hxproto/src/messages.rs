@@ -50,6 +50,8 @@ pub enum ClientHdr {
     UserGetList = 0x0000_012c,
     UserGetInfo = 0x0000_012f,
     UserChange = 0x0000_0130,
+    AccountCreate = 0x0000_015e,
+    AccountDelete = 0x0000_015f,
     AccountRead = 0x0000_0160,
     AccountModify = 0x0000_0161,
     MsgBroadcast = 0x0000_0163,

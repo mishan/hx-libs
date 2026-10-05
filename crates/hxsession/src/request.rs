@@ -202,6 +202,71 @@ pub fn user_info(uid: u16) -> Option<Request> {
     Request::from_built(ClientHdr::UserGetInfo, &chunks, hc)
 }
 
+/// USER_KICK (110): disconnect `uid`, and ban them too when `ban`.
+pub fn kick(uid: u16, ban: bool) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let mut scratch = [0u8; 4];
+    let req = build::UserKickRequest {
+        uid,
+        ban: u16::from(ban),
+    };
+    let hc = build::build_user_kick_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::UserKick, &chunks, hc)
+}
+
+/// MSG_BROADCAST (355): a message to everyone on the server.
+pub fn broadcast(body: &[u8]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_broadcast_chunks(&build::BroadcastRequest { body }, &mut chunks);
+    Request::from_built(ClientHdr::MsgBroadcast, &chunks, hc)
+}
+
+/// ACCOUNT_READ (352). The login goes as it is, where the other account
+/// requests obfuscate it, as GtkHx has always sent them.
+pub fn account_read(login: &[u8]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_account_read_chunks(login, &mut chunks);
+    Request::from_built(ClientHdr::AccountRead, &chunks, hc)
+}
+
+/// ACCOUNT_CREATE (350) or ACCOUNT_MODIFY (353): an account's login,
+/// password, name and access. No password is a single zero byte, not an
+/// empty field.
+pub fn account(
+    opcode: ClientHdr,
+    login: &[u8],
+    password: &[u8],
+    name: &[u8],
+    access: u64,
+) -> Option<Request> {
+    let (login, password) = (
+        obfuscate(login),
+        if password.is_empty() {
+            vec![0]
+        } else {
+            obfuscate(password)
+        },
+    );
+    let mut chunks = [HxChunk::EMPTY; 4];
+    let mut scratch = [0u8; 8];
+    let req = build::AccountModifyRequest {
+        login: &login,
+        password: &password,
+        name,
+        access: access.to_be_bytes(),
+    };
+    let hc = build::build_account_modify_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(opcode, &chunks, hc)
+}
+
+/// ACCOUNT_DELETE (351).
+pub fn account_delete(login: &[u8]) -> Option<Request> {
+    let login = obfuscate(login);
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_account_delete_chunks(&login, &mut chunks);
+    Request::from_built(ClientHdr::AccountDelete, &chunks, hc)
+}
+
 /// NEWS_POST (103): add to 1.2 flat news.
 pub fn news_post(body: &[u8]) -> Option<Request> {
     let mut chunks = [HxChunk::EMPTY];

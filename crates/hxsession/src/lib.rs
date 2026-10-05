@@ -164,7 +164,7 @@ impl Handled {
     /// Chat lines, invitations to private chat, and chat subjects.
     pub const CHAT: Handled = Handled(1);
     /// Users arriving, changing and leaving, on the server and in each
-    /// private chat.
+    /// private chat, and what the server says about us.
     pub const USERS: Handled = Handled(2);
     /// Private messages, broadcasts, and the server's parting words.
     pub const MSG: Handled = Handled(4);
@@ -259,6 +259,22 @@ pub struct FileEntry {
     /// e.g. `*b"TEXT"` and `*b"ttxt"`. A folder's creator is usually zeros.
     pub type_code: [u8; 4],
     pub creator: [u8; 4],
+}
+
+/// An account, as the reply to [`Session::account_read`] gives it. The
+/// login, name and password are the server's bytes, for sending back as
+/// they came: a login is matched as bytes, and a name decoded for show
+/// does not always encode back to what it was. [`Session::decode`] reads
+/// them for show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub login: Vec<u8>,
+    pub name: Vec<u8>,
+    /// Empty when the account has none, or the server will not say.
+    pub password: Vec<u8>,
+    /// The access bits, as [`Event::SelfInfo`] gives ours; `None` when the
+    /// server sent none.
+    pub access: Option<u64>,
 }
 
 /// What a file or folder is: the reply to [`Session::file_info`].
@@ -391,8 +407,17 @@ pub enum Expect {
     ChatCreate,
     /// Joining private chat `cid`: an [`Event::ChatJoined`].
     ChatJoin { cid: u32 },
-    /// A private message: nothing, once it worked.
+    /// A private message or a broadcast: nothing, once it worked.
     Message,
+    /// What the server says of a user: an [`Event::UserInfo`].
+    UserInfo,
+    /// Disconnecting a user: an [`Event::Kicked`].
+    Kick,
+    /// Reading an account: an [`Event::Account`].
+    Account,
+    /// Making, changing or deleting an account: an
+    /// [`Event::AccountChanged`].
+    AccountChange,
     /// 1.2 flat news: an [`Event::NewsFile`].
     NewsFile,
     /// What a threaded-news bundle holds: an [`Event::NewsListing`].
@@ -518,16 +543,34 @@ pub enum Event {
         cid: u32,
         uid: u16,
     },
-    /// What the server says about us.
+    /// What the server says about us; each part `None` when it left it
+    /// out. Our uid and icon come together.
     SelfInfo {
-        uid: u16,
-        icon: u16,
+        uid: Option<u16>,
+        icon: Option<u16>,
         access: Option<u64>,
+        /// The Colored-Nicknames 0x00RRGGBB the server has for us.
+        color: Option<u32>,
     },
+    /// What the server says of the user [`Session::user_info`] named.
     UserInfo {
         trans: u32,
         name: String,
         info: String,
+    },
+    /// The user [`Session::kick`] named was disconnected.
+    Kicked {
+        trans: u32,
+    },
+    /// The account [`Session::account_read`] named.
+    Account {
+        trans: u32,
+        account: Account,
+    },
+    /// An account was made, changed or deleted: a caller can tell a save
+    /// that made one from one the server refused.
+    AccountChanged {
+        trans: u32,
     },
     /// What a folder holds.
     FileList {
@@ -630,7 +673,6 @@ enum State {
 /// What a sent request's reply should become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
-    UserInfo,
     /// Replies nobody reads: the agreement, a message, a news post. Their
     /// errors still surface.
     Quiet,
@@ -1021,7 +1063,58 @@ impl Session {
     pub fn user_info(&mut self, uid: u16) -> Result<u32, Error> {
         self.ensure_ready()?;
         let r = request::user_info(uid).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::UserInfo)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::UserInfo))))
+    }
+
+    /// Disconnect `uid`, and ban them too when `ban`.
+    pub fn kick(&mut self, uid: u16, ban: bool) -> Result<u32, Error> {
+        self.send_expecting(request::kick(uid, ban), Expect::Kick)
+    }
+
+    /// A message to everyone on the server.
+    pub fn broadcast(&mut self, text: &str) -> Result<u32, Error> {
+        let body = self.body_out(text);
+        self.send_expecting(request::broadcast(&body), Expect::Message)
+    }
+
+    // An account's login and password go as bytes, as the login's do, and
+    // its name with them: what the user typed, as UTF-8, or what an
+    // `Event::Account` gave, sent back as it came.
+
+    /// The account `login` names.
+    pub fn account_read(&mut self, login: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::account_read(login), Expect::Account)
+    }
+
+    /// A new account. An empty password is none.
+    pub fn account_create(
+        &mut self,
+        login: &[u8],
+        password: &[u8],
+        name: &[u8],
+        access: u64,
+    ) -> Result<u32, Error> {
+        let r = request::account(ClientHdr::AccountCreate, login, password, name, access);
+        self.send_expecting(r, Expect::AccountChange)
+    }
+
+    /// Replace what the account `login` names holds. mhxd and the
+    /// original server make it when there is none; Janus refuses. An
+    /// empty password leaves it as it was.
+    pub fn account_save(
+        &mut self,
+        login: &[u8],
+        password: &[u8],
+        name: &[u8],
+        access: u64,
+    ) -> Result<u32, Error> {
+        let r = request::account(ClientHdr::AccountModify, login, password, name, access);
+        self.send_expecting(r, Expect::AccountChange)
+    }
+
+    /// Delete the account `login` names.
+    pub fn account_delete(&mut self, login: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::account_delete(login), Expect::AccountChange)
     }
 
     /// Change the name and icon others see. Servers do not answer this
@@ -1557,10 +1650,12 @@ impl Session {
             }
             HandlerKind::UserSelfInfo => {
                 let s = parse::parse_selfinfo(&t.buf, len);
+                let has = |bit| s.seen & bit != 0;
                 self.events.push_back(Event::SelfInfo {
-                    uid: s.uid,
-                    icon: s.icon,
-                    access: (s.seen & parse::SELFINFO_ACCESS != 0).then_some(s.access),
+                    uid: has(parse::SELFINFO_USER_LIST).then_some(s.uid),
+                    icon: has(parse::SELFINFO_USER_LIST).then_some(s.icon),
+                    access: has(parse::SELFINFO_ACCESS).then_some(s.access),
+                    color: has(parse::SELFINFO_NICK_COLOR).then_some(s.nick_color),
                 });
             }
             HandlerKind::NewsPost => {
@@ -1670,7 +1765,7 @@ impl Session {
                     subject: listed_subject(&t.buf),
                 });
             }
-            Some(Pending::UserInfo) => {
+            Some(Pending::Expected(Expect::UserInfo)) => {
                 let i = parse::parse_user_info(&t.buf, len, MAX_NICK, 4096);
                 let (name, info) = (field_text(&i.name), self.decode(&i.info));
                 self.events.push_back(Event::UserInfo {
@@ -1678,6 +1773,26 @@ impl Session {
                     name,
                     info,
                 });
+            }
+            Some(Pending::Expected(Expect::Kick)) => {
+                self.events.push_back(Event::Kicked { trans: t.trans });
+            }
+            Some(Pending::Expected(Expect::Account)) => {
+                let a = parse::parse_account_read(&t.buf, len, MAX_NICK, MAX_NICK, MAX_NICK);
+                let account = Account {
+                    login: a.login,
+                    name: a.name,
+                    password: a.pass,
+                    access: a.got_access.then(|| u64::from_be_bytes(a.access)),
+                };
+                self.events.push_back(Event::Account {
+                    trans: t.trans,
+                    account,
+                });
+            }
+            Some(Pending::Expected(Expect::AccountChange)) => {
+                self.events
+                    .push_back(Event::AccountChanged { trans: t.trans });
             }
             Some(Pending::Expected(Expect::NewsFile)) => {
                 let text = parse::parse_news_file(&t.buf, len, MAX_NEWS)
@@ -2025,7 +2140,9 @@ impl Session {
     fn handles(&self, kind: HandlerKind) -> bool {
         let domain = match kind {
             HandlerKind::Chat | HandlerKind::ChatInvite | HandlerKind::ChatSubject => Handled::CHAT,
-            HandlerKind::UserChange | HandlerKind::UserPart => Handled::USERS,
+            HandlerKind::UserChange | HandlerKind::UserPart | HandlerKind::UserSelfInfo => {
+                Handled::USERS
+            }
             HandlerKind::Msg | HandlerKind::PoliteQuit => Handled::MSG,
             HandlerKind::NewsPost => Handled::NEWS,
             HandlerKind::XferQueue => Handled::FILES,
