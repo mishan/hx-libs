@@ -3371,6 +3371,19 @@ mod tests {
     }
 
     #[test]
+    fn news_file_skips_unrelated_chunks_before_it() {
+        // The C walker's `continue` once hung on a chunk ahead of NEWS.
+        let mut body = Vec::new();
+        body.extend(chunk(0x0123, b"junk"));
+        body.extend(chunk(tag::NEWS, b"news"));
+        let m = msg(0x0001_0000, 1, 0, &body);
+        assert_eq!(
+            parse_news_file(&m, m.len(), 256).as_deref(),
+            Some(&b"news"[..])
+        );
+    }
+
+    #[test]
     fn news_file_missing_chunk_returns_none() {
         let m = msg(0x0000_0067, 1, 0, &[]);
         assert!(parse_news_file(&m, m.len(), 256).is_none());
@@ -3413,6 +3426,13 @@ mod tests {
         let v: Vec<Vec<u8>> = news_post_chunks(&m, m.len(), 8192).collect();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0], b"a\nb\x4e");
+    }
+
+    #[test]
+    fn news_post_chunks_yields_an_empty_post_for_an_empty_chunk() {
+        let m = msg(0x0000_0066, 1, 0, &chunk(tag::NEWS, b""));
+        let v: Vec<Vec<u8>> = news_post_chunks(&m, m.len(), 8192).collect();
+        assert_eq!(v, [Vec::<u8>::new()]);
     }
 
     #[test]

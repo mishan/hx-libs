@@ -166,6 +166,8 @@ impl Handled {
     pub const USERS: Handled = Handled(2);
     /// Private messages, broadcasts, and the server's parting words.
     pub const MSG: Handled = Handled(4);
+    /// What is added to 1.2 flat news, as the server announces it.
+    pub const NEWS: Handled = Handled(8);
     pub const ALL: Handled = Handled(u32::MAX);
 
     pub fn contains(self, other: Handled) -> bool {
@@ -277,6 +279,10 @@ pub struct Article {
     /// The classic Mac date: a base year and seconds into it.
     pub year: u16,
     pub seconds: u32,
+    /// The type of its first part, as the server sent it; empty when it
+    /// has none. [`Session::news_article`] asks for text/plain whatever
+    /// this says.
+    pub mime: Vec<u8>,
 }
 
 /// The picture a chat line carries, under [`cap::INLINE_MEDIA`]: the
@@ -341,6 +347,17 @@ pub enum Expect {
     ChatJoin { cid: u32 },
     /// A private message: nothing, once it worked.
     Message,
+    /// 1.2 flat news: an [`Event::NewsFile`].
+    NewsFile,
+    /// What a threaded-news bundle holds: an [`Event::NewsListing`].
+    NewsListing,
+    /// The articles in a category: an [`Event::NewsCategory`].
+    NewsCategory,
+    /// One article's text: an [`Event::NewsArticle`].
+    NewsArticle,
+    /// A change to news of either kind — a post, an article, a bundle or
+    /// category made or deleted: nothing, once it worked.
+    NewsChange,
 }
 
 /// Why the session ended. The caller closes the socket.
@@ -539,10 +556,6 @@ enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
     UserInfo,
-    NewsFile,
-    NewsListing,
-    NewsCategory,
-    NewsArticle,
     FileList,
     /// Replies nobody reads: the agreement, a message, a news post. Their
     /// errors still surface.
@@ -1014,7 +1027,7 @@ impl Session {
         self.ensure_ready()?;
         Ok(self.send(
             &Request::new(ClientHdr::NewsGetFile as u32),
-            Some(Pending::NewsFile),
+            Some(Pending::Expected(Expect::NewsFile)),
         ))
     }
 
@@ -1041,7 +1054,7 @@ impl Session {
     pub fn news_listing_raw(&mut self, path: &[&[u8]]) -> Result<u32, Error> {
         self.ensure_ready()?;
         let r = request::news_list(ClientHdr::NewsListDir, path).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::NewsListing)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::NewsListing))))
     }
 
     /// The articles in a threaded-news category.
@@ -1053,7 +1066,7 @@ impl Session {
     pub fn news_category_raw(&mut self, path: &[&[u8]]) -> Result<u32, Error> {
         self.ensure_ready()?;
         let r = request::news_list(ClientHdr::NewsListCategory, path).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::NewsCategory)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::NewsCategory))))
     }
 
     /// One article's text.
@@ -1065,7 +1078,84 @@ impl Session {
     pub fn news_article_raw(&mut self, path: &[&[u8]], id: u32) -> Result<u32, Error> {
         self.ensure_ready()?;
         let r = request::news_article(path, id).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::NewsArticle)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::NewsArticle))))
+    }
+
+    /// Post an article to a threaded-news category, in reply to article
+    /// `parent`, or 0 to start a thread.
+    pub fn news_post_article(
+        &mut self,
+        path: &[&str],
+        parent: u32,
+        subject: &str,
+        text: &str,
+    ) -> Result<u32, Error> {
+        let path = self.path_out(path);
+        let path: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
+        self.news_post_article_raw(&path, parent, subject, text)
+    }
+
+    pub fn news_post_article_raw(
+        &mut self,
+        path: &[&[u8]],
+        parent: u32,
+        subject: &str,
+        text: &str,
+    ) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let (subject, body) = (text_out(subject, self.utf8), self.body_out(text));
+        let r = request::news_post_article(path, parent, &subject, &body).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
+    }
+
+    /// Delete article `id` from a category.
+    pub fn news_delete_article(&mut self, path: &[&str], id: u32) -> Result<u32, Error> {
+        let path = self.path_out(path);
+        self.news_delete_article_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>(), id)
+    }
+
+    pub fn news_delete_article_raw(&mut self, path: &[&[u8]], id: u32) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::news_delete_article(path, id).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
+    }
+
+    /// Delete a bundle or a category, and everything in it.
+    pub fn news_delete(&mut self, path: &[&str]) -> Result<u32, Error> {
+        let path = self.path_out(path);
+        self.news_delete_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>())
+    }
+
+    pub fn news_delete_raw(&mut self, path: &[&[u8]]) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::news_delete(path).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
+    }
+
+    /// Make a bundle named `name` in the bundle at `path`.
+    pub fn news_create_bundle(&mut self, path: &[&str], name: &str) -> Result<u32, Error> {
+        let path = self.path_out(path);
+        self.news_create_bundle_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>(), name)
+    }
+
+    pub fn news_create_bundle_raw(&mut self, path: &[&[u8]], name: &str) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r =
+            request::news_create_bundle(path, &text_out(name, self.utf8)).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
+    }
+
+    /// Make a category named `name` in the bundle at `path`.
+    pub fn news_create_category(&mut self, path: &[&str], name: &str) -> Result<u32, Error> {
+        let path = self.path_out(path);
+        self.news_create_category_raw(&path.iter().map(Vec::as_slice).collect::<Vec<_>>(), name)
+    }
+
+    pub fn news_create_category_raw(&mut self, path: &[&[u8]], name: &str) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::news_create_category(path, &text_out(name, self.utf8))
+            .ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Quiet)))
     }
 
     /// What the folder at `path` holds; the root is `&[]`. The reply
@@ -1366,7 +1456,7 @@ impl Session {
                     info,
                 });
             }
-            Some(Pending::NewsFile) => {
+            Some(Pending::Expected(Expect::NewsFile)) => {
                 let text = parse::parse_news_file(&t.buf, len, MAX_NEWS)
                     .map(|b| self.decode(&b))
                     .unwrap_or_default();
@@ -1375,12 +1465,12 @@ impl Session {
                     text,
                 });
             }
-            Some(Pending::NewsListing) => {
+            Some(Pending::Expected(Expect::NewsListing)) => {
                 let items = parse::parse_dirlist(&t.buf, len)
                     .entries
                     .into_iter()
                     .map(|e| NewsItem {
-                        name: self.decode(&e.name),
+                        name: field_text(&e.name),
                         name_bytes: e.name,
                         bundle: e.kind == parse::NewsDirKind::Folder,
                     })
@@ -1390,7 +1480,7 @@ impl Session {
                     items,
                 });
             }
-            Some(Pending::NewsCategory) => {
+            Some(Pending::Expected(Expect::NewsCategory)) => {
                 let articles = parse::parse_catlist(&t.buf, len)
                     .map(|c| c.posts)
                     .unwrap_or_default()
@@ -1398,10 +1488,16 @@ impl Session {
                     .map(|p| Article {
                         id: p.postid,
                         parent: p.parentid,
-                        subject: self.decode(&p.subject),
-                        poster: self.decode(&p.sender),
+                        subject: field_text(&p.subject),
+                        poster: field_text(&p.sender),
                         year: p.date_base_year,
                         seconds: p.date_seconds,
+                        mime: p
+                            .parts
+                            .into_iter()
+                            .next()
+                            .map(|m| m.mime_type)
+                            .unwrap_or_default(),
                     })
                     .collect();
                 self.events.push_back(Event::NewsCategory {
@@ -1409,7 +1505,7 @@ impl Session {
                     articles,
                 });
             }
-            Some(Pending::NewsArticle) => {
+            Some(Pending::Expected(Expect::NewsArticle)) => {
                 let a = parse::parse_news_thread_reply(&t.buf, len, MAX_NEWS);
                 let text = a.text.map(|b| self.decode(&b)).unwrap_or_default();
                 self.events.push_back(Event::NewsArticle {
@@ -1494,6 +1590,7 @@ impl Session {
             | Some(Pending::Keepalive)
             | Some(Pending::Expected(Expect::ChatInvite))
             | Some(Pending::Expected(Expect::Message))
+            | Some(Pending::Expected(Expect::NewsChange))
             | None => {}
         }
     }
@@ -1661,6 +1758,7 @@ impl Session {
             HandlerKind::Chat | HandlerKind::ChatInvite | HandlerKind::ChatSubject => Handled::CHAT,
             HandlerKind::UserChange | HandlerKind::UserPart => Handled::USERS,
             HandlerKind::Msg | HandlerKind::PoliteQuit => Handled::MSG,
+            HandlerKind::NewsPost => Handled::NEWS,
             _ => return false,
         };
         self.cfg.handled.contains(domain)

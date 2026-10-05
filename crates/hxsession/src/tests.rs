@@ -1204,6 +1204,7 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
         ],
     );
     let quit = server(0x6f, 0, 0, &[(tag::BODY, b"Bye.")]);
+    let news = server(0x66, 0, 0, &[(tag::NEWS, b"Up\rlate")]);
     let part = server(
         0x76,
         0,
@@ -1260,31 +1261,37 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
         Event::Disconnecting("Bye.".into()),
     ];
     let msg_whole = [whole(0x68, &msg), whole(0x6f, &quit)];
+    let news_events = [Event::NewsPosted("Up\nlate".into())];
+    let news_whole = [whole(0x66, &news)];
     let cases = [
         (
             Handled::NONE,
-            [&chat_whole[..], &users_whole, &msg_whole].concat(),
+            [&chat_whole[..], &users_whole, &msg_whole, &news_whole].concat(),
         ),
         (
             Handled::CHAT,
-            [&chat_events[..], &users_whole, &msg_whole].concat(),
+            [&chat_events[..], &users_whole, &msg_whole, &news_whole].concat(),
         ),
         (
             Handled::USERS,
-            [&chat_whole[..], &user_events, &msg_whole].concat(),
+            [&chat_whole[..], &user_events, &msg_whole, &news_whole].concat(),
         ),
         (
             Handled::MSG,
-            [&chat_whole[..], &users_whole, &msg_events].concat(),
+            [&chat_whole[..], &users_whole, &msg_events, &news_whole].concat(),
         ),
         (
-            Handled::CHAT | Handled::USERS | Handled::MSG,
-            [&chat_events[..], &user_events, &msg_events].concat(),
+            Handled::NEWS,
+            [&chat_whole[..], &users_whole, &msg_whole, &news_events].concat(),
+        ),
+        (
+            Handled::CHAT | Handled::USERS | Handled::MSG | Handled::NEWS,
+            [&chat_events[..], &user_events, &msg_events, &news_events].concat(),
         ),
     ];
     for (handled, want) in cases {
         let mut s = raw_ready(handled, 0);
-        for frame in [&chat, &invite, &subject, &user, &part, &msg, &quit] {
+        for frame in [&chat, &invite, &subject, &user, &part, &msg, &quit, &news] {
             s.feed(frame, T0);
         }
         assert_eq!(events(&mut s), want, "{handled:?}");
@@ -1548,6 +1555,145 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
                 trans: other,
                 frame: reply
             },
+        ]
+    );
+}
+
+#[test]
+fn news_replies_expected_become_events() {
+    let mut s = raw_ready(Handled::NEWS, 0);
+    let [file, listing, category, article, change, refused] = [(); 6].map(|_| s.take_trans());
+    for (t, what) in [
+        (file, Expect::NewsFile),
+        (listing, Expect::NewsListing),
+        (category, Expect::NewsCategory),
+        (article, Expect::NewsArticle),
+        (change, Expect::NewsChange),
+        (refused, Expect::NewsChange),
+    ] {
+        s.expect(t, what).unwrap();
+        s.send_raw(&caller(370, t)).unwrap();
+    }
+    // A name ends at its first NUL, as a nickname does; 0x8E is Mac Roman é.
+    let bundle = [&[0, 2, 0, 0, 6][..], b"Ren\x8E\0\xFF"].concat();
+    let post = [
+        &[0, 0, 0, 7][..],   // its id
+        &[0x07, 0xea, 0, 0], // 2026
+        &[0, 0, 0, 60],      // a minute in
+        &[0, 0, 0, 3],       // replying to 3
+        &[0, 0, 0, 0],       // flags
+        &[0, 1],             // one part
+        &[4],                // subject
+        b"Re\0x",
+        &[3], // poster
+        b"amy",
+        &[10], // the part's type
+        b"text/plain",
+        &[0, 2], // and size
+    ]
+    .concat();
+    let catlist = [&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0][..], &post].concat();
+    s.feed(&server(TASK, file, 0, &[(tag::NEWS, b"one\rtwo")]), T0);
+    s.feed(
+        &server(TASK, listing, 0, &[(tag::CATEGORYITEM, &bundle)]),
+        T0,
+    );
+    s.feed(&server(TASK, category, 0, &[(tag::CATLIST, &catlist)]), T0);
+    s.feed(
+        &server(TASK, article, 0, &[(tag::NEWSDATA, b"caf\x8E")]),
+        T0,
+    );
+    s.feed(&server(TASK, change, 0, &[]), T0);
+    s.feed(
+        &server(TASK, refused, 1, &[(tag::TASK_ERROR, b"Not allowed.")]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::NewsFile {
+                trans: file,
+                text: "one\ntwo".into()
+            },
+            Event::NewsListing {
+                trans: listing,
+                items: vec![NewsItem {
+                    name: "René".into(),
+                    name_bytes: b"Ren\x8E\0\xFF".to_vec(),
+                    bundle: true
+                }]
+            },
+            Event::NewsCategory {
+                trans: category,
+                articles: vec![Article {
+                    id: 7,
+                    parent: 3,
+                    subject: "Re".into(),
+                    poster: "amy".into(),
+                    year: 2026,
+                    seconds: 60,
+                    mime: b"text/plain".to_vec()
+                }]
+            },
+            Event::NewsArticle {
+                trans: article,
+                text: "café".into()
+            },
+            Event::Failed {
+                trans: refused,
+                reason: Some("Not allowed.".into())
+            },
+        ]
+    );
+}
+
+#[test]
+fn news_changes_go_as_gtkhx_sends_them() {
+    let mut s = ready();
+    let path = [0, 1, 0, 0, 4, b'N', b'e', b'w', b's'].to_vec();
+    s.news_post_article(&["News"], 3, "Re: hi", "one\ntwo")
+        .unwrap();
+    s.news_delete_article(&["News"], 7).unwrap();
+    s.news_delete(&["News"]).unwrap();
+    s.news_create_bundle(&[], "Old").unwrap();
+    s.news_create_category(&["News"], "Café").unwrap();
+    let got: Vec<_> = sent(&mut s).into_iter().map(|(op, _, f)| (op, f)).collect();
+    assert_eq!(
+        got,
+        [
+            (
+                410,
+                vec![
+                    (tag::NEWSPATH, path.clone()),
+                    (tag::NEWSFLAGS, 0u32.to_be_bytes().to_vec()),
+                    (tag::NEWSTYPE, b"text/plain".to_vec()),
+                    (tag::NEWSSUBJECT, b"Re: hi".to_vec()),
+                    (tag::NEWSDATA, b"one\rtwo".to_vec()),
+                    (tag::THREADID, 3u32.to_be_bytes().to_vec()),
+                ]
+            ),
+            (
+                411,
+                vec![
+                    (tag::NEWSPATH, path.clone()),
+                    (tag::THREADID, 7u32.to_be_bytes().to_vec()),
+                ]
+            ),
+            (380, vec![(tag::NEWSPATH, path.clone())]),
+            (
+                381,
+                vec![
+                    (tag::NEWSPATH, vec![0, 0]),
+                    (tag::FILE_NAME, b"Old".to_vec())
+                ]
+            ),
+            (
+                382,
+                vec![
+                    (tag::NEWSPATH, path),
+                    (tag::CATEGORY, "Café".as_bytes().to_vec())
+                ]
+            ),
         ]
     );
 }
