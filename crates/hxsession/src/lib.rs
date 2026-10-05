@@ -48,10 +48,12 @@
 //! A client that has no use for HOPE leaves the feature off, and with it
 //! the ciphers and compressors.
 //!
-//! What is not here yet: file transfers (a folder's listing is here; its
-//! contents are not), and the extensions other than chat history and the
-//! media a chat line carries (voice, video, uploading and fetching media,
-//! GIF icons). [`Session::request`] sends any transaction and hands its
+//! Files are here as far as the control connection goes: listing, info,
+//! changes, and asking for a transfer, which the server answers with the
+//! reference a transfer connection opens with. That connection (HTXF) is
+//! not here, nor are the extensions other than chat history and the media
+//! a chat line carries (voice, video, uploading and fetching media, GIF
+//! icons). [`Session::request`] sends any transaction and hands its
 //! reply back whole, for what has no method of its own.
 
 pub mod frame;
@@ -168,6 +170,9 @@ impl Handled {
     pub const MSG: Handled = Handled(4);
     /// What is added to 1.2 flat news, as the server announces it.
     pub const NEWS: Handled = Handled(8);
+    /// Where a transfer stands in the server's queue, as the server moves
+    /// it.
+    pub const FILES: Handled = Handled(16);
     pub const ALL: Handled = Handled(u32::MAX);
 
     pub fn contains(self, other: Handled) -> bool {
@@ -254,6 +259,47 @@ pub struct FileEntry {
     /// e.g. `*b"TEXT"` and `*b"ttxt"`. A folder's creator is usually zeros.
     pub type_code: [u8; 4],
     pub creator: [u8; 4],
+}
+
+/// What a file or folder is: the reply to [`Session::file_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    pub name: String,
+    /// The type as the server describes it: a code such as `fldr` from
+    /// some servers, a name such as "Folder" from others.
+    pub kind: String,
+    pub creator: String,
+    pub comment: String,
+    /// Bytes for a file; for a folder, what the server counts. Exact past
+    /// 4 GiB where the server sent the Large-Files companion.
+    pub size: u64,
+    /// The classic Mac dates as the server sent them: the year, then
+    /// milliseconds and seconds into it, big-endian. Zeros when it sent
+    /// none.
+    pub created: [u8; 8],
+    pub modified: [u8; 8],
+}
+
+/// The server's answer to a request to download or upload a file or a
+/// folder: what the transfer connection quotes, and when it may open.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Transfer {
+    /// The reference the transfer connection opens with; 0 when the
+    /// server sent none, as mhxd sends none for an empty folder.
+    pub reference: u32,
+    /// How many bytes a download carries, exact past 4 GiB where the
+    /// server sent the Large-Files companion; 0 when it did not say, as
+    /// for an upload.
+    pub size: u64,
+    /// How many transfers are ahead of this one; 0 to go now. The server
+    /// says when it moves with [`Event::TransferQueued`].
+    pub queue: u32,
+    /// A folder download: how many items it holds.
+    pub items: u32,
+    /// An upload of a file the server holds part of: where its data and
+    /// resource forks carry on from. Zeros otherwise.
+    pub data_from: u32,
+    pub rsrc_from: u32,
 }
 
 /// One entry in a threaded-news listing.
@@ -358,6 +404,16 @@ pub enum Expect {
     /// A change to news of either kind — a post, an article, a bundle or
     /// category made or deleted: nothing, once it worked.
     NewsChange,
+    /// What a folder holds: an [`Event::FileList`].
+    FileList,
+    /// What a file or folder is: an [`Event::FileInfo`].
+    FileInfo,
+    /// A change to the files — a folder made, something deleted, moved or
+    /// renamed, a comment set: an [`Event::FileChanged`].
+    FileChange,
+    /// A download or an upload, of a file or a folder: an
+    /// [`Event::Transfer`].
+    Transfer,
 }
 
 /// Why the session ended. The caller closes the socket.
@@ -478,6 +534,25 @@ pub enum Event {
         trans: u32,
         files: Vec<FileEntry>,
     },
+    FileInfo {
+        trans: u32,
+        info: FileInfo,
+    },
+    /// A change to the files went through.
+    FileChanged {
+        trans: u32,
+    },
+    /// The server's answer to a download or an upload.
+    Transfer {
+        trans: u32,
+        transfer: Transfer,
+    },
+    /// A queued transfer moved: `queue` transfers are now ahead of it, and
+    /// at 0 it may go.
+    TransferQueued {
+        reference: u32,
+        queue: u32,
+    },
     /// The whole of 1.2 flat news.
     NewsFile {
         trans: u32,
@@ -556,7 +631,6 @@ enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
     UserInfo,
-    FileList,
     /// Replies nobody reads: the agreement, a message, a news post. Their
     /// errors still surface.
     Quiet,
@@ -1168,7 +1242,149 @@ impl Session {
     pub fn file_list_raw(&mut self, path: &[&[u8]]) -> Result<u32, Error> {
         self.ensure_ready()?;
         let r = request::file_list(path).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::FileList)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::FileList))))
+    }
+
+    /// What `name`, in the folder at `path`, is.
+    pub fn file_info(&mut self, path: &[&str], name: &str) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.file_info_raw(&slices(&path), &name)
+    }
+
+    pub fn file_info_raw(&mut self, path: &[&[u8]], name: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::file_info(path, name), Expect::FileInfo)
+    }
+
+    /// Make folder `name` in the folder at `path`.
+    pub fn file_mkdir(&mut self, path: &[&str], name: &str) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.file_mkdir_raw(&slices(&path), &name)
+    }
+
+    pub fn file_mkdir_raw(&mut self, path: &[&[u8]], name: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::file_mkdir(path, name), Expect::FileChange)
+    }
+
+    /// Delete `name`, in the folder at `path`: a file, or a folder and
+    /// everything in it.
+    pub fn file_delete(&mut self, path: &[&str], name: &str) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.file_delete_raw(&slices(&path), &name)
+    }
+
+    pub fn file_delete_raw(&mut self, path: &[&[u8]], name: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::file_delete(path, name), Expect::FileChange)
+    }
+
+    /// Rename `name`, in the folder at `path`, and set its comment, each
+    /// when given. A rename to the name it has is no rename.
+    pub fn file_set_info(
+        &mut self,
+        path: &[&str],
+        name: &str,
+        rename: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.file_set_info_raw(&slices(&path), &name, rename, comment)
+    }
+
+    /// The new name and the comment are what the user typed, encoded here
+    /// as the other requests' text is; only the item is named by bytes.
+    pub fn file_set_info_raw(
+        &mut self,
+        path: &[&[u8]],
+        name: &[u8],
+        rename: Option<&str>,
+        comment: Option<&str>,
+    ) -> Result<u32, Error> {
+        let rename = rename.map(|r| self.encode(r));
+        let comment = comment.map(|c| self.body_out(c));
+        let r = request::file_set_info(path, name, rename.as_deref(), comment.as_deref());
+        self.send_expecting(r, Expect::FileChange)
+    }
+
+    /// Move `name` from the folder at `path` into the one at `to`.
+    pub fn file_move(&mut self, path: &[&str], name: &str, to: &[&str]) -> Result<u32, Error> {
+        let (path, name, to) = (self.path_out(path), self.encode(name), self.path_out(to));
+        self.file_move_raw(&slices(&path), &name, &slices(&to))
+    }
+
+    pub fn file_move_raw(
+        &mut self,
+        path: &[&[u8]],
+        name: &[u8],
+        to: &[&[u8]],
+    ) -> Result<u32, Error> {
+        self.send_expecting(request::file_move(path, name, to), Expect::FileChange)
+    }
+
+    /// Ask to download file `name`, in the folder at `path`. The
+    /// [`Event::Transfer`] that answers says what the transfer connection
+    /// quotes; that connection is the caller's.
+    pub fn file_download(&mut self, path: &[&str], name: &str) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.file_download_raw(&slices(&path), &name)
+    }
+
+    pub fn file_download_raw(&mut self, path: &[&[u8]], name: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::file_download(path, name), Expect::Transfer)
+    }
+
+    /// Ask to upload `size` bytes as file `name`, into the folder at
+    /// `path`.
+    pub fn file_upload(&mut self, path: &[&str], name: &str, size: u64) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.file_upload_raw(&slices(&path), &name, size)
+    }
+
+    pub fn file_upload_raw(
+        &mut self,
+        path: &[&[u8]],
+        name: &[u8],
+        size: u64,
+    ) -> Result<u32, Error> {
+        let large = self.agreed(cap::LARGE_FILES);
+        self.send_expecting(
+            request::file_upload(path, name, size, large),
+            Expect::Transfer,
+        )
+    }
+
+    /// Ask to download folder `name`, in the folder at `path`.
+    pub fn folder_download(&mut self, path: &[&str], name: &str) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.folder_download_raw(&slices(&path), &name)
+    }
+
+    pub fn folder_download_raw(&mut self, path: &[&[u8]], name: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::folder_download(path, name), Expect::Transfer)
+    }
+
+    /// Ask to upload folder `name`, of `items` files and `size` bytes in
+    /// all, into the folder at `path`.
+    pub fn folder_upload(
+        &mut self,
+        path: &[&str],
+        name: &str,
+        size: u64,
+        items: u32,
+    ) -> Result<u32, Error> {
+        let (path, name) = (self.path_out(path), self.encode(name));
+        self.folder_upload_raw(&slices(&path), &name, size, items)
+    }
+
+    pub fn folder_upload_raw(
+        &mut self,
+        path: &[&[u8]],
+        name: &[u8],
+        size: u64,
+        items: u32,
+    ) -> Result<u32, Error> {
+        self.send_expecting(
+            request::folder_upload(path, name, size, items),
+            Expect::Transfer,
+        )
     }
 
     /// The trans for a transaction the caller builds itself, for
@@ -1353,6 +1569,13 @@ impl Session {
                     self.events.push_back(Event::NewsPosted(text));
                 }
             }
+            HandlerKind::XferQueue => {
+                let q = parse::parse_xfer_queue(&t.buf, len);
+                self.events.push_back(Event::TransferQueued {
+                    reference: q.htxf_ref,
+                    queue: q.queueid,
+                });
+            }
             HandlerKind::Agreement => self.agreement(&t),
             _ => self.events.push_back(Event::Unhandled {
                 opcode: t.type_,
@@ -1513,7 +1736,7 @@ impl Session {
                     text,
                 });
             }
-            Some(Pending::FileList) => {
+            Some(Pending::Expected(Expect::FileList)) => {
                 let mut files: Vec<FileEntry> = Vec::new();
                 // Whether the last field was an entry, which a companion
                 // that follows belongs to. Matched by place, not count: a
@@ -1556,6 +1779,52 @@ impl Session {
                 self.events.push_back(Event::FileList {
                     trans: t.trans,
                     files,
+                });
+            }
+            Some(Pending::Expected(Expect::FileInfo)) => {
+                let f =
+                    parse::parse_file_getinfo(&t.buf, len, INFO_TEXT_CAP, 31, 31, INFO_TEXT_CAP);
+                let info = FileInfo {
+                    name: field_text(whole_chars(&f.name, INFO_TEXT_CAP)),
+                    kind: field_text(&f.type_),
+                    creator: field_text(&f.creator),
+                    comment: self.decode(whole_chars(&f.comment, INFO_TEXT_CAP)),
+                    size: if f.size64_seen {
+                        f.size64
+                    } else {
+                        u64::from(f.size)
+                    },
+                    created: f.date_create,
+                    modified: f.date_modify,
+                };
+                self.events.push_back(Event::FileInfo {
+                    trans: t.trans,
+                    info,
+                });
+            }
+            Some(Pending::Expected(Expect::FileChange)) => {
+                self.events.push_back(Event::FileChanged { trans: t.trans });
+            }
+            Some(Pending::Expected(Expect::Transfer)) => {
+                // One reading for every kind: each field says one thing,
+                // and a reply carries only those its kind has.
+                let get = parse::parse_folder_get_reply(&t.buf, len);
+                let put = parse::parse_file_put_reply(&t.buf, len);
+                let transfer = Transfer {
+                    reference: get.ref_,
+                    size: if get.size64_seen {
+                        get.size64
+                    } else {
+                        u64::from(get.size)
+                    },
+                    queue: get.queue,
+                    items: get.nfiles,
+                    data_from: put.data_pos,
+                    rsrc_from: put.rsrc_pos,
+                };
+                self.events.push_back(Event::Transfer {
+                    trans: t.trans,
+                    transfer,
                 });
             }
             Some(Pending::Raw) => self.events.push_back(Event::Reply {
@@ -1759,6 +2028,7 @@ impl Session {
             HandlerKind::UserChange | HandlerKind::UserPart => Handled::USERS,
             HandlerKind::Msg | HandlerKind::PoliteQuit => Handled::MSG,
             HandlerKind::NewsPost => Handled::NEWS,
+            HandlerKind::XferQueue => Handled::FILES,
             _ => return false,
         };
         self.cfg.handled.contains(domain)
@@ -1814,6 +2084,14 @@ impl Session {
         trans
     }
 
+    /// Send a request built from the caller's input, `None` when it was
+    /// too long to build, expecting `what` in reply.
+    fn send_expecting(&mut self, req: Option<Request>, what: Expect) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = req.ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Expected(what))))
+    }
+
     fn remember(&mut self, trans: u32, p: Pending) {
         if self.pending.len() as u32 >= MAX_PENDING {
             let newest = trans;
@@ -1854,6 +2132,10 @@ impl Session {
         self.pending.clear();
         self.events.push_back(Event::Closed(why));
     }
+}
+
+fn slices(v: &[Vec<u8>]) -> Vec<&[u8]> {
+    v.iter().map(Vec::as_slice).collect()
 }
 
 fn text_out(text: &str, utf8: bool) -> Vec<u8> {
@@ -1904,6 +2186,21 @@ fn listed_subject(frame: &[u8]) -> Option<String> {
 /// then decoded, so what follows the NUL cannot change how the rest reads.
 fn field_text(bytes: &[u8]) -> String {
     text_in(bytes.split(|&b| b == 0).next().unwrap_or_default())
+}
+
+/// Where Get Info's name and comment are cut, so [`whole_chars`] knows a
+/// cut from text that merely ended.
+const INFO_TEXT_CAP: usize = 255;
+
+/// Text cut at `cap` bytes, without the UTF-8 character the cut split,
+/// which would otherwise make the whole read as Mac Roman. Text the cap did
+/// not cut is left whole: a Mac Roman one can end in what looks like the
+/// start of a UTF-8 character.
+fn whole_chars(bytes: &[u8], cap: usize) -> &[u8] {
+    match std::str::from_utf8(bytes) {
+        Err(e) if bytes.len() >= cap && e.error_len().is_none() => &bytes[..e.valid_up_to()],
+        _ => bytes,
+    }
 }
 
 fn text_in(bytes: &[u8]) -> String {

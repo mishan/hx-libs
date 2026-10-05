@@ -242,6 +242,136 @@ pub fn file_list(path: &[&[u8]]) -> Option<Request> {
     Request::from_built(ClientHdr::FileList, &chunks, hc)
 }
 
+/// The DIR of the folder at `path`, or none for the root, which GtkHx
+/// leaves out of the requests that name an item in its own field. `None`
+/// when the path is too long to send.
+fn dir_below_root(path: &[&[u8]]) -> Option<Option<Vec<u8>>> {
+    if path.iter().all(|p| p.is_empty()) {
+        return Some(None);
+    }
+    self::path(path).map(Some)
+}
+
+/// FILE_GETINFO (206): `name`, in the folder at `path`.
+pub fn file_info(path: &[&[u8]], name: &[u8]) -> Option<Request> {
+    let dir = dir_below_root(path)?;
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let hc = build::build_file_getinfo_chunks(name, dir.as_deref(), &mut chunks);
+    Request::from_built(ClientHdr::FileGetInfo, &chunks, hc)
+}
+
+/// FILE_MKDIR (205): folder `name`, in the folder at `path`. The new
+/// folder is named by the DIR alone, its whole path.
+pub fn file_mkdir(path: &[&[u8]], name: &[u8]) -> Option<Request> {
+    let encoded = self::path(&[path, &[name]].concat())?;
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_file_mkdir_chunks(&encoded, &mut chunks);
+    Request::from_built(ClientHdr::FileMkdir, &chunks, hc)
+}
+
+/// FILE_DELETE (204): `name`, in the folder at `path`. GtkHx names its
+/// folder even at the root, with an empty DIR.
+pub fn file_delete(path: &[&[u8]], name: &[u8]) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let hc = build::build_file_delete_chunks(name, Some(&encoded), &mut chunks);
+    Request::from_built(ClientHdr::FileDelete, &chunks, hc)
+}
+
+/// FILE_SETINFO (207): rename `name`, in the folder at `path`, and set
+/// its comment, each when given; the folder goes as for a delete. A
+/// rename to the name it has goes as none: Janus 2.0.13 and earlier
+/// refuse it, and the comment with it.
+pub fn file_set_info(
+    path: &[&[u8]],
+    name: &[u8],
+    rename: Option<&[u8]>,
+    comment: Option<&[u8]>,
+) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let req = build::FileSetInfoRequest {
+        name,
+        rename: rename.filter(|r| *r != name),
+        comment,
+        dir: Some(&encoded),
+    };
+    let mut chunks = [HxChunk::EMPTY; 4];
+    let hc = build::build_file_setinfo_chunks(&req, &mut chunks);
+    Request::from_built(ClientHdr::FileSetInfo, &chunks, hc)
+}
+
+/// FILE_MOVE (208): `name`, from the folder at `path` into the one at
+/// `to`, keeping its name. Both folders always go, the root as an empty
+/// DIR.
+pub fn file_move(path: &[&[u8]], name: &[u8], to: &[&[u8]]) -> Option<Request> {
+    let (from, to) = (self::path(path)?, self::path(to)?);
+    let req = build::FileMoveRequest {
+        name,
+        dir: &from,
+        dir_rename: &to,
+    };
+    let mut chunks = [HxChunk::EMPTY; 3];
+    let hc = build::build_file_move_chunks(&req, &mut chunks);
+    Request::from_built(ClientHdr::FileMove, &chunks, hc)
+}
+
+/// FILE_GET (202): download `name`, in the folder at `path`, from the
+/// start.
+pub fn file_download(path: &[&[u8]], name: &[u8]) -> Option<Request> {
+    let dir = dir_below_root(path)?;
+    let req = build::FileGetRequest {
+        name,
+        dir: dir.as_deref(),
+        rflt: None,
+    };
+    let mut chunks = [HxChunk::EMPTY; 3];
+    let hc = build::build_file_get_chunks(&req, &mut chunks);
+    Request::from_built(ClientHdr::FileGet, &chunks, hc)
+}
+
+/// FILE_PUT (203): upload `size` bytes as `name`, into the folder at
+/// `path`. The classic size field stops at 4 GiB; with `large` (the
+/// server agreed to Large Files) the exact size goes beside it.
+pub fn file_upload(path: &[&[u8]], name: &[u8], size: u64, large: bool) -> Option<Request> {
+    let dir = dir_below_root(path)?;
+    let req = build::FilePutRequest {
+        name,
+        dir: dir.as_deref(),
+        has_preview: false,
+        size: size.min(u64::from(u32::MAX)) as u32,
+        size64: large.then_some(size),
+    };
+    let mut chunks = [HxChunk::EMPTY; 5];
+    let mut scratch = [0u8; 12];
+    let hc = build::build_file_put_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::FilePut, &chunks, hc)
+}
+
+/// FILE_GETFOLDER (210): download folder `name`, in the folder at `path`.
+pub fn folder_download(path: &[&[u8]], name: &[u8]) -> Option<Request> {
+    let dir = dir_below_root(path)?;
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let hc = build::build_file_getfolder_chunks(name, dir.as_deref(), &mut chunks);
+    Request::from_built(ClientHdr::FileGetFolder, &chunks, hc)
+}
+
+/// FILE_PUTFOLDER (213): upload folder `name`, of `items` files and
+/// `size` bytes in all, into the folder at `path`. The server shows the
+/// totals in its queue; the size stops at 4 GiB.
+pub fn folder_upload(path: &[&[u8]], name: &[u8], size: u64, items: u32) -> Option<Request> {
+    let dir = dir_below_root(path)?;
+    let req = build::FilePutFolderRequest {
+        name,
+        dir: dir.as_deref(),
+        size: size.min(u64::from(u32::MAX)) as u32,
+        nfiles: items,
+    };
+    let mut chunks = [HxChunk::EMPTY; 4];
+    let mut scratch = [0u8; 8];
+    let hc = build::build_file_putfolder_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::FilePutFolder, &chunks, hc)
+}
+
 /// NEWS_LISTDIR (370) or NEWS_LISTCATEGORY (371). The root is asked for
 /// with no path at all.
 pub fn news_list(opcode: ClientHdr, path: &[&[u8]]) -> Option<Request> {

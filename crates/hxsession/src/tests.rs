@@ -866,7 +866,185 @@ fn a_path_too_long_to_send_is_refused_not_cut() {
     let long = "x".repeat(256);
     assert_eq!(s.file_list(&[&long]), Err(Error::TooLong));
     assert_eq!(s.news_category(&[&long]), Err(Error::TooLong));
+    // A new folder's name is a DIR component like any other.
+    assert_eq!(s.file_mkdir(&[], &long), Err(Error::TooLong));
+    assert_eq!(s.file_move(&[], "f", &[&long]), Err(Error::TooLong));
     assert!(s.take_outgoing().is_empty());
+}
+
+#[test]
+fn file_requests_go_as_gtkhx_sends_them() {
+    let u32_be = |v: u32| v.to_be_bytes().to_vec();
+    let name = |n: &str| (tag::FILE_NAME, n.as_bytes().to_vec());
+    let pub_dir = [&[0, 1, 0, 0, 3][..], b"pub"].concat();
+    let dst_dir = [&[0, 1, 0, 0, 3][..], b"dst"].concat();
+    // At the root, the requests GtkHx names a folder in only below it
+    // leave the DIR out; the rest send an empty one.
+    for (path, below) in [(&[][..], None), (&["pub"][..], Some(pub_dir.clone()))] {
+        let mut s = ready();
+        let dir: Vec<_> = below.iter().map(|d| (tag::DIR, d.clone())).collect();
+        let always = (tag::DIR, below.clone().unwrap_or(vec![0, 0]));
+        let new_dir = match &below {
+            None => [&[0, 1, 0, 0, 3][..], b"new"].concat(),
+            Some(_) => [&[0, 2, 0, 0, 3][..], b"pub", &[0, 0, 3], b"new"].concat(),
+        };
+        s.file_info(path, "f").unwrap();
+        s.file_mkdir(path, "new").unwrap();
+        s.file_delete(path, "f").unwrap();
+        s.file_set_info(path, "f", Some("g"), Some("a\nb")).unwrap();
+        s.file_move(path, "f", &["dst"]).unwrap();
+        s.file_download(path, "f").unwrap();
+        // Past 4 GiB, and no Large-Files companion: the server never
+        // agreed to it.
+        s.file_upload(path, "f", 5 << 32).unwrap();
+        s.folder_download(path, "d").unwrap();
+        s.folder_upload(path, "d", 5 << 32, 2).unwrap();
+        let got: Vec<_> = sent(&mut s).into_iter().map(|(op, _, f)| (op, f)).collect();
+        assert_eq!(
+            got,
+            [
+                (206, [vec![name("f")], dir.clone()].concat()),
+                (205, vec![(tag::DIR, new_dir)]),
+                (204, vec![name("f"), always.clone()]),
+                (
+                    207,
+                    vec![
+                        name("f"),
+                        (tag::FILE_RENAME, b"g".to_vec()),
+                        (tag::FILE_COMMENT, b"a\rb".to_vec()),
+                        always.clone(),
+                    ]
+                ),
+                (
+                    208,
+                    vec![name("f"), always, (tag::DIR_RENAME, dst_dir.clone())]
+                ),
+                (202, [vec![name("f")], dir.clone()].concat()),
+                (
+                    203,
+                    [
+                        vec![name("f")],
+                        dir.clone(),
+                        vec![(tag::HTXF_SIZE, u32_be(u32::MAX))],
+                    ]
+                    .concat()
+                ),
+                (210, [vec![name("d")], dir.clone()].concat()),
+                (
+                    213,
+                    [
+                        vec![name("d")],
+                        dir,
+                        vec![
+                            (tag::HTXF_SIZE, u32_be(u32::MAX)),
+                            (tag::FILE_NFILES, u32_be(2)),
+                        ],
+                    ]
+                    .concat()
+                ),
+            ],
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn files_are_named_back_as_a_listing_gave_them() {
+    // A server that never agreed to UTF-8: names go as Mac Roman, except
+    // one named by the bytes a listing gave, which go as they came.
+    let mut s = logging_in(Config::guest("me"));
+    s.feed(&login_reply(None, None), T0);
+    sent(&mut s);
+    events(&mut s);
+    let utf8 = "café".as_bytes();
+    assert_ne!(s.encode("café"), utf8);
+    s.file_info(&[], "café").unwrap();
+    s.file_info_raw(&[utf8], utf8).unwrap();
+    s.file_delete_raw(&[utf8], utf8).unwrap();
+    s.file_move_raw(&[], utf8, &[utf8]).unwrap();
+    let utf8_dir = [&[0, 1, 0, 0, 5][..], utf8].concat();
+    let got: Vec<_> = sent(&mut s).into_iter().map(|(_, _, f)| f).collect();
+    assert_eq!(
+        got,
+        [
+            vec![(tag::FILE_NAME, b"caf\x8e".to_vec())],
+            vec![
+                (tag::FILE_NAME, utf8.to_vec()),
+                (tag::DIR, utf8_dir.clone())
+            ],
+            vec![
+                (tag::FILE_NAME, utf8.to_vec()),
+                (tag::DIR, utf8_dir.clone())
+            ],
+            vec![
+                (tag::FILE_NAME, utf8.to_vec()),
+                (tag::DIR, vec![0, 0]),
+                (tag::DIR_RENAME, utf8_dir)
+            ],
+        ]
+    );
+
+    // A rename to the name it has goes as none, so that Janus keeps the
+    // comment; the name it has is the one on the wire.
+    s.file_set_info(&[], "x", Some("x"), Some("note")).unwrap();
+    s.file_set_info_raw(&[], b"caf\x8e", Some("café"), None)
+        .unwrap();
+    let got: Vec<_> = sent(&mut s).into_iter().map(|(_, _, f)| f).collect();
+    assert_eq!(
+        got,
+        [
+            vec![
+                (tag::FILE_NAME, b"x".to_vec()),
+                (tag::FILE_COMMENT, b"note".to_vec()),
+                (tag::DIR, vec![0, 0])
+            ],
+            vec![
+                (tag::FILE_NAME, b"caf\x8e".to_vec()),
+                (tag::DIR, vec![0, 0])
+            ],
+        ]
+    );
+}
+
+#[test]
+fn an_upload_says_its_exact_size_where_large_files_was_agreed() {
+    let mut s = logging_in(Config {
+        caps: cap::LARGE_FILES,
+        ..Config::guest("me")
+    });
+    s.feed(&login_reply(Some(190), Some(cap::LARGE_FILES)), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    s.file_upload(&[], "big", 6 << 30).unwrap();
+    assert_eq!(
+        sent(&mut s)[0].2,
+        [
+            (tag::FILE_NAME, b"big".to_vec()),
+            (tag::HTXF_SIZE, u32::MAX.to_be_bytes().to_vec()),
+            (tag::XFERSIZE64, (6u64 << 30).to_be_bytes().to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn a_queued_transfer_moving_is_an_event() {
+    let mut s = ready();
+    s.feed(
+        &server(
+            0xd3,
+            0,
+            0,
+            &[(tag::HTXF_REF, &[0, 0, 0, 77]), (tag::QUEUE, &[0, 0, 0, 1])],
+        ),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [Event::TransferQueued {
+            reference: 77,
+            queue: 1
+        }]
+    );
 }
 
 // ---- Raw mode ----------------------------------------------------------
@@ -1205,6 +1383,12 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
     );
     let quit = server(0x6f, 0, 0, &[(tag::BODY, b"Bye.")]);
     let news = server(0x66, 0, 0, &[(tag::NEWS, b"Up\rlate")]);
+    let queue = server(
+        0xd3,
+        0,
+        0,
+        &[(tag::HTXF_REF, &[0, 0, 0, 77]), (tag::QUEUE, &[0, 0, 0, 0])],
+    );
     let part = server(
         0x76,
         0,
@@ -1263,35 +1447,95 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
     let msg_whole = [whole(0x68, &msg), whole(0x6f, &quit)];
     let news_events = [Event::NewsPosted("Up\nlate".into())];
     let news_whole = [whole(0x66, &news)];
+    let files_events = [Event::TransferQueued {
+        reference: 77,
+        queue: 0,
+    }];
+    let files_whole = [whole(0xd3, &queue)];
     let cases = [
         (
             Handled::NONE,
-            [&chat_whole[..], &users_whole, &msg_whole, &news_whole].concat(),
+            [
+                &chat_whole[..],
+                &users_whole,
+                &msg_whole,
+                &news_whole,
+                &files_whole,
+            ]
+            .concat(),
         ),
         (
             Handled::CHAT,
-            [&chat_events[..], &users_whole, &msg_whole, &news_whole].concat(),
+            [
+                &chat_events[..],
+                &users_whole,
+                &msg_whole,
+                &news_whole,
+                &files_whole,
+            ]
+            .concat(),
         ),
         (
             Handled::USERS,
-            [&chat_whole[..], &user_events, &msg_whole, &news_whole].concat(),
+            [
+                &chat_whole[..],
+                &user_events,
+                &msg_whole,
+                &news_whole,
+                &files_whole,
+            ]
+            .concat(),
         ),
         (
             Handled::MSG,
-            [&chat_whole[..], &users_whole, &msg_events, &news_whole].concat(),
+            [
+                &chat_whole[..],
+                &users_whole,
+                &msg_events,
+                &news_whole,
+                &files_whole,
+            ]
+            .concat(),
         ),
         (
             Handled::NEWS,
-            [&chat_whole[..], &users_whole, &msg_whole, &news_events].concat(),
+            [
+                &chat_whole[..],
+                &users_whole,
+                &msg_whole,
+                &news_events,
+                &files_whole,
+            ]
+            .concat(),
         ),
         (
-            Handled::CHAT | Handled::USERS | Handled::MSG | Handled::NEWS,
-            [&chat_events[..], &user_events, &msg_events, &news_events].concat(),
+            Handled::FILES,
+            [
+                &chat_whole[..],
+                &users_whole,
+                &msg_whole,
+                &news_whole,
+                &files_events,
+            ]
+            .concat(),
+        ),
+        (
+            Handled::CHAT | Handled::USERS | Handled::MSG | Handled::NEWS | Handled::FILES,
+            [
+                &chat_events[..],
+                &user_events,
+                &msg_events,
+                &news_events,
+                &files_events,
+            ]
+            .concat(),
         ),
     ];
     for (handled, want) in cases {
         let mut s = raw_ready(handled, 0);
-        for frame in [&chat, &invite, &subject, &user, &part, &msg, &quit, &news] {
+        for frame in [
+            &chat, &invite, &subject, &user, &part, &msg, &quit, &news, &queue,
+        ] {
             s.feed(frame, T0);
         }
         assert_eq!(events(&mut s), want, "{handled:?}");
@@ -1638,6 +1882,176 @@ fn news_replies_expected_become_events() {
             Event::NewsArticle {
                 trans: article,
                 text: "café".into()
+            },
+            Event::Failed {
+                trans: refused,
+                reason: Some("Not allowed.".into())
+            },
+        ]
+    );
+}
+
+/// A UTF-8 comment longer than the field is cut, and the character the cut
+/// split is dropped rather than turning the rest into Mac Roman. One the
+/// field held whole is read whole, a Mac Roman ending that looks like the
+/// start of a UTF-8 character included.
+#[test]
+fn a_comment_reads_whole_unless_the_cut_split_a_character() {
+    let long = format!("{}\u{e9}", "a".repeat(254));
+    for (sent, want) in [
+        (long.as_bytes(), "a".repeat(254)),
+        (&b"Notes\xc9"[..], "Notes\u{2026}".to_string()),
+    ] {
+        let mut s = raw_ready(Handled::NONE, 0);
+        let info = s.take_trans();
+        s.expect(info, Expect::FileInfo).unwrap();
+        s.send_raw(&caller(206, info)).unwrap();
+        s.feed(&server(TASK, info, 0, &[(tag::FILE_COMMENT, sent)]), T0);
+        let ev = events(&mut s);
+        let [Event::FileInfo { info, .. }] = &ev[..] else {
+            panic!("{ev:?}");
+        };
+        assert_eq!(info.comment, want);
+    }
+}
+
+#[test]
+fn file_replies_expected_become_events() {
+    let mut s = raw_ready(Handled::NONE, 0);
+    let [list, info, change, get, folder, put, refused] = [(); 7].map(|_| s.take_trans());
+    for (t, what) in [
+        (list, Expect::FileList),
+        (info, Expect::FileInfo),
+        (change, Expect::FileChange),
+        (get, Expect::Transfer),
+        (folder, Expect::Transfer),
+        (put, Expect::Transfer),
+        (refused, Expect::FileChange),
+    ] {
+        s.expect(t, what).unwrap();
+        s.send_raw(&caller(200, t)).unwrap();
+    }
+    let created = [0x07, 0xea, 0, 0, 0, 0, 0, 60];
+    let modified = [0x07, 0xea, 0, 0, 0, 0, 1, 0];
+    let big = (6u64 << 30).to_be_bytes();
+    let mut rflt = vec![0u8; 74];
+    rflt[46..50].copy_from_slice(&100u32.to_be_bytes());
+    rflt[62..66].copy_from_slice(&7u32.to_be_bytes());
+    let file = entry(b"TEXT", b"ttxt", 5, 0, b"a");
+    s.feed(&server(TASK, list, 0, &[(0x00c8, &file)]), T0);
+    s.feed(
+        &server(
+            TASK,
+            info,
+            0,
+            &[
+                // A name ends at its first NUL; 0x8E is Mac Roman é.
+                (tag::FILE_NAME, b"caf\x8e\0\xff"),
+                (tag::FILE_TYPE, b"TEXT"),
+                (tag::FILE_CREATOR, b"ttxt"),
+                (tag::FILE_SIZE, &[0xff; 4]),
+                (tag::FILESIZE64, &big),
+                (tag::FILE_COMMENT, b"r\x8esum\x8e\rline"),
+                (tag::FILE_DATE_CREATE, &created),
+                (tag::FILE_DATE_MODIFY, &modified),
+            ],
+        ),
+        T0,
+    );
+    s.feed(&server(TASK, change, 0, &[]), T0);
+    s.feed(
+        &server(
+            TASK,
+            get,
+            0,
+            &[
+                (tag::HTXF_REF, &[0, 0, 0, 77]),
+                (tag::HTXF_SIZE, &[0xff; 4]),
+                (tag::XFERSIZE64, &big),
+                (tag::QUEUE, &[0, 0, 0, 2]),
+            ],
+        ),
+        T0,
+    );
+    s.feed(
+        &server(
+            TASK,
+            folder,
+            0,
+            &[
+                (tag::HTXF_REF, &[0, 0, 0, 78]),
+                (tag::HTXF_SIZE, &[0, 0, 0, 9]),
+                (tag::FILE_NFILES, &[0, 0, 0, 3]),
+            ],
+        ),
+        T0,
+    );
+    s.feed(
+        &server(
+            TASK,
+            put,
+            0,
+            &[(tag::HTXF_REF, &[0, 0, 0, 79]), (tag::RFLT, &rflt)],
+        ),
+        T0,
+    );
+    s.feed(
+        &server(TASK, refused, 1, &[(tag::TASK_ERROR, b"Not allowed.")]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::FileList {
+                trans: list,
+                files: vec![FileEntry {
+                    name: "a".into(),
+                    name_bytes: b"a".to_vec(),
+                    folder: false,
+                    size: 5,
+                    type_code: *b"TEXT",
+                    creator: *b"ttxt",
+                }]
+            },
+            Event::FileInfo {
+                trans: info,
+                info: FileInfo {
+                    name: "café".into(),
+                    kind: "TEXT".into(),
+                    creator: "ttxt".into(),
+                    comment: "résumé\nline".into(),
+                    size: 6 << 30,
+                    created,
+                    modified,
+                }
+            },
+            Event::FileChanged { trans: change },
+            Event::Transfer {
+                trans: get,
+                transfer: Transfer {
+                    reference: 77,
+                    size: 6 << 30,
+                    queue: 2,
+                    ..Transfer::default()
+                }
+            },
+            Event::Transfer {
+                trans: folder,
+                transfer: Transfer {
+                    reference: 78,
+                    size: 9,
+                    items: 3,
+                    ..Transfer::default()
+                }
+            },
+            Event::Transfer {
+                trans: put,
+                transfer: Transfer {
+                    reference: 79,
+                    data_from: 100,
+                    rsrc_from: 7,
+                    ..Transfer::default()
+                }
             },
             Event::Failed {
                 trans: refused,

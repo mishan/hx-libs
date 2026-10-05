@@ -6,7 +6,8 @@
 #![cfg(feature = "rig")]
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "hope")]
@@ -482,8 +483,13 @@ fn file_area(server: &str) -> Option<(&'static [&'static str], Option<&'static s
     }
 }
 
+/// Held by a test that changes the root folder, and by one that reads it
+/// twice and compares.
+static ROOT: Mutex<()> = Mutex::new(());
+
 #[test]
 fn files_list_on_every_server() {
+    let _root = ROOT.lock().unwrap_or_else(|e| e.into_inner());
     for (name, addr) in servers() {
         let mut c = Client::login(name, addr, &nick(name, "f"));
         let t = c.s.file_list(&[]).unwrap();
@@ -547,6 +553,212 @@ fn files_list_on_every_server() {
                 "{name}: {folder} holds what its entry said"
             );
         }
+    }
+}
+
+/// Claim the transfer `reference` on the transfer port and hang up, as
+/// a cancelled transfer does, and wait until the server has let it go:
+/// mhxd keeps a global transfer slot for good for a reference never
+/// claimed (GtkHx's `docs/mhxd-bugs.md`), and holds every transfer once
+/// twenty are gone.
+fn cancel_transfer(name: &str, addr: &str, reference: u32) {
+    let addr: SocketAddr = addr.parse().unwrap();
+    let xfer = SocketAddr::new(addr.ip(), addr.port() + 1);
+    let mut preamble = [0u8; 24];
+    let n = hxproto::build::build_htxf_preamble(&mut preamble, reference, 0, 0, 0, false);
+    let mut sock = TcpStream::connect(xfer).unwrap_or_else(|e| panic!("{name} at {xfer}: {e}"));
+    sock.write_all(&preamble[..n]).unwrap();
+    sock.shutdown(Shutdown::Write).unwrap();
+    sock.set_read_timeout(Some(WAIT)).unwrap();
+    let mut sink = [0u8; 4096];
+    loop {
+        match sock.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::ConnectionReset => break,
+            Err(e) => panic!("{name}: transfer {reference:#x} never closed: {e}"),
+        }
+    }
+}
+
+/// A request, sent.
+type Ask<'a> = dyn Fn(&mut Session) -> Result<u32, hxsession::Error> + 'a;
+
+/// The answer to the file request on `t`: its event, or its refusal.
+fn file_answer(c: &mut Client, t: u32) -> Event {
+    c.until("the answer", |e| match e {
+        Event::FileList { trans, .. }
+        | Event::FileInfo { trans, .. }
+        | Event::FileChanged { trans }
+        | Event::Transfer { trans, .. }
+        | Event::Failed { trans, .. } => *trans == t,
+        _ => false,
+    })
+}
+
+/// Files changed and transfers asked for, as an admin, in a scratch
+/// folder made at the root and deleted again; where there is no file
+/// area (hxd-ng), its refusals. The session offers no Text-Encoding, so
+/// its names go as Mac Roman, and one named by bytes alone goes back as
+/// the listing gave it. No transfer connection is opened: what is
+/// checked is the server's answer to the asking.
+#[test]
+fn files_change_and_transfers_are_asked_for_on_every_server() {
+    let _root = ROOT.lock().unwrap_or_else(|e| e.into_inner());
+    for (name, addr) in servers() {
+        let na = nick(name, "x");
+        let cfg = Config {
+            caps: cap::LARGE_FILES,
+            ..if name == "hxd-ng" {
+                Config::guest(&na)
+            } else {
+                Config::account(&na, "admin", "")
+            }
+        };
+        let mut c = Client::login_as(name, addr, Session::new(cfg, 0));
+        assert_eq!(c.s.server().unwrap().caps & cap::TEXT_ENCODING, 0, "{name}");
+        let scratch = format!("{na} files");
+        let root = [scratch.as_str()];
+        let changed = |c: &mut Client, t: u32, what: &str| {
+            let got = file_answer(c, t);
+            assert!(
+                matches!(got, Event::FileChanged { .. }),
+                "{name}: {what}: {got:?}"
+            );
+        };
+        let listed = |c: &mut Client, path: &[&str]| {
+            let t = c.s.file_list(path).unwrap();
+            match file_answer(c, t) {
+                Event::FileList { files, .. } => files,
+                got => panic!("{name}: {path:?} did not list: {got:?}"),
+            }
+        };
+
+        let t = c.s.file_mkdir(&[], &scratch).unwrap();
+        if file_area(name).is_none() {
+            // Each asked for once the one before is answered: `until`
+            // passes over what else came in the same read.
+            let mut refusals = vec![file_answer(&mut c, t)];
+            let asks: [&Ask; 8] = [
+                &|s| s.file_info(&[], "test.txt"),
+                &|s| s.file_delete(&[], &scratch),
+                &|s| s.file_set_info(&[], &scratch, Some("x"), Some("x")),
+                &|s| s.file_move(&[], &scratch, &["x"]),
+                &|s| s.file_download(&[], "test.txt"),
+                &|s| s.file_upload(&[], "up.txt", 5),
+                &|s| s.folder_download(&[], &scratch),
+                &|s| s.folder_upload(&[], &scratch, 5, 1),
+            ];
+            for ask in asks {
+                let t = ask(&mut c.s).unwrap();
+                refusals.push(file_answer(&mut c, t));
+            }
+            for got in refusals {
+                assert!(
+                    matches!(
+                        got,
+                        Event::Failed {
+                            reason: Some(_),
+                            ..
+                        }
+                    ),
+                    "{name}: {got:?}"
+                );
+            }
+            eprintln!("{name}: file changes and transfers refused");
+            continue;
+        }
+        changed(&mut c, t, "the scratch folder");
+        let t = c.s.file_mkdir(&root, "one").unwrap();
+        changed(&mut c, t, "a folder in it");
+        assert!(
+            listed(&mut c, &root)
+                .iter()
+                .any(|f| f.name == "one" && f.folder),
+            "{name}: one not listed"
+        );
+
+        let info = |c: &mut Client, item: &str| {
+            let t = c.s.file_info(&root, item).unwrap();
+            match file_answer(c, t) {
+                Event::FileInfo { info, .. } => info,
+                got => panic!("{name}: no info on {item}: {got:?}"),
+            }
+        };
+        assert_eq!(info(&mut c, "one").name, "one", "{name}");
+        let note = "a note\nline two, café";
+        let t = c.s.file_set_info(&root, "one", None, Some(note)).unwrap();
+        changed(&mut c, t, "the comment");
+        assert_eq!(info(&mut c, "one").comment, note, "{name}");
+        let t = c.s.file_set_info(&root, "one", Some("two"), None).unwrap();
+        changed(&mut c, t, "the rename");
+        let files = listed(&mut c, &root);
+        assert!(
+            files.iter().any(|f| f.name == "two") && files.iter().all(|f| f.name != "one"),
+            "{name}: not renamed: {files:?}"
+        );
+        let t = c.s.file_mkdir(&root, "dst").unwrap();
+        changed(&mut c, t, "the destination");
+        let t = c.s.file_move(&root, "two", &[&scratch, "dst"]).unwrap();
+        changed(&mut c, t, "the move");
+        assert!(
+            listed(&mut c, &[&scratch, "dst"])
+                .iter()
+                .any(|f| f.name == "two"),
+            "{name}: not moved"
+        );
+
+        // A name only Mac Roman spells, named back by its bytes.
+        let t =
+            c.s.file_mkdir_raw(&[scratch.as_bytes()], b"caf\x8e")
+                .unwrap();
+        changed(&mut c, t, "the Mac Roman folder");
+        let files = listed(&mut c, &root);
+        let cafe = files
+            .iter()
+            .find(|f| f.name == "café")
+            .unwrap_or_else(|| panic!("{name}: café not in {files:?}"));
+        assert_eq!(cafe.name_bytes, b"caf\x8e", "{name}");
+        let t =
+            c.s.file_info_raw(&[scratch.as_bytes()], &cafe.name_bytes)
+                .unwrap();
+        let got = file_answer(&mut c, t);
+        assert!(
+            matches!(&got, Event::FileInfo { info, .. } if info.name == "café"),
+            "{name}: {got:?}"
+        );
+        let t =
+            c.s.file_delete_raw(&[scratch.as_bytes()], &cafe.name_bytes)
+                .unwrap();
+        changed(&mut c, t, "the Mac Roman folder deleted");
+
+        let transfer = |c: &mut Client, t: u32, what: &str| match file_answer(c, t) {
+            Event::Transfer { transfer, .. } => {
+                assert_ne!(transfer.reference, 0, "{name}: {what}: {transfer:?}");
+                cancel_transfer(name, addr, transfer.reference);
+                transfer
+            }
+            got => panic!("{name}: {what}: {got:?}"),
+        };
+        // mhxd sends no reference for an empty folder: there is nothing
+        // to send.
+        let t = c.s.folder_download(&root, "dst").unwrap();
+        transfer(&mut c, t, "the folder download");
+        let t = c.s.folder_upload(&root, "up", 10, 1).unwrap();
+        transfer(&mut c, t, "the folder upload");
+        let t = c.s.file_download(&[], "test.txt").unwrap();
+        let got = transfer(&mut c, t, "the download");
+        assert_ne!(got.size, 0, "{name}: {got:?}");
+        let t = c.s.file_upload(&root, "up.txt", 5).unwrap();
+        transfer(&mut c, t, "the upload");
+
+        let t = c.s.file_delete(&[], &scratch).unwrap();
+        changed(&mut c, t, "the scratch folder deleted");
+        assert!(
+            listed(&mut c, &[]).iter().all(|f| f.name != scratch),
+            "{name}: {scratch:?} is still there"
+        );
+        eprintln!("{name}: files made, read, changed and deleted; transfers asked for");
     }
 }
 
