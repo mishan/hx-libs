@@ -266,6 +266,74 @@ pub fn news_article(path: &[&[u8]], id: u32) -> Option<Request> {
     Request::from_built(ClientHdr::GetThread, &chunks, hc)
 }
 
+/// POSTTHREAD (410): an article, in reply to `parent`, or 0 to start a
+/// thread; plain text, with no flags, as GtkHx posts it.
+pub fn news_post_article(
+    path: &[&[u8]],
+    parent: u32,
+    subject: &[u8],
+    text: &[u8],
+) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let mut chunks = [HxChunk::EMPTY; 6];
+    let mut scratch = [0u8; 8];
+    let req = build::NewsPostThreadRequest {
+        path: &encoded,
+        flags: 0,
+        mime_type: b"text/plain",
+        subject,
+        text,
+        thread_id: parent,
+    };
+    let hc = build::build_news_post_thread_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::PostThread, &chunks, hc)
+}
+
+/// DELETETHREAD (411): one article.
+pub fn news_delete_article(path: &[&[u8]], id: u32) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let mut scratch = [0u8; 4];
+    let req = build::NewsDeleteThreadRequest {
+        path: &encoded,
+        threadid: id,
+    };
+    let hc = build::build_news_delete_thread_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::DeleteThread, &chunks, hc)
+}
+
+/// DELNEWSDIRCAT (380): a bundle or a category.
+pub fn news_delete(path: &[&[u8]]) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let mut chunks = [HxChunk::EMPTY];
+    let hc = build::build_news_delete_chunks(&encoded, &mut chunks);
+    Request::from_built(ClientHdr::NewsDelete, &chunks, hc)
+}
+
+/// MAKENEWSDIR (381): bundle `name`, in the bundle at `path`.
+pub fn news_create_bundle(path: &[&[u8]], name: &[u8]) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let req = build::NewsMakeDirRequest {
+        path: &encoded,
+        name,
+    };
+    let hc = build::build_news_mkdir_chunks(&req, &mut chunks);
+    Request::from_built(ClientHdr::NewsMkdir, &chunks, hc)
+}
+
+/// MAKECATEGORY (382): category `name`, in the bundle at `path`.
+pub fn news_create_category(path: &[&[u8]], name: &[u8]) -> Option<Request> {
+    let encoded = self::path(path)?;
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let req = build::NewsMakeCategoryRequest {
+        path: &encoded,
+        name,
+    };
+    let hc = build::build_news_mkcat_chunks(&req, &mut chunks);
+    Request::from_built(ClientHdr::NewsMkCategory, &chunks, hc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

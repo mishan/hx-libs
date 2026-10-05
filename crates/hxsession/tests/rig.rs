@@ -308,6 +308,160 @@ fn news_answers_on_every_server() {
     }
 }
 
+/// Whether the request on `t`, which has nothing to say once it worked,
+/// worked: the user list asked for after it is answered after it, so no
+/// refusal by then means it did.
+fn worked(c: &mut Client, t: u32) -> Result<(), Option<String>> {
+    let list = c.s.user_list().unwrap();
+    match c.until("the answer", |e| {
+        matches!(e, Event::Failed { trans, .. } if *trans == t)
+            || matches!(e, Event::UserList { trans, .. } if *trans == list)
+    }) {
+        Event::Failed { reason, .. } => Err(reason),
+        _ => Ok(()),
+    }
+}
+
+/// Posting to news and changing it, as an admin, where the server has
+/// news; where it has none (hxd-ng), its refusals. Only what the test
+/// itself posts is checked: the long-lived rig's seed news drifts.
+#[test]
+fn news_posts_and_changes_on_every_server() {
+    for (name, addr) in servers() {
+        let (na, nb) = (nick(name, "p"), nick(name, "q"));
+        // The rig's hxd-ng has no admin account, and no news to refuse it.
+        let cfg = if name == "hxd-ng" {
+            Config::guest(&na)
+        } else {
+            Config::account(&na, "admin", "")
+        };
+        let mut a = Client::login_as(name, addr, Session::new(cfg, 0));
+        let mut b = Client::login(name, addr, &nb);
+        let refused = |c: &mut Client, t: u32, what: &str| {
+            let got = c.until(
+                what,
+                |e| matches!(e, Event::Failed { trans, .. } if *trans == t),
+            );
+            assert_eq!(name, "hxd-ng", "{name}: {what}: {got:?}");
+        };
+
+        // Flat news: a post reaches the others, and is in the file. The
+        // user list's answer says the server is done with b's agree, which
+        // a post that comes first can miss.
+        let t = b.s.user_list().unwrap();
+        b.until(
+            "b's user list",
+            |e| matches!(e, Event::UserList { trans, .. } if *trans == t),
+        );
+        let flat = format!("{na} was here, café");
+        let t = a.s.post_news(&flat).unwrap();
+        a.flush();
+        if name == "hxd-ng" {
+            refused(&mut a, t, "the flat post refused");
+        } else {
+            b.until(
+                "the flat post",
+                |e| matches!(e, Event::NewsPosted(text) if text.contains(&flat)),
+            );
+            let t = b.s.news_file().unwrap();
+            b.until(
+                "the flat news with the post",
+                |e| matches!(e, Event::NewsFile { trans, text } if *trans == t && text.contains(&flat)),
+            );
+        }
+
+        // Threaded news: a category made at the root, an article and a
+        // reply in it, read back, and all of it deleted again.
+        let cat = format!("{na} café");
+        let t = a.s.news_create_category(&[], &cat).unwrap();
+        let listed = |c: &mut Client| {
+            let t = c.s.news_listing(&[]).unwrap();
+            let Event::NewsListing { items, .. } = c.until(
+                "the root",
+                |e| matches!(e, Event::NewsListing { trans, .. } if *trans == t),
+            ) else {
+                unreachable!()
+            };
+            items.iter().any(|i| i.name == cat && !i.bundle)
+        };
+        if name == "hxd-ng" {
+            refused(&mut a, t, "the category refused");
+            eprintln!("{name}: news refused");
+            continue;
+        }
+        assert!(listed(&mut a), "{name}: {cat:?} not listed");
+        let subject = format!("{na}'s news");
+        let t =
+            a.s.news_post_article(&[&cat], 0, &subject, "one\ntwo, café")
+                .unwrap();
+        assert_eq!(worked(&mut a, t), Ok(()), "{name}");
+        let read = |c: &mut Client| {
+            let t = c.s.news_category(&[&cat]).unwrap();
+            let Event::NewsCategory { articles, .. } = c.until(
+                "the category",
+                |e| matches!(e, Event::NewsCategory { trans, .. } if *trans == t),
+            ) else {
+                unreachable!()
+            };
+            articles
+        };
+        let articles = read(&mut b);
+        let first = articles
+            .iter()
+            .find(|x| x.subject == subject)
+            .unwrap_or_else(|| panic!("{name}: {subject:?} not in {articles:?}"))
+            .clone();
+        assert_eq!(
+            (first.poster.as_str(), first.parent, &first.mime[..]),
+            (na.as_str(), 0, &b"text/plain"[..]),
+            "{name}"
+        );
+        let t = b.s.news_article(&[&cat], first.id).unwrap();
+        let got = b.until("the article", |e| {
+            matches!(e, Event::NewsArticle { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+        });
+        // mhxd ends it with a line break of its own.
+        assert!(
+            matches!(&got, Event::NewsArticle { text, .. } if text.trim_end() == "one\ntwo, café"),
+            "{name}: {got:?}"
+        );
+        let t =
+            a.s.news_post_article(&[&cat], first.id, "Re", "and three")
+                .unwrap();
+        assert_eq!(worked(&mut a, t), Ok(()), "{name}");
+        let articles = read(&mut b);
+        assert!(
+            articles
+                .iter()
+                .any(|x| x.parent == first.id && x.subject == "Re"),
+            "{name}: no reply in {articles:?}"
+        );
+        let t = a.s.news_delete_article(&[&cat], first.id).unwrap();
+        assert_eq!(worked(&mut a, t), Ok(()), "{name}");
+        assert!(
+            read(&mut b).iter().all(|x| x.id != first.id),
+            "{name}: the article is still there"
+        );
+        let t = a.s.news_delete(&[&cat]).unwrap();
+        assert_eq!(worked(&mut a, t), Ok(()), "{name}");
+        assert!(!listed(&mut a), "{name}: {cat:?} is still there");
+
+        let bundle = format!("{na} bundle");
+        let t = a.s.news_create_bundle(&[], &bundle).unwrap();
+        assert_eq!(worked(&mut a, t), Ok(()), "{name}");
+        let t = a.s.news_create_category(&[&bundle], "inside").unwrap();
+        assert_eq!(worked(&mut a, t), Ok(()), "{name}");
+        let t = b.s.news_listing(&[&bundle]).unwrap();
+        b.until(
+            "the bundle",
+            |e| matches!(e, Event::NewsListing { trans, items } if *trans == t && items.iter().any(|i| i.name == "inside")),
+        );
+        let t = a.s.news_delete(&[&bundle]).unwrap();
+        assert_eq!(worked(&mut a, t), Ok(()), "{name}");
+        eprintln!("{name}: flat and threaded news posted and read back");
+    }
+}
+
 /// What each rig server's file area holds at its root, by name, and a
 /// folder in it with something inside — or `None` where the server has
 /// no file area and says so. From GtkHx's rig seed (its
