@@ -2895,6 +2895,15 @@ mod tests {
     }
 
     #[test]
+    fn chat_invite_missing_chunks_default_zero() {
+        let m = msg(0x0000_0071, 1, 0, &[]);
+        let inv = parse_chat_invite(&m, m.len(), 31);
+        assert_eq!(inv.uid, 0);
+        assert_eq!(inv.cid, 0);
+        assert!(inv.name.is_empty());
+    }
+
+    #[test]
     fn chat_invite_strips_ansi_and_caps_name() {
         let mut n = vec![0x0eu8]; // folds to 'N'
         n.extend(vec![b'q'; 40]);
@@ -3097,11 +3106,24 @@ mod tests {
 
     #[test]
     fn user_change_rejects_wrong_length_color() {
-        // COLOR (Colored-Nicknames) must be exactly 4 bytes; a 2-byte
-        // payload leaves got_nick_color false and nick_color at NONE.
-        let m = msg(0x0000_012d, 1, 0, &chunk(tag::COLOR, &[0xff, 0x00]));
+        // COLOR (Colored-Nicknames) must be exactly 4 bytes; a shorter or
+        // longer payload leaves got_nick_color false and nick_color at NONE.
+        for color in [&[0xff, 0x00][..], &[0x00, 0xff, 0x88, 0x00, 0x00]] {
+            let m = msg(0x0000_012d, 1, 0, &chunk(tag::COLOR, color));
+            let uc = parse_user_change(&m, m.len(), 31);
+            assert!(!uc.got_nick_color, "{color:?}");
+            assert_eq!(uc.nick_color, NICK_COLOR_NONE, "{color:?}");
+        }
+    }
+
+    #[test]
+    fn user_change_explicit_none_color_is_got() {
+        // A client clearing its color sends NONE itself: present, unlike a
+        // missing chunk, so the receiver drops the color it had.
+        let none = NICK_COLOR_NONE.to_be_bytes();
+        let m = msg(0x0000_012d, 1, 0, &chunk(tag::COLOR, &none));
         let uc = parse_user_change(&m, m.len(), 31);
-        assert!(!uc.got_nick_color);
+        assert!(uc.got_nick_color);
         assert_eq!(uc.nick_color, NICK_COLOR_NONE);
     }
 
