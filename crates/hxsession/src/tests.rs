@@ -172,6 +172,82 @@ fn a_1_2_server_gets_the_name_in_a_user_change() {
 }
 
 #[test]
+fn logged_in_says_what_the_login_reply_did() {
+    use hxproto::inline_media::LimitsAdvertisement;
+    use hxproto::video::{Limits, VideoKind};
+    let camera = Limits {
+        kind: VideoKind::Camera,
+        max_width: 1280,
+        max_height: 720,
+        max_fps: 30,
+        max_bitrate: 1_500_000,
+        max_per_room: 8,
+    };
+    let screen = Limits {
+        kind: VideoKind::Screen,
+        max_width: 1920,
+        ..camera
+    };
+    let (camera_bytes, screen_bytes) = (camera.to_bytes(), screen.to_bytes());
+    let full: Vec<(u16, &[u8])> = vec![
+        (tag::UID, &[0, 7]),
+        (tag::VERSION, &[0, 197]),
+        (tag::SERVERNAME, b"Full\rHouse"),
+        (tag::CAPABILITIES, &[0x01, 0xff]),
+        (tag::CHAT_MEDIA_MAX_BYTES, &[0, 0, 4, 0]),
+        (tag::CHAT_MEDIA_CHUNK_SIZE, &[0, 0, 1, 0]),
+        // Short of the four bytes the field takes: not sent at all.
+        (tag::CHAT_MEDIA_MAX_PIXELS, &[1]),
+        (tag::HISTORY_MAX_MSGS, &[0, 0, 0, 50]),
+        (tag::HISTORY_MAX_DAYS, &[0, 0, 0, 0]),
+        (tag::VIDEO_LIMITS, &camera_bytes),
+        (tag::VIDEO_LIMITS, &screen_bytes),
+    ];
+    let cases = [
+        (
+            full,
+            ServerInfo {
+                version: 197,
+                name: Some("Full\nHouse".into()),
+                uid: Some(7),
+                // Only what was offered.
+                caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA,
+                media: LimitsAdvertisement {
+                    max_bytes: Some(1024),
+                    chunk_size: Some(256),
+                    ..LimitsAdvertisement::empty()
+                },
+                history_max_msgs: Some(50),
+                history_max_days: Some(0),
+                video: vec![camera, screen],
+            },
+        ),
+        // A 1.2 server: no version, no name, nothing of the extensions.
+        (
+            vec![],
+            ServerInfo {
+                version: 0,
+                name: None,
+                uid: None,
+                caps: 0,
+                media: LimitsAdvertisement::empty(),
+                history_max_msgs: None,
+                history_max_days: None,
+                video: vec![],
+            },
+        ),
+    ];
+    for (fields, want) in cases {
+        let mut s = logging_in(Config {
+            caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA,
+            ..Config::guest("me")
+        });
+        s.feed(&server(TASK, 1, 0, &fields), T0);
+        assert_eq!(events(&mut s)[0], Event::LoggedIn(want));
+    }
+}
+
+#[test]
 fn what_arrives_before_the_login_reply_waits_for_it() {
     let mut s = logging_in(Config::guest("me"));
     s.feed(&server(0x162, 0, 0, &[]), T0);
@@ -1133,6 +1209,24 @@ fn raw_hands_over_the_login_reply_and_what_came_before_it() {
         }
     );
     assert_eq!(ev.len(), 3);
+}
+
+#[test]
+fn raw_handling_the_login_hands_over_neither_its_reply_nor_its_refusal() {
+    let login = Config {
+        handled: Handled::LOGIN,
+        ..raw()
+    };
+    let mut s = logging_in(login.clone());
+    s.feed(&login_reply(Some(190), None), T0);
+    assert!(matches!(&events(&mut s)[..], [Event::LoggedIn(i)] if i.version == 190));
+
+    let mut s = logging_in(login);
+    s.feed(&server(TASK, 1, 1, &[(tag::TASK_ERROR, b"No.")]), T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::Closed(Closed::LoginRefused(Some("No.".into())))]
+    );
 }
 
 #[test]
