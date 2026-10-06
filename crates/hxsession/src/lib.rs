@@ -49,12 +49,12 @@
 //! the ciphers and compressors.
 //!
 //! Files are here as far as the control connection goes: listing, info,
-//! changes, and asking for a transfer, which the server answers with the
-//! reference a transfer connection opens with. That connection (HTXF) is
-//! not here, nor are the extensions other than chat history and the media
-//! a chat line carries (voice, video, uploading and fetching media, GIF
-//! icons). [`Session::request`] sends any transaction and hands its
-//! reply back whole, for what has no method of its own.
+//! changes, and asking for a transfer or the server's banner, which the
+//! server answers with the reference a transfer connection opens with.
+//! That connection (HTXF) is not here. Of the extensions, chat history,
+//! inline media and GIF icons are; voice and video are not.
+//! [`Session::request`] sends any transaction and hands its reply back
+//! whole, for what has no method of its own.
 
 pub mod frame;
 mod hope;
@@ -360,6 +360,26 @@ pub struct ChatMedia {
     pub bytes: Option<u32>,
 }
 
+/// A user's GIF icon. An empty `gif` is no icon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Icon {
+    pub uid: u16,
+    pub gif: Vec<u8>,
+}
+
+/// One part of a picture, under [`cap::INLINE_MEDIA`]: the parts, in
+/// order, are the picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaPart {
+    pub payload: Vec<u8>,
+    /// The MIME type, as the server sent it.
+    pub mime: Vec<u8>,
+    /// How many parts the picture is in.
+    pub parts: u16,
+    /// Whether this is the last.
+    pub last: bool,
+}
+
 /// One line of a chat's history, under [`cap::CHAT_HISTORY`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
@@ -436,9 +456,22 @@ pub enum Expect {
     /// A change to the files — a folder made, something deleted, moved or
     /// renamed, a comment set: an [`Event::FileChanged`].
     FileChange,
-    /// A download or an upload, of a file or a folder: an
-    /// [`Event::Transfer`].
+    /// A download or an upload, of a file or a folder, or the server's
+    /// banner: an [`Event::Transfer`].
     Transfer,
+    /// Every user's GIF icon: an [`Event::IconList`].
+    IconList,
+    /// One user's GIF icon: an [`Event::Icon`].
+    Icon,
+    /// Setting our GIF icon: nothing, once it worked.
+    IconSet,
+    /// One part of a picture going up: an [`Event::MediaUploading`], or for
+    /// the `last`, an [`Event::MediaUploaded`]. Any failure is an
+    /// [`Event::MediaFailed`].
+    MediaUpload { last: bool },
+    /// One part of a picture coming down: an [`Event::MediaPart`]. Any
+    /// failure is an [`Event::MediaFailed`].
+    MediaDownload,
 }
 
 /// Why the session ended. The caller closes the socket.
@@ -614,6 +647,41 @@ pub enum Event {
     NewsArticle {
         trans: u32,
         text: String,
+    },
+    /// Every user's GIF icon, as the server listed them.
+    IconList {
+        trans: u32,
+        icons: Vec<Icon>,
+    },
+    /// One user's GIF icon.
+    Icon {
+        trans: u32,
+        icon: Icon,
+    },
+    /// A part of a picture went up, and more are to follow; the token
+    /// they go on, when the server gave one.
+    MediaUploading {
+        trans: u32,
+        token: Option<Vec<u8>>,
+    },
+    /// A picture went up: the handle a chat line or a message attaches it
+    /// by, and what the server made of it.
+    MediaUploaded {
+        trans: u32,
+        media: ChatMedia,
+    },
+    /// A part of a picture came down.
+    MediaPart {
+        trans: u32,
+        part: MediaPart,
+    },
+    /// A picture's upload or download went wrong: the extension's code
+    /// for why, and the server's reason, if it gave one. A reply that
+    /// does not say what it should fails with neither.
+    MediaFailed {
+        trans: u32,
+        code: inline_media::MediaErrorCode,
+        reason: Option<String>,
     },
     /// A request that went wrong; the server's reason, if it gave one.
     Failed {
@@ -936,10 +1004,12 @@ impl Session {
                     // session's own agree, say) is nothing it can act on.
                     None | Some(Pending::Keepalive) => {}
                     Some(p) if self.cfg.raw && !matches!(p, Pending::Expected(_)) => {}
-                    Some(_) => self.events.push_back(Event::Failed {
+                    Some(p) => self.fail(
                         trans,
-                        reason: Some("the server's reply was cut short".into()),
-                    }),
+                        &p,
+                        inline_media::MediaErrorCode::Generic,
+                        Some("the server's reply was cut short".into()),
+                    ),
                 }
             }
             match next {
@@ -1480,6 +1550,82 @@ impl Session {
         )
     }
 
+    /// The server's banner, where it has one to send over a transfer
+    /// connection: the [`Event::Transfer`] that connection opens with.
+    pub fn banner(&mut self) -> Result<u32, Error> {
+        self.send_expecting(Some(request::banner()), Expect::Transfer)
+    }
+
+    /// Every user's GIF icon. A server without the extension may refuse
+    /// it, or never answer.
+    pub fn icon_list(&mut self) -> Result<u32, Error> {
+        self.send_expecting(Some(request::icon_list()), Expect::IconList)
+    }
+
+    /// `uid`'s GIF icon.
+    pub fn icon(&mut self, uid: u16) -> Result<u32, Error> {
+        self.send_expecting(request::icon(uid), Expect::Icon)
+    }
+
+    /// Our GIF icon becomes `gif`, or none when it is empty. The server
+    /// takes only a GIF.
+    pub fn icon_set(&mut self, gif: &[u8]) -> Result<u32, Error> {
+        self.send_expecting(request::icon_set(gif), Expect::IconSet)
+    }
+
+    /// A picture that goes up whole, `mime` its type if the caller knows
+    /// it: [`Event::MediaUploaded`]. Only where the server agreed to
+    /// [`cap::INLINE_MEDIA`].
+    pub fn media_upload(&mut self, payload: &[u8], mime: Option<&[u8]>) -> Result<u32, Error> {
+        self.send_media(
+            request::media_upload(payload, mime),
+            Expect::MediaUpload { last: true },
+        )
+    }
+
+    /// The first of the `parts` a larger picture goes up in: an
+    /// [`Event::MediaUploading`] with the token the rest go on.
+    pub fn media_upload_first(
+        &mut self,
+        payload: &[u8],
+        mime: Option<&[u8]>,
+        parts: u16,
+    ) -> Result<u32, Error> {
+        self.send_media(
+            request::media_upload_first(payload, mime, parts),
+            Expect::MediaUpload { last: false },
+        )
+    }
+
+    /// Part `index` of a picture after the first, on its `token`; the
+    /// `last` is answered with [`Event::MediaUploaded`].
+    pub fn media_upload_next(
+        &mut self,
+        token: &[u8],
+        payload: &[u8],
+        index: u16,
+        last: bool,
+    ) -> Result<u32, Error> {
+        self.send_media(
+            request::media_upload_next(token, payload, index, last),
+            Expect::MediaUpload { last },
+        )
+    }
+
+    /// The picture `id` names, or part `part` of it after the first: an
+    /// [`Event::MediaPart`].
+    pub fn media_download(&mut self, id: &[u8], part: Option<u16>) -> Result<u32, Error> {
+        self.send_media(request::media_download(id, part), Expect::MediaDownload)
+    }
+
+    fn send_media(&mut self, req: Option<Request>, what: Expect) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        if !self.agreed(cap::INLINE_MEDIA) {
+            return Err(Error::NotAgreed);
+        }
+        self.send_expecting(req, what)
+    }
+
     /// The trans for a transaction the caller builds itself, for
     /// [`Session::send_raw`]. Nothing else the session sends uses it.
     /// It may be taken before the login is answered: the caller can
@@ -1733,14 +1879,22 @@ impl Session {
             let reason = parse::parse_task_error(&t.buf, len, MAX_BODY).map(|r| self.decode(&r));
             // The keep-alive's own failures are noise: a server older than
             // 1.8.5 answers a ping with an error.
-            if pending != Some(Pending::Keepalive) {
-                self.events.push_back(Event::Failed {
+            match pending {
+                Some(Pending::Keepalive) => {}
+                Some(p) => {
+                    let code = inline_media::extract_error_code(
+                        hxproto::wire::ChunkIter::over_message(&t.buf, len),
+                    );
+                    self.fail(t.trans, &p, code, reason);
+                }
+                None => self.events.push_back(Event::Failed {
                     trans: t.trans,
                     reason,
-                });
+                }),
             }
             return;
         }
+        let chunks = || hxproto::wire::ChunkIter::over_message(&t.buf, len);
         match pending {
             Some(Pending::Expected(Expect::UserList)) => {
                 self.events.push_back(Event::UserList {
@@ -1942,6 +2096,72 @@ impl Session {
                     transfer,
                 });
             }
+            Some(Pending::Expected(Expect::IconList)) => {
+                let icons = hxproto::gif_icons::parse_icon_list(chunks())
+                    .map(|e| Icon {
+                        uid: e.uid,
+                        gif: e.gif.to_vec(),
+                    })
+                    .collect();
+                self.events.push_back(Event::IconList {
+                    trans: t.trans,
+                    icons,
+                });
+            }
+            Some(Pending::Expected(Expect::Icon)) => {
+                let ev = match hxproto::gif_icons::parse_icon_get_reply(chunks()) {
+                    Some(e) => Event::Icon {
+                        trans: t.trans,
+                        icon: Icon {
+                            uid: e.uid,
+                            gif: e.gif.to_vec(),
+                        },
+                    },
+                    None => Event::Failed {
+                        trans: t.trans,
+                        reason: None,
+                    },
+                };
+                self.events.push_back(ev);
+            }
+            Some(Pending::Expected(Expect::MediaUpload { last: false })) => {
+                let token = inline_media::parse_upload_token_reply(chunks()).map(<[u8]>::to_vec);
+                self.events.push_back(Event::MediaUploading {
+                    trans: t.trans,
+                    token,
+                });
+            }
+            Some(Pending::Expected(Expect::MediaUpload { last: true })) => {
+                let ev = match inline_media::parse_upload_final_reply(chunks()) {
+                    Some(r) => Event::MediaUploaded {
+                        trans: t.trans,
+                        media: ChatMedia {
+                            id: r.media_id.to_vec(),
+                            mime: r.media_type.to_vec(),
+                            width: r.width,
+                            height: r.height,
+                            bytes: r.bytes,
+                        },
+                    },
+                    None => malformed_media(t.trans),
+                };
+                self.events.push_back(ev);
+            }
+            Some(Pending::Expected(Expect::MediaDownload)) => {
+                let ev = match inline_media::parse_download_reply(chunks()) {
+                    Some(r) => Event::MediaPart {
+                        trans: t.trans,
+                        part: MediaPart {
+                            payload: r.payload.to_vec(),
+                            mime: r.media_type.to_vec(),
+                            parts: r.part_count,
+                            last: r.final_chunk,
+                        },
+                    },
+                    None => malformed_media(t.trans),
+                };
+                self.events.push_back(ev);
+            }
             Some(Pending::Raw) => self.events.push_back(Event::Reply {
                 trans: t.trans,
                 frame: t.buf,
@@ -1975,8 +2195,30 @@ impl Session {
             | Some(Pending::Expected(Expect::ChatInvite))
             | Some(Pending::Expected(Expect::Message))
             | Some(Pending::Expected(Expect::NewsChange))
+            | Some(Pending::Expected(Expect::IconSet))
             | None => {}
         }
+    }
+
+    /// The request `pending` on `trans` failed: a picture's with the
+    /// extension's `code`, any other plainly.
+    fn fail(
+        &mut self,
+        trans: u32,
+        pending: &Pending,
+        code: inline_media::MediaErrorCode,
+        reason: Option<String>,
+    ) {
+        self.events.push_back(match pending {
+            Pending::Expected(Expect::MediaUpload { .. } | Expect::MediaDownload) => {
+                Event::MediaFailed {
+                    trans,
+                    code,
+                    reason,
+                }
+            }
+            _ => Event::Failed { trans, reason },
+        });
     }
 
     fn login_reply(&mut self, t: Transaction) {
@@ -2271,6 +2513,15 @@ fn changed_user(c: &parse::UserChange) -> User {
         status: c.got_color.then_some(c.color),
         name: field_text(&c.name),
         color: c.got_nick_color.then_some(c.nick_color),
+    }
+}
+
+/// A picture's reply that lacks what it must carry.
+fn malformed_media(trans: u32) -> Event {
+    Event::MediaFailed {
+        trans,
+        code: inline_media::MediaErrorCode::Generic,
+        reason: None,
     }
 }
 

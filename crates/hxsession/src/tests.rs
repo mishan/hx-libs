@@ -2912,3 +2912,255 @@ mod hope {
         ));
     }
 }
+
+/// A session that agreed to inline media, with what logging in sent taken.
+fn media_ready() -> Session {
+    let mut s = logging_in(Config {
+        caps: cap::INLINE_MEDIA,
+        ..Config::guest("me")
+    });
+    s.feed(&login_reply(Some(190), Some(cap::INLINE_MEDIA)), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    events(&mut s);
+    s
+}
+
+#[test]
+fn extension_requests_go_as_gtkhx_sends_them() {
+    let mut s = media_ready();
+    s.banner().unwrap();
+    s.icon_list().unwrap();
+    s.icon(7).unwrap();
+    s.icon_set(b"GIF89a").unwrap();
+    s.icon_set(b"").unwrap();
+    s.media_upload(b"png", Some(b"image/png")).unwrap();
+    s.media_upload(b"png", None).unwrap();
+    s.media_upload_first(b"pn", Some(b"image/png"), 2).unwrap();
+    s.media_upload_next(b"tok", b"g", 1, true).unwrap();
+    s.media_download(b"id", None).unwrap();
+    s.media_download(b"id", Some(3)).unwrap();
+    let got: Vec<_> = sent(&mut s).into_iter().map(|(op, _, f)| (op, f)).collect();
+    let f = |t: u16, d: &[u8]| (t, d.to_vec());
+    assert_eq!(
+        got,
+        [
+            (212, vec![]),
+            (1861, vec![]),
+            (1863, vec![f(tag::UID, &[0, 7])]),
+            (1862, vec![f(tag::ICON_GIF, b"GIF89a")]),
+            (1862, vec![f(tag::ICON_GIF, b"")]),
+            (
+                750,
+                vec![
+                    f(tag::CHAT_MEDIA_PAYLOAD, b"png"),
+                    f(tag::CHAT_MEDIA_DECLARED_TYPE, b"image/png"),
+                    f(tag::CHAT_MEDIA_PART_FINAL, &[1]),
+                ]
+            ),
+            (
+                750,
+                vec![
+                    f(tag::CHAT_MEDIA_PAYLOAD, b"png"),
+                    f(tag::CHAT_MEDIA_PART_FINAL, &[1]),
+                ]
+            ),
+            (
+                750,
+                vec![
+                    f(tag::CHAT_MEDIA_PAYLOAD, b"pn"),
+                    f(tag::CHAT_MEDIA_DECLARED_TYPE, b"image/png"),
+                    f(tag::CHAT_MEDIA_PART_INDEX, &[0, 0]),
+                    f(tag::CHAT_MEDIA_PART_COUNT, &[0, 2]),
+                    f(tag::CHAT_MEDIA_PART_FINAL, &[0]),
+                ]
+            ),
+            (
+                750,
+                vec![
+                    f(tag::CHAT_MEDIA_UPLOAD_TOKEN, b"tok"),
+                    f(tag::CHAT_MEDIA_PART_INDEX, &[0, 1]),
+                    f(tag::CHAT_MEDIA_PAYLOAD, b"g"),
+                    f(tag::CHAT_MEDIA_PART_FINAL, &[1]),
+                ]
+            ),
+            (751, vec![f(tag::CHAT_MEDIA_ID, b"id")]),
+            (
+                751,
+                vec![
+                    f(tag::CHAT_MEDIA_ID, b"id"),
+                    f(tag::CHAT_MEDIA_PART_INDEX, &[0, 3]),
+                ]
+            ),
+        ]
+    );
+}
+
+#[test]
+fn media_waits_for_the_server_to_agree_to_it() {
+    let mut s = ready();
+    assert_eq!(s.media_download(b"id", None), Err(Error::NotAgreed));
+    assert_eq!(s.media_upload(b"png", None), Err(Error::NotAgreed));
+    assert!(sent(&mut s).is_empty());
+}
+
+#[test]
+fn extension_replies_expected_become_events() {
+    let mut s = raw_ready(Handled::NONE, cap::INLINE_MEDIA);
+    let [list, icon, cleared, set, part, up, down, refused, odd_icon, odd_up, odd_down] =
+        [(); 11].map(|_| s.take_trans());
+    for (t, what) in [
+        (list, Expect::IconList),
+        (icon, Expect::Icon),
+        (cleared, Expect::Icon),
+        (set, Expect::IconSet),
+        (part, Expect::MediaUpload { last: false }),
+        (up, Expect::MediaUpload { last: true }),
+        (down, Expect::MediaDownload),
+        (refused, Expect::MediaUpload { last: true }),
+        (odd_icon, Expect::Icon),
+        (odd_up, Expect::MediaUpload { last: true }),
+        (odd_down, Expect::MediaDownload),
+    ] {
+        s.expect(t, what).unwrap();
+        s.send_raw(&caller(750, t)).unwrap();
+    }
+    let entry = |uid: u16, gif: &[u8]| {
+        [
+            &uid.to_be_bytes()[..],
+            &(gif.len() as u16).to_be_bytes(),
+            gif,
+        ]
+        .concat()
+    };
+    let (a, b) = (entry(3, b"GIF89a"), entry(4, b""));
+    for (t, flag, fields) in [
+        (
+            list,
+            0,
+            vec![(tag::ICON_LIST, &a[..]), (tag::ICON_LIST, &b[..])],
+        ),
+        (
+            icon,
+            0,
+            vec![(tag::UID, &[0, 3][..]), (tag::ICON_GIF, b"GIF89a")],
+        ),
+        // Janus leaves the field out for a user with no icon.
+        (cleared, 0, vec![(tag::UID, &[0, 4][..])]),
+        (set, 0, vec![]),
+        (part, 0, vec![(tag::CHAT_MEDIA_UPLOAD_TOKEN, &b"tok"[..])]),
+        (
+            up,
+            0,
+            vec![
+                (tag::CHAT_MEDIA_ID, &b"id"[..]),
+                (tag::CHAT_MEDIA_TYPE, b"image/png"),
+                (tag::CHAT_MEDIA_WIDTH, &[0, 0, 0, 2]),
+            ],
+        ),
+        (
+            down,
+            0,
+            vec![
+                (tag::CHAT_MEDIA_PAYLOAD, &b"png"[..]),
+                (tag::CHAT_MEDIA_TYPE, b"image/png"),
+                (tag::CHAT_MEDIA_PART_COUNT, &[0, 2]),
+            ],
+        ),
+        (
+            refused,
+            1,
+            vec![
+                (tag::TASK_ERROR, &b"Too big."[..]),
+                (tag::CHAT_MEDIA_ERROR_CODE, &[0, 1]),
+            ],
+        ),
+        (odd_icon, 0, vec![]),
+        (odd_up, 0, vec![(tag::CHAT_MEDIA_ID, &b"id"[..])]),
+        (odd_down, 0, vec![(tag::CHAT_MEDIA_TYPE, &b"image/png"[..])]),
+    ] {
+        s.feed(&server(TASK, t, flag, &fields), T0);
+    }
+    let icon_of = |uid: u16, gif: &[u8]| Icon {
+        uid,
+        gif: gif.to_vec(),
+    };
+    let malformed = |trans| Event::MediaFailed {
+        trans,
+        code: inline_media::MediaErrorCode::Generic,
+        reason: None,
+    };
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::IconList {
+                trans: list,
+                icons: vec![icon_of(3, b"GIF89a"), icon_of(4, b"")],
+            },
+            Event::Icon {
+                trans: icon,
+                icon: icon_of(3, b"GIF89a"),
+            },
+            Event::Icon {
+                trans: cleared,
+                icon: icon_of(4, b""),
+            },
+            Event::MediaUploading {
+                trans: part,
+                token: Some(b"tok".to_vec()),
+            },
+            Event::MediaUploaded {
+                trans: up,
+                media: ChatMedia {
+                    id: b"id".to_vec(),
+                    mime: b"image/png".to_vec(),
+                    width: Some(2),
+                    height: None,
+                    bytes: None,
+                },
+            },
+            Event::MediaPart {
+                trans: down,
+                part: MediaPart {
+                    payload: b"png".to_vec(),
+                    mime: b"image/png".to_vec(),
+                    parts: 2,
+                    last: false,
+                },
+            },
+            Event::MediaFailed {
+                trans: refused,
+                code: inline_media::MediaErrorCode::PayloadTooLarge,
+                reason: Some("Too big.".into()),
+            },
+            Event::Failed {
+                trans: odd_icon,
+                reason: None,
+            },
+            malformed(odd_up),
+            malformed(odd_down),
+        ]
+    );
+}
+
+#[test]
+fn a_picture_whose_reply_is_cut_short_fails_as_a_picture() {
+    let mut s = media_ready();
+    let t = s.media_download(b"id", None).unwrap();
+    let whole = &server(TASK, t, 0, &[(tag::CHAT_MEDIA_PAYLOAD, &[0; 40])])[20..];
+    // The first part, then the same trans starting over with a different
+    // size: the first can never finish.
+    for total in [whole.len() as u32, whole.len() as u32 + 1] {
+        let mut f = Vec::new();
+        for word in [TASK, t, 0, total, 20] {
+            f.extend_from_slice(&word.to_be_bytes());
+        }
+        f.extend_from_slice(&whole[..20]);
+        s.feed(&f, T0);
+    }
+    assert!(events(&mut s).contains(&Event::MediaFailed {
+        trans: t,
+        code: inline_media::MediaErrorCode::Generic,
+        reason: Some("the server's reply was cut short".into()),
+    }));
+}

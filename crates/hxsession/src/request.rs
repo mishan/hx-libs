@@ -6,6 +6,7 @@
 //! its bytes.
 
 use hxproto::build::{self, HxChunk, PackChunk};
+use hxproto::inline_media;
 use hxproto::messages::{tag, ClientHdr};
 
 /// One request: the transaction type and its fields, in order.
@@ -527,6 +528,81 @@ pub fn news_create_category(path: &[&[u8]], name: &[u8]) -> Option<Request> {
     };
     let hc = build::build_news_mkcat_chunks(&req, &mut chunks);
     Request::from_built(ClientHdr::NewsMkCategory, &chunks, hc)
+}
+
+/// DOWNLOAD_BANNER (212): the server's banner, for a transfer connection
+/// to fetch. No fields.
+pub fn banner() -> Request {
+    Request::new(ClientHdr::DownloadBanner as u32)
+}
+
+/// ICON_GETLIST (1861): every user's GIF icon. No fields.
+pub fn icon_list() -> Request {
+    Request::new(ClientHdr::IconGetList as u32)
+}
+
+/// ICON_GET (1863): `uid`'s GIF icon.
+pub fn icon(uid: u16) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY; 1];
+    let mut scratch = [0u8; 2];
+    let hc = hxproto::gif_icons::build_icon_get_chunks(uid, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::IconGet, &chunks, hc)
+}
+
+/// ICON_SET (1862): our GIF icon; an empty one clears it.
+pub fn icon_set(gif: &[u8]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY; 1];
+    let hc = hxproto::gif_icons::build_icon_set_chunks(gif, &mut chunks);
+    Request::from_built(ClientHdr::IconSet, &chunks, hc)
+}
+
+/// UPLOAD_MEDIA (750): a picture small enough to go whole.
+pub fn media_upload(payload: &[u8], mime: Option<&[u8]>) -> Option<Request> {
+    let req = inline_media::UploadMediaSingle {
+        payload,
+        declared_type: mime,
+    };
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 3], [0u8; 1]);
+    let hc = inline_media::build_upload_media_single_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::UploadMedia, &chunks, hc)
+}
+
+/// UPLOAD_MEDIA (750): the first of the `parts` a picture goes in.
+pub fn media_upload_first(payload: &[u8], mime: Option<&[u8]>, parts: u16) -> Option<Request> {
+    let req = inline_media::UploadMediaFirst {
+        payload,
+        declared_type: mime,
+        part_count: parts,
+    };
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 5], [0u8; 5]);
+    let hc = inline_media::build_upload_media_first_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::UploadMedia, &chunks, hc)
+}
+
+/// UPLOAD_MEDIA (750): part `index` of a picture, after the first, on the
+/// `token` the first's reply gave.
+pub fn media_upload_next(token: &[u8], payload: &[u8], index: u16, last: bool) -> Option<Request> {
+    let req = inline_media::UploadMediaFollowup {
+        upload_token: token,
+        payload,
+        part_index: index,
+        final_chunk: last,
+    };
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 4], [0u8; 3]);
+    let hc = inline_media::build_upload_media_followup_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::UploadMedia, &chunks, hc)
+}
+
+/// DOWNLOAD_MEDIA (751): the picture `id` names, or part `part` of it
+/// after the first.
+pub fn media_download(id: &[u8], part: Option<u16>) -> Option<Request> {
+    let req = inline_media::DownloadMedia {
+        media_id: id,
+        part_index: part,
+    };
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 2], [0u8; 2]);
+    let hc = inline_media::build_download_media_chunks(&req, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::DownloadMedia, &chunks, hc)
 }
 
 #[cfg(test)]
