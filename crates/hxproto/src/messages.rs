@@ -120,6 +120,14 @@ pub enum ClientHdr {
     /// PART_FINAL on the server side).
     /// `TranDownloadMedia` = 751 (`0x02EF`).
     DownloadMedia = 0x0000_02ef,
+    /// GIF-icons extension (fogWraith `GIF-Icons.md`): every
+    /// user's avatar. No fields.
+    IconGetList = 0x0000_0745,
+    /// GIF-icons extension: set our avatar to an [`tag::ICON_GIF`]; an
+    /// empty one clears it.
+    IconSet = 0x0000_0746,
+    /// GIF-icons extension: one user's avatar, by [`tag::UID`].
+    IconGet = 0x0000_0747,
 }
 
 /// Server → client transaction opcodes (`HTLS_HDR_*`).

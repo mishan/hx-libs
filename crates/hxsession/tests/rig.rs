@@ -1075,6 +1075,165 @@ fn chat_invitations_subjects_history_and_media_on_every_server() {
     }
 }
 
+/// A 1×1 GIF89a.
+const GIF: &[u8] = &[
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+];
+
+impl Client {
+    /// As [`Client::until`], but `None` once `wait` has passed with no
+    /// such event: for a server that may never answer.
+    fn within(&mut self, wait: Duration, want: impl Fn(&Event) -> bool) -> Option<Event> {
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if let Some(e) = self.step().into_iter().find(|e| want(e)) {
+                return Some(e);
+            }
+        }
+        None
+    }
+}
+
+/// The banner, GIF icons, and a picture up and down again, on the
+/// servers that have each. A server without the GIF-icons extension may
+/// refuse its requests or never answer them; one without a banner to
+/// send over a transfer connection refuses it, or grants nothing.
+#[test]
+fn banners_icons_and_pictures_on_every_server() {
+    for (name, addr) in servers() {
+        let (na, nb) = (nick(name, "i"), nick(name, "j"));
+        let session = |nick: &str| {
+            Session::new(
+                Config {
+                    caps: cap::INLINE_MEDIA,
+                    ..Config::guest(nick)
+                },
+                0,
+            )
+        };
+        let mut a = Client::login_as(name, addr, session(&na));
+        let mut b = Client::login_as(name, addr, session(&nb));
+
+        // A server whose banner is a URL may not answer at all.
+        let t = a.s.banner().unwrap();
+        match a.within(Duration::from_secs(3), |e| {
+            matches!(e, Event::Transfer { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+        }) {
+            Some(Event::Transfer { transfer, .. }) if transfer.reference != 0 => {
+                assert_ne!(transfer.size, 0, "{name}: a banner of no size");
+                cancel_transfer(name, addr, transfer.reference);
+                eprintln!("{name}: a banner of {} bytes", transfer.size);
+            }
+            e => eprintln!(
+                "{name}: no banner to fetch: {}",
+                e.as_ref().map_or("no answer".into(), summary)
+            ),
+        }
+
+        let t = a.s.icon_list().unwrap();
+        let answered = |trans: u32| {
+            move |e: &Event| {
+                matches!(e, Event::IconList { trans: t, .. } | Event::Icon { trans: t, .. }
+                    | Event::Failed { trans: t, .. } if *t == trans)
+            }
+        };
+        match a.within(Duration::from_secs(3), answered(t)) {
+            Some(Event::IconList { .. }) => {}
+            other => {
+                eprintln!(
+                    "{name}: no GIF icons: {}",
+                    other.as_ref().map_or("no answer".into(), summary)
+                );
+                continue;
+            }
+        }
+        let a_uid = uid_of(&mut b, &na);
+        let icon = |b: &mut Client| {
+            let t = b.s.icon(a_uid).unwrap();
+            match b.until("the icon", answered(t)) {
+                Event::Icon { icon, .. } => icon,
+                e => panic!("{name}: {}", summary(&e)),
+            }
+        };
+        a.s.icon_set(GIF).unwrap();
+        a.flush();
+        // The server tells everyone of the change, the one who made it too.
+        a.until("the icon set", |e| {
+            matches!(e, Event::Unhandled { opcode: 1864, .. })
+        });
+        assert_eq!(icon(&mut b).gif, GIF, "{name}");
+        let t = b.s.icon_list().unwrap();
+        let Event::IconList { icons, .. } = b.until("the icons", answered(t)) else {
+            panic!("{name}: the icons were refused")
+        };
+        assert!(
+            icons.iter().any(|i| i.uid == a_uid && i.gif == GIF),
+            "{name}: {na}'s icon not in {icons:?}"
+        );
+        a.s.icon_set(b"").unwrap();
+        a.flush();
+        a.until("the icon cleared", |e| {
+            matches!(e, Event::Unhandled { opcode: 1864, .. })
+        });
+        assert!(icon(&mut b).gif.is_empty(), "{name}: the icon stayed");
+        eprintln!("{name}: a GIF icon set, read, listed and cleared");
+
+        if a.s.server().unwrap().caps & cap::INLINE_MEDIA == 0 {
+            continue;
+        }
+        let pictured = |trans: u32| {
+            move |e: &Event| {
+                matches!(e, Event::MediaUploaded { trans: t, .. } | Event::MediaPart { trans: t, .. }
+                    | Event::MediaFailed { trans: t, .. } if *t == trans)
+            }
+        };
+        let t = a.s.media_upload(PNG, Some(b"image/png")).unwrap();
+        let Event::MediaUploaded { media, .. } = a.until("the upload", pictured(t)) else {
+            panic!("{name}: the picture was refused")
+        };
+        assert!(media.mime.starts_with(b"image/"), "{name}: {media:?}");
+        // Whoever sees the picture on a chat line may fetch it.
+        let line = format!("{na} pictured");
+        let chat = Request::new(105)
+            .field(tag::BODY, line.as_bytes())
+            .field(tag::CHAT_MEDIA_ID, media.id.clone())
+            .field(tag::CHAT_MEDIA_TYPE, media.mime.clone());
+        a.s.request(&chat).unwrap();
+        a.flush();
+        b.until(
+            "the line with the picture",
+            |e| matches!(e, Event::Chat { text, .. } if text.contains(&line)),
+        );
+        let mut got = Vec::new();
+        let mut part = None;
+        loop {
+            let t = b.s.media_download(&media.id, part).unwrap();
+            let Event::MediaPart { part: p, .. } = b.until("the picture", pictured(t)) else {
+                panic!("{name}: the download was refused")
+            };
+            got.extend_from_slice(&p.payload);
+            if p.last {
+                break;
+            }
+            part = Some(part.map_or(1, |n| n + 1));
+            assert!(
+                part.unwrap() < p.parts,
+                "{name}: more parts than {}",
+                p.parts
+            );
+        }
+        assert!(got.starts_with(b"\x89PNG"), "{name}: not a PNG");
+
+        let t = a.s.media_upload(&[0; 1024], None).unwrap();
+        let Event::MediaFailed { code, reason, .. } = a.until("the refusal", pictured(t)) else {
+            panic!("{name}: a picture of zeros went up")
+        };
+        eprintln!("{name}: a picture up and down; zeros refused ({code:?}, {reason:?})");
+    }
+}
+
 fn summary(e: &Event) -> String {
     match e {
         Event::NewsFile { text, .. } => format!("{} bytes", text.len()),
