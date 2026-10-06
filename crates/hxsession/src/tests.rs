@@ -949,6 +949,51 @@ fn file_requests_go_as_gtkhx_sends_them() {
 }
 
 #[test]
+fn user_requests_go_as_gtkhx_sends_them() {
+    let mut s = ready();
+    s.kick(5, false).unwrap();
+    s.kick(5, true).unwrap();
+    s.broadcast("caf\u{e9}").unwrap();
+    s.account_read(b"bob").unwrap();
+    s.account_save(b"bob", b"", b"Bob", 0x8000_0000_0000_0001)
+        .unwrap();
+    s.account_create(b"bob", b"pw", b"Bob", 0).unwrap();
+    s.account_delete(b"bob").unwrap();
+    let bob: Vec<u8> = b"bob".iter().map(|b| !b).collect();
+    let access = |a: u64| (tag::ACCESS, a.to_be_bytes().to_vec());
+    let got: Vec<_> = sent(&mut s).into_iter().map(|(op, _, f)| (op, f)).collect();
+    assert_eq!(
+        got,
+        [
+            (110, vec![(tag::UID, vec![0, 5])]),
+            (110, vec![(tag::BAN, vec![0, 1]), (tag::UID, vec![0, 5])]),
+            // The server agreed to UTF-8.
+            (355, vec![(tag::BODY, "caf\u{e9}".as_bytes().to_vec())]),
+            (352, vec![(tag::LOGIN, b"bob".to_vec())]),
+            (
+                353,
+                vec![
+                    (tag::LOGIN, bob.clone()),
+                    (tag::PASSWORD, vec![0]),
+                    (tag::NAME, b"Bob".to_vec()),
+                    access(0x8000_0000_0000_0001),
+                ]
+            ),
+            (
+                350,
+                vec![
+                    (tag::LOGIN, bob.clone()),
+                    (tag::PASSWORD, vec![!b'p', !b'w']),
+                    (tag::NAME, b"Bob".to_vec()),
+                    access(0),
+                ]
+            ),
+            (351, vec![(tag::LOGIN, bob)]),
+        ]
+    );
+}
+
+#[test]
 fn files_are_named_back_as_a_listing_gave_them() {
     // A server that never agreed to UTF-8: names go as Mac Roman, except
     // one named by the bytes a listing gave, which go as they came.
@@ -1395,6 +1440,7 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
         0,
         &[(tag::UID, &[0, 5]), (tag::CHAT_ID, &[0, 0, 0, 9])],
     );
+    let me = server(0x162, 0, 0, &[(tag::ACCESS, &[0x80, 0, 0, 0, 0, 0, 0, 1])]);
     let whole = |opcode: u32, frame: &[u8]| Event::Unhandled {
         opcode,
         frame: frame.to_vec(),
@@ -1428,13 +1474,19 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
             },
         },
         Event::UserLeft { cid: 9, uid: 5 },
+        Event::SelfInfo {
+            uid: None,
+            icon: None,
+            access: Some(0x8000_0000_0000_0001),
+            color: None,
+        },
     ];
     let chat_whole = [
         whole(0x6a, &chat),
         whole(0x71, &invite),
         whole(0x77, &subject),
     ];
-    let users_whole = [whole(0x12d, &user), whole(0x76, &part)];
+    let users_whole = [whole(0x12d, &user), whole(0x76, &part), whole(0x162, &me)];
     let msg_events = [
         Event::Message {
             uid: 5,
@@ -1534,7 +1586,7 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
     for (handled, want) in cases {
         let mut s = raw_ready(handled, 0);
         for frame in [
-            &chat, &invite, &subject, &user, &part, &msg, &quit, &news, &queue,
+            &chat, &invite, &subject, &user, &part, &me, &msg, &quit, &news, &queue,
         ] {
             s.feed(frame, T0);
         }
@@ -2364,6 +2416,136 @@ fn only_a_raw_caller_expects_and_only_on_its_own_trans() {
     let mine = s.take_trans();
     assert_eq!(s.expect(mine, Expect::ChatInvite), Ok(()));
     assert_eq!(s.expect(mine, Expect::ChatInvite), Err(Error::InUse));
+}
+
+/// A transaction's fields, as [`server`] takes them.
+type Fields<'a> = &'a [(u16, &'a [u8])];
+
+#[test]
+fn self_info_says_only_what_the_server_sent() {
+    let me = [&[0, 7, 0, 9, 0, 0, 0, 2][..], b"me"].concat();
+    let none = Event::SelfInfo {
+        uid: None,
+        icon: None,
+        access: None,
+        color: None,
+    };
+    let cases: [(Fields, Event); 5] = [
+        (&[], none.clone()),
+        (
+            &[
+                (tag::ACCESS, &[0, 0, 0, 0, 0, 0, 1, 2]),
+                (tag::USER_LIST, &me),
+                (tag::COLOR, &[0, 0x11, 0x22, 0x33]),
+            ],
+            Event::SelfInfo {
+                uid: Some(7),
+                icon: Some(9),
+                access: Some(0x0102),
+                color: Some(0x112233),
+            },
+        ),
+        // Each field the wrong length is no field at all.
+        (&[(tag::ACCESS, &[0; 7])], none.clone()),
+        (&[(tag::USER_LIST, &me[..7])], none.clone()),
+        (&[(tag::COLOR, &[0; 3])], none),
+    ];
+    for (fields, want) in cases {
+        let mut s = raw_ready(Handled::USERS, 0);
+        s.feed(&server(0x162, 0, 0, fields), T0);
+        assert_eq!(events(&mut s), [want], "{fields:?}");
+    }
+}
+
+#[test]
+fn user_replies_expected_become_events() {
+    let mut s = raw_ready(Handled::NONE, 0);
+    let [info, kick, account, bare, change, refused] = [(); 6].map(|_| s.take_trans());
+    for (t, what) in [
+        (info, Expect::UserInfo),
+        (kick, Expect::Kick),
+        (account, Expect::Account),
+        (bare, Expect::Account),
+        (change, Expect::AccountChange),
+        (refused, Expect::Kick),
+    ] {
+        s.expect(t, what).unwrap();
+        s.send_raw(&caller(303, t)).unwrap();
+    }
+    let obfuscated = |b: &[u8]| b.iter().map(|x| !x).collect::<Vec<u8>>();
+    s.feed(
+        &server(
+            TASK,
+            info,
+            0,
+            &[(tag::NAME, b"Ren\x8e"), (tag::BODY, b"idle\rhere")],
+        ),
+        T0,
+    );
+    s.feed(&server(TASK, kick, 0, &[]), T0);
+    s.feed(
+        &server(
+            TASK,
+            account,
+            0,
+            &[
+                (tag::NAME, b"Ren\x8e"),
+                (tag::LOGIN, &obfuscated(b"ren\x8e")),
+                (tag::PASSWORD, &obfuscated(b"pw")),
+                (tag::ACCESS, &[0x80, 0, 0, 0, 0, 0, 0, 1]),
+            ],
+        ),
+        T0,
+    );
+    // No password is a single zero byte.
+    s.feed(
+        &server(
+            TASK,
+            bare,
+            0,
+            &[(tag::LOGIN, &obfuscated(b"x")), (tag::PASSWORD, &[0])],
+        ),
+        T0,
+    );
+    s.feed(&server(TASK, change, 0, &[]), T0);
+    s.feed(
+        &server(TASK, refused, 1, &[(tag::TASK_ERROR, b"Not allowed.")]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::UserInfo {
+                trans: info,
+                name: "René".into(),
+                info: "idle\nhere".into(),
+            },
+            Event::Kicked { trans: kick },
+            Event::Account {
+                trans: account,
+                account: Account {
+                    login: b"ren\x8e".to_vec(),
+                    name: b"Ren\x8e".to_vec(),
+                    password: b"pw".to_vec(),
+                    access: Some(0x8000_0000_0000_0001),
+                },
+            },
+            Event::Account {
+                trans: bare,
+                account: Account {
+                    login: b"x".to_vec(),
+                    name: Vec::new(),
+                    password: Vec::new(),
+                    access: None,
+                },
+            },
+            Event::AccountChanged { trans: change },
+            Event::Failed {
+                trans: refused,
+                reason: Some("Not allowed.".into()),
+            },
+        ]
+    );
 }
 
 #[test]

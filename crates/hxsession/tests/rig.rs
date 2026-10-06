@@ -122,16 +122,27 @@ impl Client {
     }
 
     fn login_as(name: &'static str, addr: &str, s: Session) -> Client {
+        Client::login_seeing(name, addr, s).0
+    }
+
+    /// As [`Client::login_as`], with every event up to the session being
+    /// ready.
+    fn login_seeing(name: &'static str, addr: &str, s: Session) -> (Client, Vec<Event>) {
         let mut c = Client::connect(name, addr, s);
-        let first = c.until("the agreement or readiness", |e| {
-            matches!(e, Event::Agreement(_) | Event::Ready)
-        });
-        // An agreement with text waits for the user, who here agrees.
-        if let Event::Agreement(_) = first {
-            c.s.agree().unwrap();
-            c.until("the session to be ready", |e| matches!(e, Event::Ready));
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + WAIT;
+        while !seen.iter().any(|e| matches!(e, Event::Ready)) {
+            for e in c.step() {
+                // An agreement with text waits for the user, who here
+                // agrees.
+                if let Event::Agreement(_) = e {
+                    c.s.agree().unwrap();
+                }
+                seen.push(e);
+            }
+            assert!(Instant::now() < deadline, "{name}: never ready");
         }
-        c
+        (c, seen)
     }
 }
 
@@ -151,6 +162,24 @@ fn uid_of(c: &mut Client, nick: &str) -> u16 {
             return u.uid;
         }
         assert!(Instant::now() < deadline, "{}: {nick} never listed", c.name);
+    }
+}
+
+/// Wait until `nick` has left, as the user list `c` asks for says.
+fn until_gone(c: &mut Client, nick: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let t = c.s.user_list().unwrap();
+        let Event::UserList { users, .. } = c.until(
+            "the user list",
+            |e| matches!(e, Event::UserList { trans, .. } if *trans == t),
+        ) else {
+            unreachable!()
+        };
+        if users.iter().all(|u| u.name != nick) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{}: {nick} never left", c.name);
     }
 }
 
@@ -235,9 +264,7 @@ fn a_broadcast_reaches_everyone_on_every_server() {
         let mut b = Client::login(name, addr, &nb);
 
         let text = format!("{nb}: rebooting, café");
-        let t =
-            a.s.request(&Request::new(0x163).field(tag::BODY, text.clone().into_bytes()))
-                .unwrap();
+        let t = a.s.broadcast(&text).unwrap();
         let deadline = Instant::now() + WAIT;
         let outcome = 'wait: loop {
             for e in b.step() {
@@ -266,6 +293,126 @@ fn a_broadcast_reaches_everyone_on_every_server() {
             );
         };
         eprintln!("{name}: broadcast {outcome}");
+    }
+}
+
+/// What the server says of us and of another user, a kick refused and
+/// one that worked, and an account made, read, changed and deleted, as an
+/// admin; where there is no admin (hxd-ng), the refusals. The servers
+/// that give our uid in the login reply leave it out of the self-info.
+#[test]
+fn users_kicks_and_accounts_on_every_server() {
+    for (name, addr) in servers() {
+        let (na, nb) = (nick(name, "k"), nick(name, "v"));
+        let admin = name != "hxd-ng";
+        let cfg = if admin {
+            Config::account(&na, "admin", "")
+        } else {
+            Config::guest(&na)
+        };
+        let (mut a, seen) = Client::login_seeing(name, addr, Session::new(cfg, 0));
+        let me = match seen
+            .into_iter()
+            .find(|e| matches!(e, Event::SelfInfo { .. }))
+        {
+            Some(e) => e,
+            None => a.until("our self-info", |e| matches!(e, Event::SelfInfo { .. })),
+        };
+        let Event::SelfInfo { uid, access, .. } = me else {
+            unreachable!()
+        };
+        assert!(access.is_some(), "{name}: no access in {me:?}");
+        let a_uid = uid_of(&mut a, &na);
+        assert!(uid.is_none_or(|u| u == a_uid), "{name}: {me:?}");
+
+        let mut b = Client::login(name, addr, &nb);
+        let b_uid = uid_of(&mut a, &nb);
+        let t = a.s.user_info(b_uid).unwrap();
+        a.until(
+            "b's info",
+            |e| matches!(e, Event::UserInfo { trans, name, .. } if *trans == t && *name == nb),
+        );
+
+        let t = b.s.kick(a_uid, false).unwrap();
+        b.until(
+            "a guest's kick refused",
+            |e| matches!(e, Event::Failed { trans, reason: Some(_) } if *trans == t),
+        );
+        let t = a.s.kick(b_uid, false).unwrap();
+        if !admin {
+            a.until(
+                "the kick refused",
+                |e| matches!(e, Event::Failed { trans, reason: Some(_) } if *trans == t),
+            );
+            // Account requests are refused too; one is enough, as each
+            // costs a guest towards hxd-ng's flood limit.
+            let t = a.s.account_read(b"guest").unwrap();
+            a.until(
+                "the account refused",
+                |e| matches!(e, Event::Failed { trans, reason: Some(_) } if *trans == t),
+            );
+            eprintln!("{name}: self-info, user info, kicks and accounts refused");
+            continue;
+        }
+        // b leaves, before the kick is answered or after it.
+        let (mut kicked, mut left) = (false, false);
+        let deadline = Instant::now() + WAIT;
+        while !(kicked && left) {
+            for e in a.step() {
+                kicked |= matches!(e, Event::Kicked { trans } if trans == t);
+                left |= matches!(e, Event::UserLeft { uid, .. } if uid == b_uid);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name}: kicked {kicked}, left {left}"
+            );
+        }
+        drop(b);
+
+        let login = format!("hx{}{}", std::process::id() % 100_000, &name[..2]);
+        let read = |a: &mut Client| {
+            let t = a.s.account_read(login.as_bytes()).unwrap();
+            match a.until("the account", |e| {
+                matches!(e, Event::Account { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+            }) {
+                Event::Account { account, .. } => Some(account),
+                _ => None,
+            }
+        };
+        let access = 0x6060_0c00_0000_0000;
+        // 0x8E is Mac Roman é, and comes back as it went.
+        let t =
+            a.s.account_create(login.as_bytes(), b"pw", b"Ren\x8e", access)
+                .unwrap();
+        assert_eq!(changed(&mut a, t), Ok(()), "{name}: create");
+        let got = read(&mut a).unwrap_or_else(|| panic!("{name}: not made"));
+        assert_eq!(
+            (&got.login[..], &got.name[..], got.access),
+            (login.as_bytes(), &b"Ren\x8e"[..], Some(access)),
+            "{name}"
+        );
+        // No password leaves the one it had.
+        let t = a.s.account_save(login.as_bytes(), b"", b"Ren", 0).unwrap();
+        assert_eq!(changed(&mut a, t), Ok(()), "{name}: save");
+        let got = read(&mut a).unwrap_or_else(|| panic!("{name}: gone"));
+        assert_eq!(
+            (&got.name[..], got.access),
+            (&b"Ren"[..], Some(0)),
+            "{name}"
+        );
+        let nu = nick(name, "u");
+        Client::login_as(
+            name,
+            addr,
+            Session::new(Config::account(&nu, &login, "pw"), 0),
+        );
+        // Deleted only once no one is logged in with it: mhxd can crash
+        // deleting an account in use (GtkHx's docs/mhxd-bugs.md).
+        until_gone(&mut a, &nu);
+        let t = a.s.account_delete(login.as_bytes()).unwrap();
+        assert_eq!(changed(&mut a, t), Ok(()), "{name}: delete");
+        assert_eq!(read(&mut a), None, "{name}: still there");
+        eprintln!("{name}: self-info, user info, kicks and an account");
     }
 }
 
@@ -317,6 +464,16 @@ fn worked(c: &mut Client, t: u32) -> Result<(), Option<String>> {
     match c.until("the answer", |e| {
         matches!(e, Event::Failed { trans, .. } if *trans == t)
             || matches!(e, Event::UserList { trans, .. } if *trans == list)
+    }) {
+        Event::Failed { reason, .. } => Err(reason),
+        _ => Ok(()),
+    }
+}
+
+/// Whether an account change on `t` worked, as its own answer says.
+fn changed(c: &mut Client, t: u32) -> Result<(), Option<String>> {
+    match c.until("the answer", |e| {
+        matches!(e, Event::Failed { trans, .. } | Event::AccountChanged { trans } if *trans == t)
     }) {
         Event::Failed { reason, .. } => Err(reason),
         _ => Ok(()),
