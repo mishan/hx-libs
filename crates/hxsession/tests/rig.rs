@@ -1406,3 +1406,82 @@ fn hope_logs_in_and_chats_on_every_server_that_has_it() {
         eprintln!("{what}: login, user list, chat both ways");
     }
 }
+
+/// How each voice request on `ts` was answered: done, or refused with
+/// the server's reason.
+fn outcomes(c: &mut Client, ts: &[u32]) -> Vec<Result<(), Option<String>>> {
+    let got = std::cell::RefCell::new(std::collections::HashMap::new());
+    c.until("the answers", |e| {
+        match e {
+            Event::VoiceDone { trans } => got.borrow_mut().insert(*trans, Ok(())),
+            Event::Failed { trans, reason } => got.borrow_mut().insert(*trans, Err(reason.clone())),
+            _ => None,
+        };
+        ts.iter().all(|t| got.borrow().contains_key(t))
+    });
+    let mut got = got.into_inner();
+    ts.iter().map(|t| got.remove(t).unwrap()).collect()
+}
+
+/// Voice and video's requests on the servers that have them (Janus and
+/// hxd-ng): joined, with the server's offer; muted and unmuted; a camera
+/// started, paused, subscriptions set and the camera stopped; left; and
+/// a start and a join for rooms the user is not in, refused. No answer
+/// goes back, so no media flows.
+#[test]
+fn voice_and_video_on_every_server_that_has_them() {
+    use hxproto::video::VideoKind;
+    for (name, addr) in servers() {
+        let s = Session::new(
+            Config {
+                caps: cap::VOICE | cap::VIDEO,
+                ..Config::guest(&nick(name, "v"))
+            },
+            0,
+        );
+        let mut c = Client::login_as(name, addr, s);
+        if c.s.server().unwrap().caps & cap::VOICE == 0 {
+            assert!(!["janus", "hxd-ng"].contains(&name), "{name}: no voice");
+            eprintln!("{name}: no voice or video");
+            continue;
+        }
+        let t = c.s.voice_join(0).unwrap();
+        match c.until("the join", |e| {
+            matches!(e, Event::VoiceJoined { trans, .. } | Event::Failed { trans, .. } if *trans == t)
+        }) {
+            Event::VoiceJoined {
+                cid,
+                sdp,
+                codec,
+                participants,
+                ..
+            } => {
+                assert_eq!(cid, 0, "{name}");
+                assert!(sdp.starts_with(b"v=0"), "{name}: an offer that isn't SDP");
+                assert_eq!(codec, b"PCMU", "{name}");
+                assert_eq!(participants.len() % 6, 0, "{name}: {participants:?}");
+            }
+            e => panic!("{name}: {}", summary(&e)),
+        }
+        let ts = [
+            c.s.voice_mute(0, true).unwrap(),
+            c.s.voice_mute(0, false).unwrap(),
+            c.s.video_start(0, VideoKind::Camera).unwrap(),
+            c.s.video_state(0, VideoKind::Camera, true).unwrap(),
+            c.s.video_subscribe(0, &[]).unwrap(),
+            c.s.video_stop(0, None).unwrap(),
+            c.s.voice_leave(0).unwrap(),
+        ];
+        assert_eq!(outcomes(&mut c, &ts), vec![Ok(()); ts.len()], "{name}");
+        let ts = [
+            c.s.video_start(7, VideoKind::Screen).unwrap(),
+            c.s.voice_join(99).unwrap(),
+        ];
+        for (t, refused) in ts.iter().zip(outcomes(&mut c, &ts)) {
+            match refused {
+                Err(Some(why)) => eprintln!("{name}: {t} refused: {why}"),
+                r => panic!("{name}: {t} was not refused with a reason: {r:?}"),
+            }
+        }
+    }
+}

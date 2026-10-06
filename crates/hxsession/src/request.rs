@@ -8,6 +8,8 @@
 use hxproto::build::{self, HxChunk, PackChunk};
 use hxproto::inline_media;
 use hxproto::messages::{tag, ClientHdr};
+use hxproto::video::{self, VideoKind};
+use hxproto::voice;
 
 /// One request: the transaction type and its fields, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -603,6 +605,74 @@ pub fn media_download(id: &[u8], part: Option<u16>) -> Option<Request> {
     let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 2], [0u8; 2]);
     let hc = inline_media::build_download_media_chunks(&req, &mut chunks, &mut scratch);
     Request::from_built(ClientHdr::DownloadMedia, &chunks, hc)
+}
+
+/// VOICE_JOIN (600): voice in chat `cid`, 0 the public chat.
+pub fn voice_join(cid: u32) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 1], [0u8; 4]);
+    let hc = voice::build_voice_join_chunks(cid, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VoiceJoin, &chunks, hc)
+}
+
+/// VOICE_LEAVE (601).
+pub fn voice_leave(cid: u32) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 1], [0u8; 4]);
+    let hc = voice::build_voice_leave_chunks(cid, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VoiceLeave, &chunks, hc)
+}
+
+/// VOICE_SDP_ANSWER (603): our answer to the server's offer for chat
+/// `cid`. An empty answer is refused.
+pub fn voice_answer(cid: u32, sdp: &[u8]) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 2], [0u8; 4]);
+    let hc = voice::build_voice_answer_chunks(cid, sdp, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VoiceSdpAnswer, &chunks, hc)
+}
+
+/// VOICE_ICE (604): one of our ICE candidates for chat `cid`, as the
+/// extension's JSON; empty when we have no more.
+pub fn voice_ice(cid: u32, ice: &[u8]) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 2], [0u8; 4]);
+    let hc = voice::build_voice_ice_chunks(cid, ice, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VoiceIce, &chunks, hc)
+}
+
+/// VOICE_MUTE (606): whether we are muted in chat `cid`.
+pub fn voice_mute(cid: u32, muted: bool) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 2], [0u8; 6]);
+    let hc = voice::build_voice_mute_chunks(cid, muted.into(), &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VoiceMute, &chunks, hc)
+}
+
+/// VIDEO_START (607): publish a `kind` of video in chat `cid`.
+pub fn video_start(cid: u32, kind: VideoKind) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 2], [0u8; 6]);
+    let hc = video::build_video_start_chunks(cid, kind, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VideoStart, &chunks, hc)
+}
+
+/// VIDEO_STOP (608): stop publishing `kind` in chat `cid`, or with `None`
+/// everything we publish there.
+pub fn video_stop(cid: u32, kind: Option<VideoKind>) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 2], [0u8; 6]);
+    let hc = video::build_video_stop_chunks(cid, kind, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VideoStop, &chunks, hc)
+}
+
+/// VIDEO_STATE (609): pause or resume what we publish of `kind`.
+pub fn video_state(cid: u32, kind: VideoKind, paused: bool) -> Option<Request> {
+    let (mut chunks, mut scratch) = ([HxChunk::EMPTY; 3], [0u8; 8]);
+    let hc = video::build_video_state_chunks(cid, kind, paused, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VideoState, &chunks, hc)
+}
+
+/// VIDEO_SUBSCRIBE (610): every stream we want to see in chat `cid`;
+/// empty for none.
+pub fn video_subscribe(cid: u32, streams: &[video::Stream]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY; 2];
+    let mut scratch = vec![0u8; video::video_subscribe_scratch_len(streams.len())];
+    let hc = video::build_video_subscribe_chunks(cid, streams, &mut chunks, &mut scratch);
+    Request::from_built(ClientHdr::VideoSubscribe, &chunks, hc)
 }
 
 #[cfg(test)]

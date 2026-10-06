@@ -3258,3 +3258,150 @@ fn a_picture_whose_reply_is_cut_short_fails_as_a_picture() {
         reason: Some("the server's reply was cut short".into()),
     }));
 }
+
+// ---- Voice and video -------------------------------------------------------
+
+/// A session that agreed to `caps`, offering voice and video, with what
+/// logging in sent taken.
+fn voice_ready(caps: u16) -> Session {
+    let mut s = logging_in(Config {
+        caps: cap::VOICE | cap::VIDEO,
+        ..Config::guest("me")
+    });
+    s.feed(&login_reply(Some(190), Some(caps)), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    events(&mut s);
+    s
+}
+
+#[test]
+fn voice_requests_go_as_gtkhx_sends_them() {
+    use hxproto::video::{Stream, VideoKind};
+    let mut s = voice_ready(cap::VOICE | cap::VIDEO);
+    s.voice_join(0).unwrap();
+    s.voice_leave(7).unwrap();
+    s.voice_answer(3, b"v=0\r\n").unwrap();
+    s.voice_ice(9, b"{}").unwrap();
+    s.voice_ice(9, b"").unwrap();
+    s.voice_mute(4, true).unwrap();
+    s.video_start(9, VideoKind::Screen).unwrap();
+    s.video_stop(4, None).unwrap();
+    s.video_stop(4, Some(VideoKind::Camera)).unwrap();
+    s.video_state(4, VideoKind::Camera, true).unwrap();
+    let streams = [Stream {
+        user_id: 5,
+        kind: VideoKind::Camera,
+    }];
+    s.video_subscribe(3, &streams).unwrap();
+    s.video_subscribe(3, &[]).unwrap();
+    // An empty answer is no answer.
+    assert_eq!(s.voice_answer(3, b""), Err(Error::Malformed));
+    let got: Vec<_> = sent(&mut s).into_iter().map(|(op, _, f)| (op, f)).collect();
+    let f = |t: u16, d: &[u8]| (t, d.to_vec());
+    let room = |cid: u8| f(tag::CHAT_ID, &[0, 0, 0, cid]);
+    assert_eq!(
+        got,
+        [
+            (600, vec![room(0)]),
+            (601, vec![room(7)]),
+            (603, vec![room(3), f(tag::VOICE_SDP, b"v=0\r\n")]),
+            (604, vec![room(9), f(tag::VOICE_ICE, b"{}")]),
+            (604, vec![room(9), f(tag::VOICE_ICE, b"")]),
+            (606, vec![room(4), f(tag::VOICE_MUTED, &[0, 1])]),
+            (607, vec![room(9), f(tag::VIDEO_KIND, &[0, 2])]),
+            (608, vec![room(4)]),
+            (608, vec![room(4), f(tag::VIDEO_KIND, &[0, 1])]),
+            (
+                609,
+                vec![
+                    room(4),
+                    f(tag::VIDEO_KIND, &[0, 1]),
+                    f(tag::VIDEO_PAUSED, &[0, 1])
+                ]
+            ),
+            (
+                610,
+                vec![room(3), f(tag::VIDEO_SUBSCRIPTIONS, &[0, 5, 0, 1])]
+            ),
+            (610, vec![room(3), f(tag::VIDEO_SUBSCRIPTIONS, b"")]),
+        ]
+    );
+}
+
+#[test]
+fn voice_and_video_wait_for_the_server_to_agree_to_them() {
+    use hxproto::video::VideoKind;
+    let mut s = voice_ready(0);
+    assert_eq!(s.voice_join(0), Err(Error::NotAgreed));
+    assert_eq!(s.voice_ice(0, b""), Err(Error::NotAgreed));
+    let mut s = voice_ready(cap::VOICE);
+    assert_eq!(s.video_start(0, VideoKind::Camera), Err(Error::NotAgreed));
+    // Video without voice is not video: the extension needs both.
+    let mut s = voice_ready(cap::VIDEO);
+    assert_eq!(s.video_stop(0, None), Err(Error::NotAgreed));
+    assert!(sent(&mut s).is_empty());
+}
+
+#[test]
+fn voice_replies_expected_become_events() {
+    let mut s = voice_ready(cap::VOICE | cap::VIDEO);
+    let joined = s.voice_join(2).unwrap();
+    let odd = s.voice_join(2).unwrap();
+    let muted = s.voice_mute(2, true).unwrap();
+    let refused = s.voice_leave(2).unwrap();
+    let blob = [0, 3, 0, 0, 0, 0];
+    s.feed(
+        &server(
+            TASK,
+            joined,
+            0,
+            &[
+                (tag::CHAT_ID, &[0, 0, 0, 2]),
+                (tag::VOICE_SDP, b"v=0\r\n"),
+                (tag::VOICE_CODEC, b"PCMU"),
+                (tag::VOICE_PARTICIPANTS, &blob),
+            ],
+        ),
+        T0,
+    );
+    // No codec: not the reply the extension describes.
+    s.feed(
+        &server(
+            TASK,
+            odd,
+            0,
+            &[
+                (tag::VOICE_SDP, b"v=0\r\n"),
+                (tag::VOICE_PARTICIPANTS, &blob),
+            ],
+        ),
+        T0,
+    );
+    s.feed(&server(TASK, muted, 0, &[]), T0);
+    s.feed(
+        &server(TASK, refused, 1, &[(tag::TASK_ERROR, b"Not in voice.")]),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::VoiceJoined {
+                trans: joined,
+                cid: 2,
+                sdp: b"v=0\r\n".to_vec(),
+                codec: b"PCMU".to_vec(),
+                participants: blob.to_vec(),
+            },
+            Event::Failed {
+                trans: odd,
+                reason: None,
+            },
+            Event::VoiceDone { trans: muted },
+            Event::Failed {
+                trans: refused,
+                reason: Some("Not in voice.".into()),
+            },
+        ]
+    );
+}
