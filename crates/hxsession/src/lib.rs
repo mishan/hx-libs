@@ -52,7 +52,9 @@
 //! changes, and asking for a transfer or the server's banner, which the
 //! server answers with the reference a transfer connection opens with.
 //! That connection (HTXF) is not here. Of the extensions, chat history,
-//! inline media and GIF icons are; voice and video are not.
+//! inline media and GIF icons are, and voice and video's requests; what
+//! voice and video send unasked (the offers, candidates and who is in the
+//! room) arrives whole, as [`Event::Unhandled`].
 //! [`Session::request`] sends any transaction and hands its reply back
 //! whole, for what has no method of its own.
 
@@ -66,6 +68,7 @@ use hxproto::dispatch::{route, HandlerKind};
 use hxproto::inline_media;
 use hxproto::messages::{tag, ClientHdr};
 use hxproto::parse;
+use hxproto::video::VideoKind;
 
 use frame::{FrameError, FrameReader, Transaction};
 use request::Request;
@@ -87,6 +90,8 @@ pub mod cap {
     pub const VOICE: u16 = 0x0004;
     pub const INLINE_MEDIA: u16 = 0x0008;
     pub const CHAT_HISTORY: u16 = 0x0010;
+    /// Never agreed without [`VOICE`].
+    pub const VIDEO: u16 = 0x0400;
 }
 
 /// The trans the login goes out on, as GtkHx sends it.
@@ -483,6 +488,12 @@ pub enum Expect {
     /// One part of a picture coming down: an [`Event::MediaPart`]. Any
     /// failure is an [`Event::MediaFailed`].
     MediaDownload,
+    /// Joining voice in chat `cid`: an [`Event::VoiceJoined`].
+    VoiceJoin { cid: u32 },
+    /// Any other voice or video request that has a reply — leaving, an
+    /// answer, muting, and video's start, stop, state and subscriptions:
+    /// an [`Event::VoiceDone`].
+    Voice,
 }
 
 /// Why the session ended. The caller closes the socket.
@@ -694,6 +705,21 @@ pub enum Event {
         code: inline_media::MediaErrorCode,
         reason: Option<String>,
     },
+    /// The reply to joining voice in chat `cid`: the server's SDP offer,
+    /// the codec it chose, and who is in the room, as the server sent
+    /// them. hxproto's `voice::parse_voice_participants` reads the last.
+    /// A reply without all three fails with no reason.
+    VoiceJoined {
+        trans: u32,
+        cid: u32,
+        sdp: Vec<u8>,
+        codec: Vec<u8>,
+        participants: Vec<u8>,
+    },
+    /// A voice or video request other than a join went through.
+    VoiceDone {
+        trans: u32,
+    },
     /// A request that went wrong; the server's reason, if it gave one.
     Failed {
         trans: u32,
@@ -729,7 +755,8 @@ pub enum Error {
     /// [`Session::agree`] with no agreement waiting for an answer.
     NoAgreement,
     /// [`Session::send_raw`] given something that is not one whole
-    /// transaction.
+    /// transaction, or a request with nothing in it that must have
+    /// something: an empty SDP answer.
     Malformed,
     /// The server did not agree to the capability the request needs.
     NotAgreed,
@@ -1629,6 +1656,86 @@ impl Session {
         self.send_media(request::media_download(id, part), Expect::MediaDownload)
     }
 
+    /// Join voice in chat `cid`, 0 the public chat: an
+    /// [`Event::VoiceJoined`]. Only where the server agreed to
+    /// [`cap::VOICE`], as for every voice request.
+    pub fn voice_join(&mut self, cid: u32) -> Result<u32, Error> {
+        let r = request::voice_join(cid);
+        self.send_voice(cap::VOICE, r, Some(Expect::VoiceJoin { cid }))
+    }
+
+    pub fn voice_leave(&mut self, cid: u32) -> Result<u32, Error> {
+        let r = request::voice_leave(cid);
+        self.send_voice(cap::VOICE, r, Some(Expect::Voice))
+    }
+
+    /// Our SDP answer to the offer the server made for chat `cid`; an
+    /// empty one is [`Error::Malformed`].
+    pub fn voice_answer(&mut self, cid: u32, sdp: &[u8]) -> Result<u32, Error> {
+        if sdp.is_empty() {
+            return Err(Error::Malformed);
+        }
+        let r = request::voice_answer(cid, sdp);
+        self.send_voice(cap::VOICE, r, Some(Expect::Voice))
+    }
+
+    /// One of our ICE candidates, as the extension's JSON; empty when there
+    /// are no more. The server never answers one.
+    pub fn voice_ice(&mut self, cid: u32, ice: &[u8]) -> Result<u32, Error> {
+        self.send_voice(cap::VOICE, request::voice_ice(cid, ice), None)
+    }
+
+    pub fn voice_mute(&mut self, cid: u32, muted: bool) -> Result<u32, Error> {
+        let r = request::voice_mute(cid, muted);
+        self.send_voice(cap::VOICE, r, Some(Expect::Voice))
+    }
+
+    /// Publish `kind` of video in chat `cid`. The offer that carries it
+    /// arrives unasked. Video's requests go only where the server agreed
+    /// to [`cap::VIDEO`].
+    pub fn video_start(&mut self, cid: u32, kind: VideoKind) -> Result<u32, Error> {
+        let r = request::video_start(cid, kind);
+        self.send_voice(cap::VIDEO, r, Some(Expect::Voice))
+    }
+
+    /// Stop publishing `kind` in chat `cid`, or everything with `None`.
+    pub fn video_stop(&mut self, cid: u32, kind: Option<VideoKind>) -> Result<u32, Error> {
+        let r = request::video_stop(cid, kind);
+        self.send_voice(cap::VIDEO, r, Some(Expect::Voice))
+    }
+
+    pub fn video_state(&mut self, cid: u32, kind: VideoKind, paused: bool) -> Result<u32, Error> {
+        let r = request::video_state(cid, kind, paused);
+        self.send_voice(cap::VIDEO, r, Some(Expect::Voice))
+    }
+
+    /// Every stream we want to see in chat `cid`, replacing what was
+    /// asked for before; empty for none.
+    pub fn video_subscribe(
+        &mut self,
+        cid: u32,
+        streams: &[hxproto::video::Stream],
+    ) -> Result<u32, Error> {
+        let r = request::video_subscribe(cid, streams);
+        self.send_voice(cap::VIDEO, r, Some(Expect::Voice))
+    }
+
+    /// A voice or video request, only where the server agreed to `bit` (and
+    /// so to voice, which video needs).
+    fn send_voice(
+        &mut self,
+        bit: u16,
+        req: Option<Request>,
+        what: Option<Expect>,
+    ) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        if !self.agreed(bit) || !self.agreed(cap::VOICE) {
+            return Err(Error::NotAgreed);
+        }
+        let r = req.ok_or(Error::TooLong)?;
+        Ok(self.send(&r, what.map(Pending::Expected)))
+    }
+
     fn send_media(&mut self, req: Option<Request>, what: Expect) -> Result<u32, Error> {
         self.ensure_ready()?;
         if !self.agreed(cap::INLINE_MEDIA) {
@@ -2172,6 +2279,26 @@ impl Session {
                     None => malformed_media(t.trans),
                 };
                 self.events.push_back(ev);
+            }
+            Some(Pending::Expected(Expect::VoiceJoin { cid })) => {
+                let r = hxproto::voice::parse_voice_join_reply(&t.buf, len);
+                let ev = match (r.sdp, r.codec, r.participants) {
+                    (Some(sdp), Some(codec), Some(participants)) => Event::VoiceJoined {
+                        trans: t.trans,
+                        cid,
+                        sdp: sdp.to_vec(),
+                        codec: codec.to_vec(),
+                        participants: participants.to_vec(),
+                    },
+                    _ => Event::Failed {
+                        trans: t.trans,
+                        reason: None,
+                    },
+                };
+                self.events.push_back(ev);
+            }
+            Some(Pending::Expected(Expect::Voice)) => {
+                self.events.push_back(Event::VoiceDone { trans: t.trans });
             }
             Some(Pending::Raw) => self.events.push_back(Event::Reply {
                 trans: t.trans,
