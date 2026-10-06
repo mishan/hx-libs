@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use hxhope::{Cipher, Compression};
 use hxproto::messages::tag;
 use hxsession::request::Request;
-use hxsession::{cap, Config, Event, Session};
+use hxsession::{cap, Config, Event, Handled, Session};
 
 const SERVERS: &[(&str, &str)] = &[
     ("mhxd", "127.0.0.1:5500"),
@@ -246,6 +246,78 @@ fn log_in_chat_and_message_on_every_server() {
         drop(b);
         a.until("b leaving", |e| matches!(e, Event::UserLeft { .. }));
         eprintln!("{name}: login, user list, chat, leave; message {outcome}");
+    }
+}
+
+/// What GtkHx offers at login: every extension, voice and video too.
+const GTKHX_CAPS: u16 = cap::LARGE_FILES
+    | cap::TEXT_ENCODING
+    | cap::VOICE
+    | cap::INLINE_MEDIA
+    | cap::CHAT_HISTORY
+    | 0x0400;
+
+/// A raw session that handles the login, as GtkHx's does, reports the
+/// reply before it is ready, and never hands it over whole. A login no
+/// account has is refused with the server's reason.
+#[test]
+fn the_login_reply_and_a_refusal_on_every_server() {
+    for (name, addr) in servers() {
+        let cfg = Config {
+            caps: GTKHX_CAPS,
+            raw: true,
+            handled: Handled::LOGIN,
+            ..Config::guest(&nick(name, "l"))
+        };
+        let (_c, seen) = Client::login_seeing(name, addr, Session::new(cfg, 0));
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, Event::Reply { trans: 1, .. })),
+            "{name}: {seen:?}"
+        );
+        let info = seen
+            .iter()
+            .position(|e| matches!(e, Event::LoggedIn(_)))
+            .unwrap_or_else(|| panic!("{name}: never logged in"));
+        let ready = seen.iter().position(|e| matches!(e, Event::Ready)).unwrap();
+        assert!(info < ready, "{name}: {seen:?}");
+        let Event::LoggedIn(info) = &seen[info] else {
+            unreachable!()
+        };
+        eprintln!("{name}: {info:?}");
+
+        // An account no server has. mhxd says nothing: it hangs up.
+        let who = nick(name, "nobody");
+        let cfg = Config::account(&who, &who, "not the password");
+        let mut c = Client::connect(name, addr, Session::new(cfg, 0));
+        let deadline = Instant::now() + WAIT;
+        let why = loop {
+            c.flush();
+            let mut buf = [0u8; 4096];
+            match c.sock.read(&mut buf) {
+                Ok(0) => break None,
+                Ok(n) => {
+                    let now = c.now();
+                    c.s.feed(&buf[..n], now);
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(e) => panic!("{name}: {e}"),
+            }
+            if let Some(Event::Closed(why)) =
+                std::iter::from_fn(|| c.s.poll_event()).find(|e| matches!(e, Event::Closed(_)))
+            {
+                break Some(why);
+            }
+            assert!(Instant::now() < deadline, "{name}: not refused");
+        };
+        match why {
+            None => assert_eq!(name, "mhxd"),
+            Some(hxsession::Closed::LoginRefused(Some(reason))) if !reason.is_empty() => {
+                eprintln!("{name}: refused: {reason}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
     }
 }
 

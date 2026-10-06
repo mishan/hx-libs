@@ -173,6 +173,9 @@ impl Handled {
     /// Where a transfer stands in the server's queue, as the server moves
     /// it.
     pub const FILES: Handled = Handled(16);
+    /// The login's reply, which [`Event::LoggedIn`] or
+    /// [`Closed::LoginRefused`] says all of, rather than also whole.
+    pub const LOGIN: Handled = Handled(32);
     pub const ALL: Handled = Handled(u32::MAX);
 
     pub fn contains(self, other: Handled) -> bool {
@@ -224,6 +227,14 @@ pub struct ServerInfo {
     pub uid: Option<u16>,
     /// What the server agreed to, of what was offered.
     pub caps: u16,
+    /// Inline media's advisory limits, each where the server sent it.
+    pub media: inline_media::LimitsAdvertisement,
+    /// Chat history's retention: how many messages, and how many days, the
+    /// server keeps, where it said. 0 is no limit.
+    pub history_max_msgs: Option<u32>,
+    pub history_max_days: Option<u32>,
+    /// Video's ceilings, one for each kind the server described.
+    pub video: Vec<hxproto::video::Limits>,
 }
 
 /// One user on the server.
@@ -2225,7 +2236,7 @@ impl Session {
         let len = t.buf.len();
         if t.is_error() {
             let reason = parse::parse_task_error(&t.buf, len, MAX_BODY).map(|r| text_in(&r));
-            if self.cfg.raw {
+            if self.login_whole() {
                 self.events.push_back(Event::Reply {
                     trans: t.trans,
                     frame: t.buf,
@@ -2248,11 +2259,33 @@ impl Session {
             name: has(parse::LOGIN_SEEN_SERVERNAME).then(|| self.decode(&name[..n])),
             uid: has(parse::LOGIN_SEEN_UID).then_some(info.uid),
             caps,
+            media: inline_media::LimitsAdvertisement {
+                max_bytes: has(parse::LOGIN_SEEN_MEDIA_MAX_BYTES).then_some(info.media_max_bytes),
+                max_dimension: has(parse::LOGIN_SEEN_MEDIA_MAX_DIMENSION)
+                    .then_some(info.media_max_dimension),
+                max_pixels: has(parse::LOGIN_SEEN_MEDIA_MAX_PIXELS)
+                    .then_some(info.media_max_pixels),
+                chunk_size: has(parse::LOGIN_SEEN_MEDIA_CHUNK_SIZE)
+                    .then_some(info.media_chunk_size),
+                max_frames: has(parse::LOGIN_SEEN_MEDIA_MAX_FRAMES)
+                    .then_some(info.media_max_frames),
+                max_duration_ms: has(parse::LOGIN_SEEN_MEDIA_MAX_DURATION_MS)
+                    .then_some(info.media_max_duration_ms),
+            },
+            history_max_msgs: has(parse::LOGIN_SEEN_HISTORY_MAX_MSGS)
+                .then_some(info.history_max_msgs),
+            history_max_days: has(parse::LOGIN_SEEN_HISTORY_MAX_DAYS)
+                .then_some(info.history_max_days),
+            video: info
+                .video_camera
+                .into_iter()
+                .chain(info.video_screen)
+                .collect(),
         };
         let version = server.version;
         self.server = Some(server.clone());
         self.state = State::LoggedIn;
-        if self.cfg.raw {
+        if self.login_whole() {
             self.events.push_back(Event::Reply {
                 trans: t.trans,
                 frame: t.buf,
@@ -2376,6 +2409,11 @@ impl Session {
             })),
             Err(inline_media::MediaMetaError::OnlyOnePresent) => Err(()),
         }
+    }
+
+    /// Whether the login's reply is also handed over whole.
+    fn login_whole(&self) -> bool {
+        self.cfg.raw && !self.cfg.handled.contains(Handled::LOGIN)
     }
 
     /// Whether a raw session acts on `kind` itself.
