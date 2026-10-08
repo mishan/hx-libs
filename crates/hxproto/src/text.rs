@@ -39,9 +39,17 @@ const MAC_ROMAN_HIGH: [u32; 128] = [
 ///    identity below 0x80, [`MAC_ROMAN_HIGH`] at and above). This always
 ///    succeeds, so there is no lossy fallback.
 pub fn to_utf8(bytes: &[u8]) -> String {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_owned();
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => mac_roman_to_utf8(bytes),
     }
+}
+
+/// Convert Mac Roman wire bytes to UTF-8, every byte through the table
+/// even when the whole happens to be valid UTF-8 too: what a server reads
+/// from a client that never negotiated UTF-8, whose "√©" (`C3 A9`) is
+/// not "é". Injective, so [`from_utf8`] gives the bytes back.
+pub fn mac_roman_to_utf8(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
         if b < 0x80 {
@@ -179,6 +187,13 @@ mod tests {
         let s = "café ™ • Ø";
         let wire = from_utf8(s);
         assert_eq!(to_utf8(&wire), s);
+    }
+
+    #[test]
+    fn mac_roman_decode_reads_every_byte_as_mac_roman_and_round_trips() {
+        assert_eq!(mac_roman_to_utf8(&[0xC3, 0xA9]), "\u{221A}\u{00A9}");
+        let every: Vec<u8> = (0..=255).collect();
+        assert_eq!(from_utf8(&mac_roman_to_utf8(&every)), every);
     }
 
     #[test]
