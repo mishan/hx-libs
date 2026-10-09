@@ -31,6 +31,9 @@ pub enum Role {
 }
 
 const HDR: usize = 22;
+/// The most rounds a rekey marker counts: six bits, as the original
+/// client stamps them.
+const MAX_ROUNDS: u8 = 63;
 /// The largest transaction body the Blowfish framing takes; past this the
 /// keystream has gone astray.
 const MAX_BODY: usize = 1024 * 1024;
@@ -342,6 +345,14 @@ impl Receiver {
                     rest = &rest[n..];
                     if hdr.len() == HDR {
                         let rounds = std::mem::take(&mut hdr[0]);
+                        // A marker past what any sender stamps is not a
+                        // rekey but a peer making each header cost
+                        // hundreds of HMACs.
+                        if rounds > MAX_ROUNDS {
+                            return Err(Error::Transport(format!(
+                                "a rekey of {rounds} rounds (at most {MAX_ROUNDS})"
+                            )));
+                        }
                         if rounds > 0 {
                             bf.rekey(rounds, &self.session_key, self.mac)?;
                         }
