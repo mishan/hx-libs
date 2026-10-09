@@ -198,6 +198,42 @@ fn every_transport_carries_both_ways_however_the_bytes_are_cut() {
     }
 }
 
+#[test]
+fn split_halves_carry_both_ways_at_once() {
+    for cipher in [None, Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+        for compression in compressions() {
+            let offer = Offer {
+                ciphers: cipher.into_iter().collect(),
+                compressions: compression.into_iter().collect(),
+                ..Offer::new(*b"TEST")
+            };
+            let policy = Policy {
+                macs: Mac::ALL.to_vec(),
+                ciphers: vec![Cipher::Blowfish, Cipher::ChaCha20Poly1305],
+                compressions: vec![Compression::Gzip, Compression::Lz4, Compression::Zstd],
+                require_cipher: false,
+            };
+            let (c, s, _) = handshake(&offer, &policy, WHO.password).unwrap();
+            let ((mut c_send, mut c_recv), (mut s_send, mut s_recv)) = (c.split(), s.split());
+            // Each direction's sends and reads interleaved with the
+            // other's, as a writer and a reader task would make them.
+            let (mut at_server, mut at_client) = (Vec::new(), Vec::new());
+            let mut sent = Vec::new();
+            for i in 0..20u32 {
+                let f = frame(105, i, &vec![i as u8; (i as usize * 53) % 900]);
+                let up = c_send.encode(&f).unwrap();
+                let down = s_send.encode(&f).unwrap();
+                s_recv.decode(&up, &mut at_server).unwrap();
+                c_recv.decode(&down, &mut at_client).unwrap();
+                sent.push(f);
+            }
+            assert_eq!(at_server, sent.concat(), "{cipher:?} {compression:?}");
+            assert_eq!(at_client, sent.concat(), "{cipher:?} {compression:?}");
+            assert!(s_recv.idle() && c_recv.idle());
+        }
+    }
+}
+
 /// Compression goes on only when both sides want it, and the client's
 /// choice of what to offer is the one that counts.
 #[test]

@@ -30,7 +30,7 @@ mod tests;
 
 pub use alg::{Cipher, Compression, Mac};
 pub use keys::TransferKeys;
-pub use transport::{Random, Role, Transport};
+pub use transport::{Random, Receiver, Role, Sender, Transport};
 
 /// What was agreed.
 #[derive(Debug, Clone)]
