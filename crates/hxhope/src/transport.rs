@@ -108,10 +108,23 @@ enum Open {
 
 /// The codec between a session and its socket, once HOPE has agreed one.
 pub struct Transport {
+    send: Sender,
+    recv: Receiver,
+}
+
+/// A transport's sending half, for a connection whose writer and reader
+/// run apart ([`Transport::split`]).
+pub struct Sender {
     mac: Mac,
     session_key: Vec<u8>,
     compress: Option<Compressor>,
     seal: Seal,
+}
+
+/// A transport's receiving half.
+pub struct Receiver {
+    mac: Mac,
+    session_key: Vec<u8>,
     open: Open,
     decompress: Option<Decompressor>,
 }
@@ -169,15 +182,43 @@ impl Transport {
             }
         };
         Ok(Transport {
-            mac,
-            session_key: session_key.to_vec(),
-            compress,
-            seal,
-            open,
-            decompress,
+            send: Sender {
+                mac,
+                session_key: session_key.to_vec(),
+                compress,
+                seal,
+            },
+            recv: Receiver {
+                mac,
+                session_key: session_key.to_vec(),
+                open,
+                decompress,
+            },
         })
     }
 
+    /// The two directions apart, each its own task's to drive.
+    pub fn split(self) -> (Sender, Receiver) {
+        (self.send, self.recv)
+    }
+
+    /// [`Sender::encode`].
+    pub fn encode(&mut self, plain: &[u8]) -> Result<Vec<u8>, Error> {
+        self.send.encode(plain)
+    }
+
+    /// [`Receiver::decode`].
+    pub fn decode(&mut self, wire: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+        self.recv.decode(wire, out)
+    }
+
+    /// [`Receiver::idle`].
+    pub fn idle(&self) -> bool {
+        self.recv.idle()
+    }
+}
+
+impl Sender {
     /// What to write for `plain`, which is whole transactions when the
     /// transport is Blowfish without compression. One call is one unit:
     /// one compression flush or frame, one ChaCha20-Poly1305 record.
@@ -256,7 +297,9 @@ impl Transport {
             }
         }
     }
+}
 
+impl Receiver {
     /// Take what arrived, in whatever pieces, and add its plaintext to
     /// `out`.
     pub fn decode(&mut self, wire: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
