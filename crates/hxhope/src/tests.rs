@@ -363,6 +363,27 @@ fn a_damaged_stream_is_refused() {
 /// A server that requires a cipher refuses a step 2 that runs none, as it
 /// would after a step-1 reply stripped of its cipher on the way.
 #[test]
+fn a_rekey_marker_past_six_bits_is_refused() {
+    let offer = Offer {
+        ciphers: vec![Cipher::Blowfish],
+        ..Offer::new(*b"TEST")
+    };
+    let policy = Policy {
+        macs: Mac::ALL.to_vec(),
+        ciphers: vec![Cipher::Blowfish],
+        compressions: vec![],
+        require_cipher: false,
+    };
+    let (mut c, mut s, _) = handshake(&offer, &policy, WHO.password).unwrap();
+    // The marker's byte, set past six bits before the sender stamps its
+    // own count into it: no stamp can bring it back under.
+    let mut f = frame(105, 1, b"");
+    f[0] = 64;
+    let wire = c.encode(&f).unwrap();
+    assert!(s.decode(&wire, &mut Vec::new()).is_err());
+}
+
+#[test]
 fn a_required_cipher_cannot_be_stripped_on_the_way() {
     let offer = Offer {
         ciphers: vec![Cipher::Blowfish],
