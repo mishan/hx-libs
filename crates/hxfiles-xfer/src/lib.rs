@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ffo;
+pub mod folder;
 pub mod htxf;
 pub mod resume_digest;
 pub mod rflt;
