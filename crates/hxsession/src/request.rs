@@ -452,13 +452,18 @@ pub fn news_list(opcode: ClientHdr, path: &[&[u8]]) -> Option<Request> {
 
 /// GETTHREAD (400): one article, as text.
 pub fn news_article(path: &[&[u8]], id: u32) -> Option<Request> {
+    news_part(path, id, b"text/plain")
+}
+
+/// GETTHREAD (400): the part of type `mime` of one article.
+pub fn news_part(path: &[&[u8]], id: u32, mime: &[u8]) -> Option<Request> {
     let encoded = self::path(path)?;
     let mut chunks = [HxChunk::EMPTY, HxChunk::EMPTY, HxChunk::EMPTY];
     let mut scratch = [0u8; 4];
     let req = build::NewsGetThreadRequest {
         path: &encoded,
         threadid: id,
-        mime_type: b"text/plain",
+        mime_type: mime,
     };
     let hc = build::build_news_getthread_chunks(&req, &mut chunks, &mut scratch);
     Request::from_built(ClientHdr::GetThread, &chunks, hc)

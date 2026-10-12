@@ -546,11 +546,19 @@ fn threaded_news_walks_down_from_the_root() {
         )]
     );
     s.news_article(&["News", "General"], 3).unwrap();
-    let out = sent(&mut s);
-    assert_eq!(out[0].0, 400);
-    assert!(out[0]
-        .2
-        .contains(&(tag::THREADID, 3u32.to_be_bytes().to_vec())));
+    s.news_part_raw(&[b"News", b"General"], 3, b"image/png")
+        .unwrap();
+    for ((op, _, fields), mime) in sent(&mut s)
+        .into_iter()
+        .zip([&b"text/plain"[..], b"image/png"])
+    {
+        assert_eq!(op, 400);
+        assert!(fields.contains(&(tag::THREADID, 3u32.to_be_bytes().to_vec())));
+        assert!(
+            fields.contains(&(tag::NEWSTYPE, mime.to_vec())),
+            "{fields:?}"
+        );
+    }
 }
 
 #[test]
@@ -1952,12 +1960,13 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
 #[test]
 fn news_replies_expected_become_events() {
     let mut s = raw_ready(Handled::NEWS, 0);
-    let [file, listing, category, article, change, refused] = [(); 6].map(|_| s.take_trans());
+    let [file, listing, category, article, part, change, refused] = [(); 7].map(|_| s.take_trans());
     for (t, what) in [
         (file, Expect::NewsFile),
         (listing, Expect::NewsListing),
         (category, Expect::NewsCategory),
         (article, Expect::NewsArticle),
+        (part, Expect::NewsPart),
         (change, Expect::NewsChange),
         (refused, Expect::NewsChange),
     ] {
@@ -1972,7 +1981,7 @@ fn news_replies_expected_become_events() {
         &[0, 0, 0, 60],      // a minute in
         &[0, 0, 0, 3],       // replying to 3
         &[0, 0, 0, 0],       // flags
-        &[0, 1],             // one part
+        &[0, 2],             // two parts
         &[4],                // subject
         b"Re\0x",
         &[3], // poster
@@ -1980,8 +1989,13 @@ fn news_replies_expected_become_events() {
         &[10], // the part's type
         b"text/plain",
         &[0, 2], // and size
+        &[9],
+        b"image/png",
+        &[0xea, 0x60],
     ]
     .concat();
+    // A picture's bytes, which read as text would lose their CRs.
+    let picture = b"\x89PNG\r\n\x1a\n\x8E\x1b[1m";
     let catlist = [&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0][..], &post].concat();
     s.feed(&server(TASK, file, 0, &[(tag::NEWS, b"one\rtwo")]), T0);
     s.feed(
@@ -1993,6 +2007,7 @@ fn news_replies_expected_become_events() {
         &server(TASK, article, 0, &[(tag::NEWSDATA, b"caf\x8E")]),
         T0,
     );
+    s.feed(&server(TASK, part, 0, &[(tag::NEWSDATA, picture)]), T0);
     s.feed(&server(TASK, change, 0, &[]), T0);
     s.feed(
         &server(TASK, refused, 1, &[(tag::TASK_ERROR, b"Not allowed.")]),
@@ -2022,12 +2037,26 @@ fn news_replies_expected_become_events() {
                     poster: "amy".into(),
                     year: 2026,
                     seconds: 60,
-                    mime: b"text/plain".to_vec()
+                    mime: b"text/plain".to_vec(),
+                    parts: vec![
+                        Part {
+                            mime: b"text/plain".to_vec(),
+                            size: 2
+                        },
+                        Part {
+                            mime: b"image/png".to_vec(),
+                            size: 60_000
+                        },
+                    ],
                 }]
             },
             Event::NewsArticle {
                 trans: article,
                 text: "café".into()
+            },
+            Event::NewsPart {
+                trans: part,
+                data: picture.to_vec()
             },
             Event::Failed {
                 trans: refused,

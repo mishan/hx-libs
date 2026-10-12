@@ -361,6 +361,17 @@ pub struct Article {
     /// has none. [`Session::news_article`] asks for text/plain whatever
     /// this says.
     pub mime: Vec<u8>,
+    /// Every part, in the order the server listed them: an article can
+    /// carry pictures after its text, each fetched by its type with
+    /// [`Session::news_part_raw`].
+    pub parts: Vec<Part>,
+}
+
+/// One part of an [`Article`]: its type and the size the server gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Part {
+    pub mime: Vec<u8>,
+    pub size: u16,
 }
 
 /// The picture a chat line carries, under [`cap::INLINE_MEDIA`]: the
@@ -462,6 +473,8 @@ pub enum Expect {
     NewsCategory,
     /// One article's text: an [`Event::NewsArticle`].
     NewsArticle,
+    /// One part of an article, as it is: an [`Event::NewsPart`].
+    NewsPart,
     /// A change to news of either kind — a post, an article, a bundle or
     /// category made or deleted: nothing, once it worked.
     NewsChange,
@@ -669,6 +682,12 @@ pub enum Event {
     NewsArticle {
         trans: u32,
         text: String,
+    },
+    /// A part's bytes as the server sent them, read as neither text nor
+    /// lines.
+    NewsPart {
+        trans: u32,
+        data: Vec<u8>,
     },
     /// Every user's GIF icon, as the server listed them.
     IconList {
@@ -1354,6 +1373,14 @@ impl Session {
         self.ensure_ready()?;
         let r = request::news_article(path, id).ok_or(Error::TooLong)?;
         Ok(self.send(&r, Some(Pending::Expected(Expect::NewsArticle))))
+    }
+
+    /// The part of type `mime` of an article, such as a picture listed
+    /// after its text.
+    pub fn news_part_raw(&mut self, path: &[&[u8]], id: u32, mime: &[u8]) -> Result<u32, Error> {
+        self.ensure_ready()?;
+        let r = request::news_part(path, id, mime).ok_or(Error::TooLong)?;
+        Ok(self.send(&r, Some(Pending::Expected(Expect::NewsPart))))
     }
 
     /// Post an article to a threaded-news category, in reply to article
@@ -2104,15 +2131,32 @@ impl Session {
                         seconds: p.date_seconds,
                         mime: p
                             .parts
-                            .into_iter()
-                            .next()
-                            .map(|m| m.mime_type)
+                            .first()
+                            .map(|m| m.mime_type.clone())
                             .unwrap_or_default(),
+                        parts: p
+                            .parts
+                            .into_iter()
+                            .map(|m| Part {
+                                mime: m.mime_type,
+                                size: m.size,
+                            })
+                            .collect(),
                     })
                     .collect();
                 self.events.push_back(Event::NewsCategory {
                     trans: t.trans,
                     articles,
+                });
+            }
+            Some(Pending::Expected(Expect::NewsPart)) => {
+                let data = hxproto::wire::ChunkIter::over_message(&t.buf, len)
+                    .find(|c| c.tag == tag::NEWSDATA)
+                    .map(|c| c.data.to_vec())
+                    .unwrap_or_default();
+                self.events.push_back(Event::NewsPart {
+                    trans: t.trans,
+                    data,
                 });
             }
             Some(Pending::Expected(Expect::NewsArticle)) => {
