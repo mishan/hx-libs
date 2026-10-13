@@ -694,7 +694,7 @@ fn news_posts_and_changes_on_every_server() {
 
 /// What each rig server's file area holds at its root, by name, and a
 /// folder in it with something inside — or `None` where the server has
-/// no file area and says so. From GtkHx's rig seed (its
+/// no file area and says so; every rig server has one now. From GtkHx's rig seed (its
 /// `tests/COMPOSE.md`); a long-lived container that has drifted from its
 /// seed fails here first.
 fn file_area(server: &str) -> Option<(&'static [&'static str], Option<&'static str>)> {
@@ -708,6 +708,7 @@ fn file_area(server: &str) -> Option<(&'static [&'static str], Option<&'static s
             Some("test_folder"),
         )),
         "hlservd" => Some((&["test.txt"], None)),
+        "hxd-ng" => Some((&["Uploads", "test.txt", "test_folder"], Some("test_folder"))),
         _ => None,
     }
 }
@@ -826,8 +827,9 @@ fn file_answer(c: &mut Client, t: u32) -> Event {
 }
 
 /// Files changed and transfers asked for, as an admin, in a scratch
-/// folder made at the root and deleted again; where there is no file
-/// area (hxd-ng), its refusals. The session offers no Text-Encoding, so
+/// folder made at the root and deleted again; on hxd-ng, whose rig
+/// account is a guest that may read and download but change nothing
+/// outside `Uploads`, what it may do and the refusals of the rest. The session offers no Text-Encoding, so
 /// its names go as Mac Roman, and one named by bytes alone goes back as
 /// the listing gave it. No transfer connection is opened: what is
 /// checked is the server's answer to the asking.
@@ -864,16 +866,27 @@ fn files_change_and_transfers_are_asked_for_on_every_server() {
         };
 
         let t = c.s.file_mkdir(&[], &scratch).unwrap();
-        if file_area(name).is_none() {
+        if name == "hxd-ng" {
             // Each asked for once the one before is answered: `until`
             // passes over what else came in the same read.
             let mut refusals = vec![file_answer(&mut c, t)];
-            let asks: [&Ask; 8] = [
-                &|s| s.file_info(&[], "test.txt"),
+            let t = c.s.file_info(&[], "test.txt").unwrap();
+            let got = file_answer(&mut c, t);
+            assert!(
+                matches!(&got, Event::FileInfo { info, .. } if info.name == "test.txt"),
+                "{name}: {got:?}"
+            );
+            let t = c.s.file_download(&[], "test.txt").unwrap();
+            match file_answer(&mut c, t) {
+                Event::Transfer { transfer, .. } if transfer.reference != 0 => {
+                    cancel_transfer(name, addr, transfer.reference)
+                }
+                got => panic!("{name}: the download: {got:?}"),
+            }
+            let asks: [&Ask; 6] = [
                 &|s| s.file_delete(&[], &scratch),
                 &|s| s.file_set_info(&[], &scratch, Some("x"), Some("x")),
                 &|s| s.file_move(&[], &scratch, &["x"]),
-                &|s| s.file_download(&[], "test.txt"),
                 &|s| s.file_upload(&[], "up.txt", 5),
                 &|s| s.folder_download(&[], &scratch),
                 &|s| s.folder_upload(&[], &scratch, 5, 1),
@@ -894,7 +907,7 @@ fn files_change_and_transfers_are_asked_for_on_every_server() {
                     "{name}: {got:?}"
                 );
             }
-            eprintln!("{name}: file changes and transfers refused");
+            eprintln!("{name}: files read and downloaded; changes and uploads refused");
             continue;
         }
         changed(&mut c, t, "the scratch folder");
