@@ -241,6 +241,11 @@ pub fn parse_info(info: &[u8]) -> Result<ParsedInfo, Error> {
         return Err(Error::NameTooLong);
     }
     let comment_at = 72usize.checked_add(name_len).ok_or(Error::SizeOverflow)?;
+    // hlservd (the 1.9.5 server) and the Nostalgia client end the fork after
+    // the name when there is no comment, leaving out its length too.
+    if info.len() == comment_at {
+        return parse_info(&[info, &[0, 0]].concat());
+    }
     let comment_len = u16::from_be_bytes(
         info.get(comment_at..comment_at + 2)
             .ok_or(Error::Truncated)?
@@ -392,6 +397,24 @@ mod tests {
         assert_eq!(parsed.platform, *b"MWIN");
         assert_eq!(parsed.name, b"notes.txt");
         assert_eq!(parsed.comment, b"source");
+    }
+
+    #[test]
+    fn info_that_ends_after_the_name_has_no_comment() {
+        // hlservd's INFO fork for a 1.9.5 download of `test.txt`.
+        let mut info = vec![0; 72];
+        info[..4].copy_from_slice(b"UNIX");
+        info[70..72].copy_from_slice(&8u16.to_be_bytes());
+        info.extend_from_slice(b"test.txt");
+
+        let parsed = parse_info(&info).unwrap();
+        assert_eq!(parsed.name, b"test.txt");
+        assert!(parsed.comment.is_empty());
+        assert_eq!(parse_info(&info[..79]), Err(Error::Truncated));
+        assert_eq!(
+            parse_info(&[&info[..], &[0]].concat()),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
