@@ -7,6 +7,10 @@ pub const FORK_HEADER_LEN: usize = 16;
 pub const INFO_FIXED_LEN: usize = 74;
 pub const MAX_NAME_LEN: usize = 128;
 pub const MAX_COMMENT_LEN: usize = 255;
+/// The smallest INFO fork [`parse_info`] accepts: the fields before the
+/// name, from a peer that ends the fork after an empty name and leaves the
+/// comment's length out.
+pub const MIN_INFO_LEN: usize = INFO_FIXED_LEN - 2;
 /// The largest INFO fork [`parse_info`] accepts: the fixed fields, a maximal
 /// name, and a maximal comment.
 pub const MAX_INFO_LEN: usize = INFO_FIXED_LEN + MAX_NAME_LEN + MAX_COMMENT_LEN;
@@ -228,8 +232,7 @@ pub struct ParsedInfo {
 }
 
 pub fn parse_info(info: &[u8]) -> Result<ParsedInfo, Error> {
-    // Short of the comment's length, which may be left out (below).
-    if info.len() < INFO_FIXED_LEN - 2 {
+    if info.len() < MIN_INFO_LEN {
         return Err(Error::Truncated);
     }
     // The platform tag is not checked. Windows clients and servers send
