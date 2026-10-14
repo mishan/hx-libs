@@ -228,7 +228,8 @@ pub struct ParsedInfo {
 }
 
 pub fn parse_info(info: &[u8]) -> Result<ParsedInfo, Error> {
-    if info.len() < INFO_FIXED_LEN {
+    // Short of the comment's length, which may be left out (below).
+    if info.len() < INFO_FIXED_LEN - 2 {
         return Err(Error::Truncated);
     }
     // The platform tag is not checked. Windows clients and servers send
@@ -401,20 +402,27 @@ mod tests {
 
     #[test]
     fn info_that_ends_after_the_name_has_no_comment() {
-        // hlservd's INFO fork for a 1.9.5 download of `test.txt`.
+        // hlservd's INFO fork for a 1.9.5 download of `test.txt`, and of
+        // files whose names leave it shorter than a fork with a comment.
+        for name in [&b"test.txt"[..], b"c", b""] {
+            let mut info = vec![0; 72];
+            info[..4].copy_from_slice(b"UNIX");
+            info[70..72].copy_from_slice(&(name.len() as u16).to_be_bytes());
+            info.extend_from_slice(name);
+
+            let parsed = parse_info(&info).unwrap();
+            assert_eq!(parsed.name, name);
+            assert!(parsed.comment.is_empty());
+            assert_eq!(
+                parse_info(&[&info[..], &[0]].concat()),
+                Err(Error::Truncated)
+            );
+        }
         let mut info = vec![0; 72];
-        info[..4].copy_from_slice(b"UNIX");
         info[70..72].copy_from_slice(&8u16.to_be_bytes());
         info.extend_from_slice(b"test.txt");
-
-        let parsed = parse_info(&info).unwrap();
-        assert_eq!(parsed.name, b"test.txt");
-        assert!(parsed.comment.is_empty());
         assert_eq!(parse_info(&info[..79]), Err(Error::Truncated));
-        assert_eq!(
-            parse_info(&[&info[..], &[0]].concat()),
-            Err(Error::Truncated)
-        );
+        assert_eq!(parse_info(&info[..71]), Err(Error::Truncated));
     }
 
     #[test]
