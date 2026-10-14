@@ -2246,37 +2246,31 @@ pub struct FilePutReply {
     pub ref_: u32,
     pub queue: u32,
     /// Data-fork resume offset (RFLT bytes 46..50, BE u32). Zero
-    /// when no RFLT was sent, or when the RFLT was shorter than 66
-    /// bytes (the C extractor's gate; the trailer at offset 62..66
-    /// is the resource fork's, so a record shorter than 66 can't
-    /// carry both).
+    /// when no RFLT was sent, or one too short to hold it.
     pub data_pos: u32,
-    /// Resource-fork resume offset (RFLT bytes 62..66, BE u32).
+    /// Resource-fork resume offset (RFLT bytes 62..66, BE u32). Zero
+    /// when the RFLT stops before it: Janus, Mobius, the 1.9 server and
+    /// the Windows server send a DATA entry alone, 58 bytes.
     pub rsrc_pos: u32,
 }
 
-/// Parse the FILE_PUT reply scalars. RFLT is gated at len >= 66
-/// (matching the C extractor); shorter records leave data_pos /
-/// rsrc_pos at zero. The caller applies the `!ref` dispatch gate.
+/// Parse the FILE_PUT reply scalars. The RFLT's offsets are read by
+/// position, each when the record reaches it, as
+/// `hxfiles_xfer::rflt::parse_compatible` reads them. The caller
+/// applies the `!ref` dispatch gate.
 pub fn parse_file_put_reply(buf: &[u8], len: usize) -> FilePutReply {
     let mut out = FilePutReply::default();
+    let at = |data: &[u8], off: usize| {
+        data.get(off..off + 4)
+            .map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
     for chunk in ChunkIter::over_message(buf, len) {
         match chunk.tag {
             tag::HTXF_REF => out.ref_ = chunk.as_uint(),
             tag::QUEUE => out.queue = chunk.as_uint(),
-            tag::RFLT if chunk.data.len() >= 66 => {
-                out.data_pos = u32::from_be_bytes([
-                    chunk.data[46],
-                    chunk.data[47],
-                    chunk.data[48],
-                    chunk.data[49],
-                ]);
-                out.rsrc_pos = u32::from_be_bytes([
-                    chunk.data[62],
-                    chunk.data[63],
-                    chunk.data[64],
-                    chunk.data[65],
-                ]);
+            tag::RFLT => {
+                out.data_pos = at(chunk.data, 46);
+                out.rsrc_pos = at(chunk.data, 62);
             }
             _ => {}
         }
@@ -5069,16 +5063,25 @@ mod tests {
     }
 
     #[test]
-    fn file_put_reply_short_rflt_ignored() {
-        // RFLT requires >= 66 bytes (the C `if (_len >= 66)` gate).
-        // A 65-byte RFLT leaves both fork offsets at zero.
-        let mut body = Vec::new();
-        body.extend(chunk(tag::HTXF_REF, &1u32.to_be_bytes()));
-        body.extend(chunk(tag::RFLT, &[0u8; 65]));
-        let m = msg(0x0001_0000, 1, 0, &body);
-        let r = parse_file_put_reply(&m, m.len());
-        assert_eq!(r.data_pos, 0);
-        assert_eq!(r.rsrc_pos, 0);
+    fn file_put_reply_reads_each_offset_the_rflt_reaches() {
+        let whole = rflt_payload(0x0000_1234, 0x0000_5678);
+        // (RFLT length, data offset, resource offset)
+        for (len, data, rsrc) in [
+            (74, 0x1234, 0x5678),
+            (66, 0x1234, 0x5678),
+            // A DATA entry alone, as Janus and the 1.9 server send.
+            (58, 0x1234, 0),
+            (50, 0x1234, 0),
+            (49, 0, 0),
+            (0, 0, 0),
+        ] {
+            let mut body = Vec::new();
+            body.extend(chunk(tag::HTXF_REF, &1u32.to_be_bytes()));
+            body.extend(chunk(tag::RFLT, &whole[..len]));
+            let m = msg(0x0001_0000, 1, 0, &body);
+            let r = parse_file_put_reply(&m, m.len());
+            assert_eq!((r.data_pos, r.rsrc_pos), (data, rsrc), "{len}");
+        }
     }
 
     #[test]
