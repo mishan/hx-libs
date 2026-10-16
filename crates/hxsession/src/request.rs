@@ -431,6 +431,7 @@ pub fn folder_upload(path: &[&[u8]], name: &[u8], size: u64, items: u32) -> Opti
     let req = build::FilePutFolderRequest {
         name,
         dir: dir.as_deref(),
+        resume: false,
         size: size.min(u64::from(u32::MAX)) as u32,
         nfiles: items,
     };
