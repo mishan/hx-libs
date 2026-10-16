@@ -1566,6 +1566,10 @@ pub struct FilePutFolderRequest<'a> {
     /// `HTLC_DATA_DIR` — parent directory. `None` when uploading at
     /// the root.
     pub dir: Option<&'a [u8]>,
+    /// `HTLC_DATA_FILE_PREVIEW` — when `true`, emit `"\0\1"`: the
+    /// upload resumes a folder already on the server, which then
+    /// answers each file it holds part of with RESUME.
+    pub resume: bool,
     /// `HTLC_DATA_HTXF_SIZE` — aggregate byte size of the folder
     /// (host order; the builder big-endian-encodes it). Clamps at
     /// `G_MAXUINT32` on the caller side; the wire field is u32.
@@ -1578,13 +1582,14 @@ pub struct FilePutFolderRequest<'a> {
 
 /// Build the chunk array for `HTLC_HDR_FILE_PUTFOLDER`. Wire shape:
 ///
-/// 1. `HTLC_DATA_FILE_NAME`   — always
-/// 2. `HTLC_DATA_DIR`         — when `dir.is_some()`
-/// 3. `HTLC_DATA_HTXF_SIZE`   — u32 BE, always
-/// 4. `HTLC_DATA_FILE_NFILES` — u32 BE, always
+/// 1. `HTLC_DATA_FILE_NAME`    — always
+/// 2. `HTLC_DATA_DIR`          — when `dir.is_some()`
+/// 3. `HTLC_DATA_FILE_PREVIEW` — when `resume`
+/// 4. `HTLC_DATA_HTXF_SIZE`    — u32 BE, always
+/// 5. `HTLC_DATA_FILE_NFILES`  — u32 BE, always
 ///
-/// Returns 3 (no dir) or 4 (with dir) on success. Requires
-/// `chunks.len()` ≥ the matching count and `scratch.len() >= 8`
+/// Returns the chunk count (3..=5) on success. Requires
+/// `chunks.len()` ≥ that count and `scratch.len() >= 8`
 /// (two BE u32 slots). Rejects `name.len() > u16::MAX` or
 /// `dir.len() > u16::MAX`.
 pub fn build_file_putfolder_chunks(
@@ -1600,7 +1605,7 @@ pub fn build_file_putfolder_chunks(
             return 0;
         }
     }
-    let needed = 3 + usize::from(req.dir.is_some());
+    let needed = 3 + usize::from(req.dir.is_some()) + usize::from(req.resume);
     if chunks.len() < needed {
         return 0;
     }
@@ -1627,6 +1632,14 @@ pub fn build_file_putfolder_chunks(
             } else {
                 d.as_ptr()
             },
+        };
+        hc += 1;
+    }
+    if req.resume {
+        chunks[hc] = HxChunk {
+            tag: tag::FILE_PREVIEW,
+            len: 2,
+            data: b"\x00\x01".as_ptr(),
         };
         hc += 1;
     }
@@ -3656,6 +3669,7 @@ mod tests {
         let req = FilePutFolderRequest {
             name: b"MyFolder",
             dir: Some(b"Uploads"),
+            resume: false,
             size: 0x0102_0304,
             nfiles: 42,
         };
@@ -3683,6 +3697,7 @@ mod tests {
         let req = FilePutFolderRequest {
             name: b"MyFolder",
             dir: None,
+            resume: false,
             size: 1024,
             nfiles: 3,
         };
@@ -3696,10 +3711,49 @@ mod tests {
     }
 
     #[test]
+    fn file_putfolder_resume_marks_the_request_after_the_dir() {
+        let with_dir: &[u16] = &[
+            tag::FILE_NAME,
+            tag::DIR,
+            tag::FILE_PREVIEW,
+            tag::HTXF_SIZE,
+            tag::FILE_NFILES,
+        ];
+        let at_root: &[u16] = &[
+            tag::FILE_NAME,
+            tag::FILE_PREVIEW,
+            tag::HTXF_SIZE,
+            tag::FILE_NFILES,
+        ];
+        for (dir, tags) in [(Some(&b"Uploads"[..]), with_dir), (None, at_root)] {
+            let req = FilePutFolderRequest {
+                name: b"MyFolder",
+                dir,
+                resume: true,
+                size: 1024,
+                nfiles: 3,
+            };
+            let mut chunks = [HxChunk::EMPTY; 5];
+            let mut scratch = [0u8; 8];
+            let hc = build_file_putfolder_chunks(&req, &mut chunks, &mut scratch);
+            let got: Vec<u16> = chunks[..hc].iter().map(|c| c.tag).collect();
+            assert_eq!(got, tags);
+            let at = tags.iter().position(|&t| t == tag::FILE_PREVIEW).unwrap();
+            assert_eq!(unsafe { chunk_bytes(&chunks[at]) }, &[0, 1]);
+            // One slot short of what the flag needs.
+            assert_eq!(
+                build_file_putfolder_chunks(&req, &mut chunks[..hc - 1], &mut scratch),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn file_putfolder_rejects_short_scratch() {
         let req = FilePutFolderRequest {
             name: b"x",
             dir: None,
+            resume: false,
             size: 0,
             nfiles: 0,
         };
@@ -3717,6 +3771,7 @@ mod tests {
         let req = FilePutFolderRequest {
             name: b"x",
             dir: Some(b"d"),
+            resume: false,
             size: 0,
             nfiles: 0,
         };
@@ -3730,6 +3785,7 @@ mod tests {
         let req2 = FilePutFolderRequest {
             name: b"x",
             dir: None,
+            resume: false,
             size: 0,
             nfiles: 0,
         };
@@ -3747,6 +3803,7 @@ mod tests {
         let req = FilePutFolderRequest {
             name: &big,
             dir: None,
+            resume: false,
             size: 0,
             nfiles: 0,
         };
@@ -3760,6 +3817,7 @@ mod tests {
         let req2 = FilePutFolderRequest {
             name: b"x",
             dir: Some(&big),
+            resume: false,
             size: 0,
             nfiles: 0,
         };
