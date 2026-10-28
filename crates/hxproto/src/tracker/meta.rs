@@ -125,6 +125,8 @@ pub struct TrackerMeta {
     pub min_protocol_version: Option<u16>,
     pub peak_24h: Option<u16>,
     pub avg_24h: Option<u16>,
+    /// Other servers' users shown here, apart from the user count.
+    pub linked_users: Option<u16>,
 
     // Capabilities (0x03xx).
     pub protocol_version: Option<u16>,
@@ -135,8 +137,10 @@ pub struct TrackerMeta {
     pub supports_voice: bool,
     pub supports_large_files: bool,
     pub supports_ipv6: bool,
+    pub supports_video: bool,
     /// Comma-separated cipher names.
     pub hope_ciphers: Option<String>,
+    pub supports_server_linking: bool,
     /// Comma-separated.
     pub tags: Option<String>,
 
@@ -239,6 +243,7 @@ impl TrackerMeta {
             id::MIN_PROTOCOL_VERSION => self.min_protocol_version = Some(u16_of(v)),
             id::PEAK_24H => self.peak_24h = Some(u16_of(v)),
             id::AVG_24H => self.avg_24h = Some(u16_of(v)),
+            id::LINKED_USERS => self.linked_users = Some(u16_of(v)),
 
             id::PROTOCOL_VERSION => self.protocol_version = Some(u16_of(v)),
             id::SUPPORTS_HOPE => self.supports_hope = flag_of(v),
@@ -248,7 +253,9 @@ impl TrackerMeta {
             id::SUPPORTS_VOICE => self.supports_voice = flag_of(v),
             id::SUPPORTS_LARGE_FILES => self.supports_large_files = flag_of(v),
             id::SUPPORTS_IPV6 => self.supports_ipv6 = flag_of(v),
+            id::SUPPORTS_VIDEO => self.supports_video = flag_of(v),
             id::HOPE_CIPHERS => self.hope_ciphers = Some(string_of(v)),
+            id::SUPPORTS_SERVER_LINKING => self.supports_server_linking = flag_of(v),
             id::TAGS => self.tags = Some(string_of(v)),
 
             id::NEWS_COUNT => self.news_count = Some(u32_of(v)),
@@ -321,6 +328,7 @@ impl TrackerMeta {
         n16(w, id::MIN_PROTOCOL_VERSION, self.min_protocol_version)?;
         n16(w, id::PEAK_24H, self.peak_24h)?;
         n16(w, id::AVG_24H, self.avg_24h)?;
+        n16(w, id::LINKED_USERS, self.linked_users)?;
 
         n16(w, id::PROTOCOL_VERSION, self.protocol_version)?;
         f(w, id::SUPPORTS_HOPE, self.supports_hope)?;
@@ -330,7 +338,9 @@ impl TrackerMeta {
         f(w, id::SUPPORTS_VOICE, self.supports_voice)?;
         f(w, id::SUPPORTS_LARGE_FILES, self.supports_large_files)?;
         f(w, id::SUPPORTS_IPV6, self.supports_ipv6)?;
+        f(w, id::SUPPORTS_VIDEO, self.supports_video)?;
         s(w, id::HOPE_CIPHERS, &self.hope_ciphers)?;
+        f(w, id::SUPPORTS_SERVER_LINKING, self.supports_server_linking)?;
         s(w, id::TAGS, &self.tags)?;
 
         n32(w, id::NEWS_COUNT, self.news_count)?;
@@ -483,6 +493,9 @@ mod tests {
             supports_tls: true,
             tls_port: Some(5600),
             supports_voice: true,
+            supports_video: true,
+            supports_server_linking: true,
+            linked_users: Some(3),
             tags: Some("retro,files".into()),
             files_count: Some(4),
             total_file_size: Some(1 << 40),

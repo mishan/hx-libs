@@ -38,6 +38,7 @@ pub mod id {
     pub const MIN_PROTOCOL_VERSION: u16 = 0x0210;
     pub const PEAK_24H: u16 = 0x0211;
     pub const AVG_24H: u16 = 0x0212;
+    pub const LINKED_USERS: u16 = 0x0213;
 
     // Capabilities (0x03xx).
     pub const PROTOCOL_VERSION: u16 = 0x0300;
@@ -48,7 +49,9 @@ pub mod id {
     pub const SUPPORTS_VOICE: u16 = 0x0305;
     pub const SUPPORTS_LARGE_FILES: u16 = 0x0306;
     pub const SUPPORTS_IPV6: u16 = 0x0307;
+    pub const SUPPORTS_VIDEO: u16 = 0x0308;
     pub const HOPE_CIPHERS: u16 = 0x0309;
+    pub const SUPPORTS_SERVER_LINKING: u16 = 0x030a;
     pub const TAGS: u16 = 0x0310;
 
     // Content index (0x04xx).
