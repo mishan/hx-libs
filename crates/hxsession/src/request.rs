@@ -84,7 +84,7 @@ const MAX_CREDENTIAL: usize = 64;
 /// here — it goes with the agreement, or in a user change to a server too
 /// old for one — which is what every server GtkHx is tested against
 /// expects.
-pub fn login(login: &[u8], password: &[u8], icon: u16, version: u16, caps: u16) -> Request {
+pub fn login(login: &[u8], password: &[u8], icon: u16, version: u16, caps: u64) -> Request {
     let login = &login[..login.len().min(MAX_CREDENTIAL)];
     let password = &password[..password.len().min(MAX_CREDENTIAL)];
     let mut r = Request::new(ClientHdr::Login as u32).field(tag::LOGIN, obfuscate(login));
@@ -98,7 +98,11 @@ pub fn login(login: &[u8], password: &[u8], icon: u16, version: u16, caps: u16) 
         r = r.field(tag::VERSION, version.to_be_bytes());
     }
     if caps != 0 {
-        r = r.field(tag::CAPABILITIES, caps.to_be_bytes());
+        let mut buf = [0u8; 8];
+        r = r.field(
+            tag::CAPABILITIES,
+            build::capabilities_encode(caps, &mut buf),
+        );
     }
     r
 }

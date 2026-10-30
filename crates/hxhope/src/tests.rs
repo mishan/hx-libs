@@ -1,6 +1,7 @@
 use crate::client::{self, Login, Offer};
 use crate::server::{self, Policy};
-use crate::{pack, tag, Cipher, Compression, Error, Mac, Random, Transport};
+use crate::{pack, tag, Cipher, Compression, Error, Mac, Random, Transport, LOGIN};
+use hxproto::messages::tag as hl;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
@@ -605,4 +606,35 @@ fn a_server_takes_the_login_only_as_a_mac() {
     assert!(!step2(&crate::obfuscate(b"guest")).names(&srv, b"guest"));
     assert!(step2(b"").names(&srv, b""));
     assert!(!step2(b"").names(&srv, b"guest"));
+}
+
+#[test]
+fn caps_past_bit_15_cross_step_2_whole() {
+    let offer = Offer::new(*b"TEST");
+    let policy = Policy {
+        macs: Mac::ALL.to_vec(),
+        ciphers: vec![],
+        compressions: vec![],
+        require_cipher: false,
+    };
+    let who = Login {
+        caps: (1 << 16) | 0x1f,
+        ..WHO
+    };
+    let (srv, reply) =
+        server::answer(&policy, &client::step1(&offer, 1).unwrap(), [2; 64], 1).unwrap();
+    let est = client::step2(&offer, &reply, &who, 2, cycle(&[0])).unwrap();
+    let wide = [0x01, 0xf0, 0x00, 0x04, 0x00, 0x01, 0x00, 0x1f];
+    assert!(est.step2.windows(wide.len()).any(|w| w == wide));
+    assert_eq!(srv.step2(&est.step2).unwrap().caps, who.caps);
+    // An 8-byte field, as earlier clients sent for any bit past 15.
+    let mac = Mac::Sha256.mac(b"pw", &[2; 64]);
+    let caps = [0, 0, 0, 0, 0, 1, 0, 0x1f];
+    let fields: Vec<(u16, &[u8])> = vec![
+        (hl::LOGIN, b""),
+        (hl::PASSWORD, &mac),
+        (hl::CAPABILITIES, &caps),
+    ];
+    let step2 = srv.step2(&pack(LOGIN, 2, &fields).unwrap()).unwrap();
+    assert_eq!(step2.caps, who.caps);
 }

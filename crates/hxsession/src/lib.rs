@@ -85,13 +85,13 @@ pub const CLIENT_VERSION: u16 = 254;
 
 /// Capability bits (the login's 0x01F0 field).
 pub mod cap {
-    pub const LARGE_FILES: u16 = 0x0001;
-    pub const TEXT_ENCODING: u16 = 0x0002;
-    pub const VOICE: u16 = 0x0004;
-    pub const INLINE_MEDIA: u16 = 0x0008;
-    pub const CHAT_HISTORY: u16 = 0x0010;
+    pub const LARGE_FILES: u64 = 0x0001;
+    pub const TEXT_ENCODING: u64 = 0x0002;
+    pub const VOICE: u64 = 0x0004;
+    pub const INLINE_MEDIA: u64 = 0x0008;
+    pub const CHAT_HISTORY: u64 = 0x0010;
     /// Never agreed without [`VOICE`].
-    pub const VIDEO: u16 = 0x0400;
+    pub const VIDEO: u64 = 0x0400;
 }
 
 /// The trans the login goes out on, as GtkHx sends it.
@@ -131,7 +131,7 @@ pub struct Config {
     /// [`cap::INLINE_MEDIA`], and [`cap::CHAT_HISTORY`]; offering others
     /// means the caller handles what they bring, through
     /// [`Session::request`] and [`Event::Unhandled`].
-    pub caps: u16,
+    pub caps: u64,
     /// Give up if the login has not been answered by then. `u64::MAX`
     /// never does.
     pub handshake_timeout_ms: u64,
@@ -231,7 +231,7 @@ pub struct ServerInfo {
     /// Our uid, when the server said.
     pub uid: Option<u16>,
     /// What the server agreed to, of what was offered.
-    pub caps: u16,
+    pub caps: u64,
     /// Inline media's advisory limits, each where the server sent it.
     pub media: inline_media::LimitsAdvertisement,
     /// Chat history's retention: how many messages, and how many days, the
@@ -1751,7 +1751,7 @@ impl Session {
     /// so to voice, which video needs).
     fn send_voice(
         &mut self,
-        bit: u16,
+        bit: u64,
         req: Option<Request>,
         what: Option<Expect>,
     ) -> Result<u32, Error> {
@@ -2418,7 +2418,7 @@ impl Session {
         }
         let mut name = vec![0u8; u16::MAX as usize];
         let (info, n) = parse::parse_login(&t.buf, len, &mut name);
-        let caps = (info.caps as u16) & self.cfg.caps;
+        let caps = info.caps & self.cfg.caps;
         self.utf8 = caps & cap::TEXT_ENCODING != 0;
         let has = |bit| info.seen & bit != 0;
         let server = ServerInfo {
@@ -2558,7 +2558,7 @@ impl Session {
         self.server.as_ref().map_or(0, |s| s.version)
     }
 
-    fn agreed(&self, bit: u16) -> bool {
+    fn agreed(&self, bit: u64) -> bool {
         self.server.as_ref().is_some_and(|s| s.caps & bit != 0)
     }
 

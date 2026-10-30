@@ -55,9 +55,10 @@ fn logging_in(cfg: Config) -> Session {
     s
 }
 
-fn login_reply(version: Option<u16>, caps: Option<u16>) -> Vec<u8> {
+fn login_reply(version: Option<u16>, caps: Option<u64>) -> Vec<u8> {
     let v = version.map(u16::to_be_bytes);
-    let c = caps.map(u16::to_be_bytes);
+    let mut buf = [0u8; 8];
+    let c = caps.map(|c| hxproto::build::capabilities_encode(c, &mut buf));
     let mut fields: Vec<(u16, &[u8])> = vec![(tag::SERVERNAME, b"Scripted")];
     if let Some(v) = &v {
         fields.push((tag::VERSION, v));
@@ -244,6 +245,33 @@ fn logged_in_says_what_the_login_reply_did() {
         });
         s.feed(&server(TASK, 1, 0, &fields), T0);
         assert_eq!(events(&mut s)[0], Event::LoggedIn(want));
+    }
+}
+
+#[test]
+fn caps_past_bit_15_go_and_come_back_whole() {
+    let cards = 1 << 16;
+    let cfg = Config {
+        caps: cap::TEXT_ENCODING | cards,
+        ..Config::guest("me")
+    };
+    let mut s = Session::new(cfg.clone(), T0);
+    assert_eq!(s.take_outgoing(), CLIENT_MAGIC);
+    s.feed(SERVER_MAGIC, T0);
+    let login = sent(&mut s);
+    assert!(login[0]
+        .2
+        .contains(&(tag::CAPABILITIES, vec![0x00, 0x01, 0x00, 0x02])));
+    // The narrowest width, and the 8 bytes earlier servers sent for any
+    // bit past 15.
+    for reply in [&[0x00, 0x01, 0x00, 0x02][..], &[0, 0, 0, 0, 0, 1, 0, 2]] {
+        let mut s = logging_in(cfg.clone());
+        s.feed(&server(TASK, 1, 0, &[(tag::CAPABILITIES, reply)]), T0);
+        assert_eq!(
+            s.server().unwrap().caps,
+            cap::TEXT_ENCODING | cards,
+            "{reply:02x?}"
+        );
     }
 }
 
@@ -1480,7 +1508,7 @@ fn the_session_says_when_the_stream_stopped_part_way() {
 
 /// A raw session through an empty agreement, handling `handled`, its login
 /// having agreed to `caps`.
-fn raw_ready(handled: Handled, caps: u16) -> Session {
+fn raw_ready(handled: Handled, caps: u64) -> Session {
     let mut s = logging_in(Config {
         handled,
         caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA | cap::CHAT_HISTORY,
@@ -3292,7 +3320,7 @@ fn a_picture_whose_reply_is_cut_short_fails_as_a_picture() {
 
 /// A session that agreed to `caps`, offering voice and video, with what
 /// logging in sent taken.
-fn voice_ready(caps: u16) -> Session {
+fn voice_ready(caps: u64) -> Session {
     let mut s = logging_in(Config {
         caps: cap::VOICE | cap::VIDEO,
         ..Config::guest("me")

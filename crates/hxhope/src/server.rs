@@ -8,6 +8,7 @@
 //! never crosses the wire, even obfuscated.
 
 use hxproto::messages::tag as hl;
+use hxproto::parse::capabilities_decode;
 
 use crate::alg::{encode_list, parse_list, Cipher, Compression, Mac};
 use crate::keys::{Chain, TransferKeys};
@@ -54,7 +55,7 @@ pub struct Step2 {
     pub icon: u16,
     /// 0 when it said none.
     pub version: u16,
-    pub caps: u16,
+    pub caps: u64,
 }
 
 /// The first label in the client's list at `tag` that `have` says yes to.
@@ -149,7 +150,7 @@ impl Server {
             name: field(frame, hl::NAME).unwrap_or_default().to_vec(),
             icon: u16_field(frame, hl::ICON),
             version: u16_field(frame, hl::VERSION),
-            caps: u16_field(frame, hl::CAPABILITIES),
+            caps: field(frame, hl::CAPABILITIES).map_or(0, capabilities_decode),
         })
     }
 

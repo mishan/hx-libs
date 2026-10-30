@@ -1958,6 +1958,26 @@ pub fn build_htxf_preamble(
     }
 }
 
+// ---- DATA_CAPABILITIES ------------------------------------------------
+
+/// Encode `caps` as a `DATA_CAPABILITIES` payload in `buf`: the narrowest
+/// of 2, 4 or 8 big-endian bytes that holds every bit set, as
+/// `Capabilities.md` requires of a sender. Nothing above bit 15 is the 2
+/// bytes every deployed implementation expects; 4 bytes is still an
+/// ordinary Hotline integer. [`crate::parse::capabilities_decode`] reads
+/// any width back.
+pub fn capabilities_encode(caps: u64, buf: &mut [u8; 8]) -> &[u8] {
+    *buf = caps.to_be_bytes();
+    let width = if caps <= 0xffff {
+        2
+    } else if caps <= 0xffff_ffff {
+        4
+    } else {
+        8
+    };
+    &buf[8 - width..]
+}
+
 // ---- Full message packer (Hotline transaction wire format) ----------
 
 /// A chunk with a safely-borrowed payload, used by the pure-Rust
@@ -4381,5 +4401,27 @@ mod tests {
         assert_eq!(parsed.icon_id, 128);
         assert_eq!(parsed.nick, b"alice");
         assert_eq!(parsed.message, b"waves");
+    }
+
+    #[test]
+    fn capabilities_go_in_the_narrowest_width_that_holds_them() {
+        let cases: &[(u64, &[u8])] = &[
+            (0, &[0x00, 0x00]),
+            ((1 << 1) | (1 << 6), &[0x00, 0x42]),
+            (1 << 15, &[0x80, 0x00]),
+            ((1 << 16) | (1 << 1), &[0x00, 0x01, 0x00, 0x02]),
+            (1 << 31, &[0x80, 0x00, 0x00, 0x00]),
+            (
+                (1 << 40) | (1 << 1),
+                &[0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02],
+            ),
+            (u64::MAX, &[0xff; 8]),
+        ];
+        for &(caps, want) in cases {
+            let mut buf = [0u8; 8];
+            let got = capabilities_encode(caps, &mut buf);
+            assert_eq!(got, want, "{caps:#x}");
+            assert_eq!(crate::parse::capabilities_decode(got), caps);
+        }
     }
 }
