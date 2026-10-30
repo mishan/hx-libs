@@ -128,6 +128,75 @@ pub enum ClientHdr {
     IconSet = 0x0000_0746,
     /// GIF-icons extension: one user's avatar, by [`tag::UID`].
     IconGet = 0x0000_0747,
+    /// Instant messaging (fogWraith `Capabilities-Messaging.md`), 800:
+    /// the whole roster. No fields; see [`crate::messaging`] for this
+    /// block and the drafts beside it.
+    GetRoster = 0x0000_0320,
+    /// Messaging 802: ask a Login to be a friend.
+    AddFriend = 0x0000_0322,
+    /// Messaging 803: end a friendship or withdraw a request.
+    RemoveFriend = 0x0000_0323,
+    /// Messaging 805: accept or reject a friend request.
+    FriendResponse = 0x0000_0325,
+    /// Messaging 806.
+    BlockUser = 0x0000_0326,
+    /// Messaging 807.
+    UnblockUser = 0x0000_0327,
+    /// Messaging 808: our presence, status text and preferences.
+    SetPresence = 0x0000_0328,
+    /// Messaging 810: an instant message to a Login.
+    ImSend = 0x0000_032a,
+    /// Messaging 812: a receipt. Bidirectional, as [`ServerHdr::ImAck`].
+    ImAck = 0x0000_032c,
+    /// Messaging 813: typing. Bidirectional, and never answered.
+    ImTyping = 0x0000_032d,
+    /// Messaging 814, the spec's File Offer: a file to a friend, not to
+    /// the server. 814-817 are bidirectional.
+    PeerFileOffer = 0x0000_032e,
+    /// Messaging 815, File Accept.
+    PeerFileAccept = 0x0000_032f,
+    /// Messaging 816, File Decline.
+    PeerFileDecline = 0x0000_0330,
+    /// Messaging 817, File Ready: direct-path candidates.
+    PeerFileReady = 0x0000_0331,
+    /// Messaging 818: ring friends into a voice room. 818-821 are
+    /// bidirectional.
+    CallInvite = 0x0000_0332,
+    /// Messaging 819.
+    CallAccept = 0x0000_0333,
+    /// Messaging 820.
+    CallDecline = 0x0000_0334,
+    /// Messaging 821.
+    CallCancel = 0x0000_0335,
+    /// Messaging 822: resolve an exact Login, or a fingerprint.
+    FindUser = 0x0000_0336,
+    /// Messaging 823: the directory.
+    UserSearch = 0x0000_0337,
+    /// Messaging 824: our alias for a friend.
+    SetFriendNickname = 0x0000_0338,
+    /// Messaging 825, the spec's Get User Info: a Login's profile. Not
+    /// [`ClientHdr::UserGetInfo`] (303).
+    GetProfile = 0x0000_0339,
+    /// Messaging 826, the spec's Set User Info: our own profile.
+    SetProfile = 0x0000_033a,
+    /// Messaging 827 (Buddy Icons): set or clear ours.
+    SetBuddyIcon = 0x0000_033b,
+    /// Messaging 828 (Buddy Icons): a friend's, or our own.
+    GetBuddyIcon = 0x0000_033c,
+    /// Message requests draft, 829: our requests and approvals, a page.
+    GetMessageRequests = 0x0000_033d,
+    /// Message requests draft, 830: approve, delete or end one.
+    AnswerMessageRequest = 0x0000_033e,
+    /// Message requests draft, 831: clear those within a span.
+    ClearMessageRequests = 0x0000_033f,
+    /// Messaging identity draft version 2, 833.
+    PresentFriendships = 0x0000_0341,
+    /// Messaging identity draft version 2, 834.
+    GetFriendships = 0x0000_0342,
+    /// Device proof draft, 1020: a challenge for the host we dialed.
+    GetDeviceChallenge = 0x0000_03fc,
+    /// Device proof draft, 1021: sign it with a device key.
+    ProveDevice = 0x0000_03fd,
 }
 
 /// Server → client transaction opcodes (`HTLS_HDR_*`).
@@ -167,6 +236,33 @@ pub enum ServerHdr {
     /// Video extension: the room's complete publication list, sent on
     /// every start, stop, pause and resume. Notification — task id `0`.
     VideoStatus = 0x0000_0263,
+    /// Messaging 801: one roster entry, whole. See [`crate::messaging`].
+    RosterEntry = 0x0000_0321,
+    /// Messaging 804: someone asks to be a friend.
+    FriendRequest = 0x0000_0324,
+    /// Messaging 809: a friend's presence.
+    PresenceChanged = 0x0000_0329,
+    /// Messaging 811: an instant message.
+    ImDeliver = 0x0000_032b,
+    /// Messaging 812: a receipt, forwarded.
+    ImAck = 0x0000_032c,
+    /// Messaging 813: typing, forwarded.
+    ImTyping = 0x0000_032d,
+    /// Messaging 814-817, relayed from a friend.
+    PeerFileOffer = 0x0000_032e,
+    PeerFileAccept = 0x0000_032f,
+    PeerFileDecline = 0x0000_0330,
+    /// Messaging 817: a relay reference or a friend's candidates.
+    PeerFileReady = 0x0000_0331,
+    /// Messaging 818-821, a ring and its answers.
+    CallInvite = 0x0000_0332,
+    CallAccept = 0x0000_0333,
+    CallDecline = 0x0000_0334,
+    CallCancel = 0x0000_0335,
+    /// Messaging 827: our buddy icon, set from another of our sessions.
+    SetBuddyIcon = 0x0000_033b,
+    /// Message requests draft, 832: the listing changed.
+    MessageRequestsChanged = 0x0000_0340,
     Task = 0x0001_0000,
 }
 
@@ -189,6 +285,22 @@ impl ServerHdr {
             0x0000_025c => VoiceIce,
             0x0000_025d => VoiceRoomStatus,
             0x0000_0263 => VideoStatus,
+            0x0000_0321 => RosterEntry,
+            0x0000_0324 => FriendRequest,
+            0x0000_0329 => PresenceChanged,
+            0x0000_032b => ImDeliver,
+            0x0000_032c => ImAck,
+            0x0000_032d => ImTyping,
+            0x0000_032e => PeerFileOffer,
+            0x0000_032f => PeerFileAccept,
+            0x0000_0330 => PeerFileDecline,
+            0x0000_0331 => PeerFileReady,
+            0x0000_0332 => CallInvite,
+            0x0000_0333 => CallAccept,
+            0x0000_0334 => CallDecline,
+            0x0000_0335 => CallCancel,
+            0x0000_033b => SetBuddyIcon,
+            0x0000_0340 => MessageRequestsChanged,
             0x0001_0000 => Task,
             _ => return None,
         })
@@ -539,6 +651,141 @@ pub mod tag {
     pub const VIDEO_SUBSCRIPTIONS: u16 = 0x0225;
     /// `0x0500` — Colored-Nicknames extension: 0x00RRGGBB (u32 BE).
     pub const COLOR: u16 = 0x0500;
+
+    // Instant messaging (fogWraith `Capabilities-Messaging.md`) and the
+    // drafts beside it; shapes in [`crate::messaging`]. Strings are in
+    // the connection's text encoding, integers big-endian.
+
+    /// `0x0600` — a roster peer's Login, not obfuscated. Opens each entry
+    /// group of a listing.
+    pub const FRIEND_LOGIN: u16 = 0x0600;
+    /// `0x0601` — our private alias for a friend.
+    pub const FRIEND_NICKNAME: u16 = 0x0601;
+    /// `0x0602` — presence (u16); see [`crate::messaging::PresenceState`].
+    pub const PRESENCE_STATE: u16 = 0x0602;
+    /// `0x0603` — status text. Present and empty clears it in a Set
+    /// Presence; absent there leaves it as it is.
+    pub const PRESENCE_STATUS_TEXT: u16 = 0x0603;
+    /// `0x0604` — relationship (u16); see [`crate::messaging::RosterState`].
+    pub const ROSTER_STATE: u16 = 0x0604;
+    /// `0x0605` — a message's 16-byte client-chosen id.
+    pub const MESSAGE_GUID: u16 = 0x0605;
+    /// `0x0606` — a message's text.
+    pub const MESSAGE_BODY: u16 = 0x0606;
+    /// `0x0607` — Unix seconds (u64), never the Hotline date.
+    pub const MESSAGE_TIMESTAMP: u16 = 0x0607;
+    /// `0x0608` — receipt kind (u16); see [`crate::messaging::AckType`].
+    pub const ACK_TYPE: u16 = 0x0608;
+    /// `0x0609` — typing (u16); see [`crate::messaging::TypingState`].
+    pub const TYPING_STATE: u16 = 0x0609;
+    /// `0x060a` — a user-to-user transfer's 16-byte id.
+    pub const FILE_TRANSFER_GUID: u16 = 0x060a;
+    /// `0x060b` — a 4-byte relay reference for the transfer port.
+    pub const FILE_RELAY_REF: u16 = 0x060b;
+    /// `0x060c` — a JSON ICE candidate for the direct transfer path.
+    pub const DIRECT_CANDIDATE: u16 = 0x060c;
+    /// `0x060d` — a call's 4-byte voice room id.
+    pub const CALL_ID: u16 = 0x060d;
+    /// `0x060e` — a call's packed member list.
+    pub const CALL_MEMBERS: u16 = 0x060e;
+    /// `0x060f` — outcome (u16); see [`crate::messaging::ReasonCode`].
+    pub const REASON_CODE: u16 = 0x060f;
+    /// `0x0610` — a friend request's note.
+    pub const REQUEST_NOTE: u16 = 0x0610;
+    /// `0x0611` — our directory listing (u16): 0 unlisted, 1 listed.
+    pub const DISCOVERABLE: u16 = 0x0611;
+    /// `0x0612` — a directory search term.
+    pub const SEARCH_QUERY: u16 = 0x0612;
+    /// `0x0613` — a friend's negotiated capabilities, read as
+    /// [`CAPABILITIES`] is.
+    pub const FRIEND_CAPABILITIES: u16 = 0x0613;
+    /// `0x0614` — profile: the name its holder goes by.
+    pub const PROFILE_NICKNAME: u16 = 0x0614;
+    /// `0x0615` — profile: given name.
+    pub const PROFILE_FIRST_NAME: u16 = 0x0615;
+    /// `0x0616` — profile: family name.
+    pub const PROFILE_LAST_NAME: u16 = 0x0616;
+    /// `0x0617` — profile: e-mail address.
+    pub const PROFILE_EMAIL: u16 = 0x0617;
+    /// `0x0618` — profile: gender (u16); see [`crate::messaging::Gender`].
+    pub const PROFILE_GENDER: u16 = 0x0618;
+    /// `0x0619` — profile: birth date, `year:2 | month:1 | day:1`.
+    pub const PROFILE_BIRTHDATE: u16 = 0x0619;
+    /// `0x061a` — profile: ISO 3166-1 alpha-2 country.
+    pub const PROFILE_COUNTRY: u16 = 0x061a;
+    /// `0x061b` — profile: post code.
+    pub const PROFILE_POSTCODE: u16 = 0x061b;
+    /// `0x061c` — profile: ISO 639-1 language, repeated.
+    pub const PROFILE_LANGUAGE: u16 = 0x061c;
+    /// `0x061d` — Buddy Icons: GIF, PNG or JPEG bytes.
+    pub const BUDDY_ICON: u16 = 0x061d;
+    /// `0x061e` — Buddy Icons: the first 16 bytes of the icon's SHA-256.
+    pub const BUDDY_ICON_HASH: u16 = 0x061e;
+    /// `0x061f` — identity draft: the 32-byte fingerprint of the
+    /// identity linked to an account.
+    pub const FRIEND_IDENTITY: u16 = 0x061f;
+    /// `0x0620` — login reply: the server's message byte limit (u32).
+    pub const MAX_MESSAGE_BYTES: u16 = 0x0620;
+    /// `0x0621` — login reply: the server's roster limit (u32).
+    pub const MAX_ROSTER_SIZE: u16 = 0x0621;
+    /// `0x0622` — login reply: the server's offline queue limit (u32).
+    pub const MAX_OFFLINE_QUEUE: u16 = 0x0622;
+    /// `0x0623` — login reply: buddy icon byte limit (u32); absent when
+    /// the server has no buddy icons.
+    pub const MAX_ICON_BYTES: u16 = 0x0623;
+    /// `0x0624` — login reply: buddy icon dimension limit (u32).
+    pub const MAX_ICON_DIMENSION: u16 = 0x0624;
+    /// `0x0625` — message requests draft, login reply: messages a request
+    /// may hold (u32); absent when the server takes no requests.
+    pub const MAX_REQUEST_MESSAGES: u16 = 0x0625;
+    /// `0x0628` — identity draft: a device certificate, repeated.
+    pub const FRIEND_DEVICE_CERT: u16 = 0x0628;
+    /// `0x0629` — identity draft: a signed message, detached.
+    pub const MESSAGE_SIGNED: u16 = 0x0629;
+    /// `0x062a` — identity draft: a sealed message, in place of a body.
+    pub const MESSAGE_SEALED: u16 = 0x062a;
+    /// `0x062b` — identity draft: the SHA-256 of the key it was sealed to.
+    pub const MESSAGE_SEALED_TO: u16 = 0x062b;
+    /// `0x0650` — message requests draft: whether we take them (u16).
+    pub const TAKES_REQUESTS: u16 = 0x0650;
+    /// `0x0651` — message requests draft: an opaque paging cursor.
+    pub const REQUEST_CURSOR: u16 = 0x0651;
+    /// `0x0652` — message requests draft: what to do with one (u16); see
+    /// [`crate::messaging::RequestAction`].
+    pub const REQUEST_ACTION: u16 = 0x0652;
+    /// `0x0653` — message requests draft: a count (u32), of what each
+    /// transaction says.
+    pub const REQUEST_COUNT: u16 = 0x0653;
+    /// `0x0654` — message requests draft: friend requests declined (u32).
+    pub const FRIEND_REQUEST_COUNT: u16 = 0x0654;
+    /// `0x0655` — message requests draft: a span's start, Unix seconds.
+    pub const SPAN_SINCE: u16 = 0x0655;
+    /// `0x0656` — message requests draft: a span's end, Unix seconds.
+    pub const SPAN_BEFORE: u16 = 0x0656;
+    /// `0x0658` — identity draft version 2: a friendship offer.
+    pub const FRIEND_OFFER: u16 = 0x0658;
+    /// `0x0659` — identity draft version 2: a friendship.
+    pub const FRIENDSHIP: u16 = 0x0659;
+    /// `0x065a` — identity draft version 2: a withdrawal.
+    pub const FRIEND_WITHDRAW: u16 = 0x065a;
+    /// `0x065b` — identity draft version 2: a 32-byte friendship hash, or
+    /// a withdrawal's pair hash.
+    pub const FRIENDSHIP_HASH: u16 = 0x065b;
+    /// `0x065c` — identity draft version 2: a rotation record, repeated.
+    pub const IDENTITY_ROTATION: u16 = 0x065c;
+    /// `0x0420` — device proof draft: the host the client dialed, port
+    /// included.
+    pub const PROOF_HOST: u16 = 0x0420;
+    /// `0x0421` — device proof draft: a TRTP server challenge.
+    pub const SERVER_CHALLENGE: u16 = 0x0421;
+    /// `0x0422` — device proof draft: a device proof.
+    pub const DEVICE_PROOF: u16 = 0x0422;
+    /// `0x0423` — device proof draft: a device certificate. The shape of
+    /// [`FRIEND_DEVICE_CERT`] under a number of its own, since device
+    /// proof does not depend on messaging.
+    pub const DEVICE_CERT: u16 = 0x0423;
+    /// `0x0424` — device proof draft: a user card, only to link.
+    pub const USER_CARD: u16 = 0x0424;
 
     /// `0x0300` — GIF-icons extension: raw GIF avatar bytes
     /// (GIF87a/GIF89a). On an ICON_SET request (empty clears) and an

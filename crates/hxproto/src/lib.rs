@@ -29,6 +29,8 @@
 //! - [`build`] — outgoing-message builders for the SEND path. Each
 //!   `hx_send_*` in C delegates to a `build_*_chunks` here, then hands
 //!   the chunk array to `hlwrite_chunks()` for actual wire encoding.
+//! - [`messaging`] — the instant messaging extension and its drafts:
+//!   their enumerations, the grouped listings, and the client's requests.
 //!
 //! The crate exports no C ABI. A consumer with a C side (GtkHx) keeps its
 //! `extern "C"` entry points in its own tree, over this Rust API.
@@ -46,6 +48,7 @@ pub mod hl_date;
 pub mod inline_media;
 pub mod login;
 pub mod messages;
+pub mod messaging;
 pub mod parse;
 pub mod sanitize;
 pub mod text;

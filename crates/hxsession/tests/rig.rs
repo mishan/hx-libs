@@ -250,7 +250,7 @@ fn log_in_chat_and_message_on_every_server() {
 }
 
 /// What GtkHx offers at login: every extension, voice and video too.
-const GTKHX_CAPS: u16 = cap::LARGE_FILES
+const GTKHX_CAPS: u64 = cap::LARGE_FILES
     | cap::TEXT_ENCODING
     | cap::VOICE
     | cap::INLINE_MEDIA

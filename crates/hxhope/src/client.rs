@@ -44,7 +44,7 @@ pub struct Login<'a> {
     pub icon: u16,
     /// 0 leaves it out.
     pub version: u16,
-    pub caps: u16,
+    pub caps: u64,
 }
 
 /// Step 2, and what the rest of the connection runs through once it is
@@ -196,7 +196,8 @@ pub fn step2(
     let compression_echo = compression.map(|c| list(&[c.label()])).transpose()?;
     let icon = who.icon.to_be_bytes();
     let version = who.version.to_be_bytes();
-    let caps = who.caps.to_be_bytes();
+    let mut caps_buf = [0u8; 8];
+    let caps = hxproto::build::capabilities_encode(who.caps, &mut caps_buf);
     let mut fields: Vec<(u16, &[u8])> =
         vec![(hl::LOGIN, &login), (hl::PASSWORD, &chain.password_mac)];
     // No cipher is an absent field: mhxd closes on a present one that
@@ -216,7 +217,7 @@ pub fn step2(
     if mode != b"STREAM" {
         fields.push((tag::S_CIPHER_MODE, mode));
     }
-    fields.push((hl::CAPABILITIES, &caps));
+    fields.push((hl::CAPABILITIES, caps));
     let step2 =
         pack(LOGIN, trans, &fields).ok_or_else(|| Error::Malformed("step 2 too long".into()))?;
 

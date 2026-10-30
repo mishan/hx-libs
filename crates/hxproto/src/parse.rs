@@ -1456,25 +1456,21 @@ pub fn tracker_v3_meta_clamp_listing_category(raw: u8) -> u8 {
 
 // ---- HTLS_DATA_CAPABILITIES decode -------------------------------------
 
-/// Decode an `HTLS_DATA_CAPABILITIES` payload (variable-width big-endian
-/// unsigned integer) into a `u64`. The wire format is the same shape any
-/// peer uses to advertise the fogWraith capability bitmask: 1..8 bytes,
-/// MSB first, no fixed length.
+/// Decode a `DATA_CAPABILITIES` payload into a `u64`, read as a
+/// big-endian unsigned integer of whatever width it arrives in.
 ///
-/// Truncation: payloads longer than 8 bytes are clipped at the first 8
-/// (the rest can't fit in a `u64` anyway, and the spec lets us drop
-/// trailing capability bits we don't understand — bits stay round-trip
-/// consistent at the wire layer, we just can't store them locally).
+/// A sender uses the narrowest of 2, 4 or 8 bytes that holds its bits,
+/// but a receiver accepts any width (`Capabilities.md`, "Field Width"):
+/// earlier implementations sent 8 bytes for any bit above 15, and some
+/// send 1. Reading a fixed 2 bytes would take a wider field's top bits
+/// and lose every capability in it. A field wider than 8 bytes is read by
+/// its low 64 bits, the ones that can carry a defined capability.
 ///
 /// Empty input returns `0` — used by pre-spec servers that advertise the
 /// CAPABILITIES chunk without a payload.
 pub fn capabilities_decode(bytes: &[u8]) -> u64 {
-    let n = bytes.len().min(8);
-    let mut caps: u64 = 0;
-    for &b in &bytes[..n] {
-        caps = (caps << 8) | (b as u64);
-    }
-    caps
+    let low = &bytes[bytes.len().saturating_sub(8)..];
+    low.iter().fold(0, |caps, &b| (caps << 8) | u64::from(b))
 }
 
 // ---- HTLC_DATA_CATLIST (1.5 threaded-news article listing) -------------
@@ -4316,39 +4312,37 @@ mod tests {
     // ---- HTLS_DATA_CAPABILITIES ----
 
     #[test]
-    fn capabilities_decode_empty_is_zero() {
-        // Pre-spec servers can advertise the chunk with no payload.
-        assert_eq!(capabilities_decode(&[]), 0);
-    }
-
-    #[test]
-    fn capabilities_decode_single_byte() {
-        assert_eq!(capabilities_decode(&[0x42]), 0x42);
-    }
-
-    #[test]
-    fn capabilities_decode_two_bytes_be() {
-        // Production-typical width — CHAT_HISTORY (bit 0) + LARGE_FILES
-        // (bit 1) + TEXT_ENCODING (bit 4) all fit in 16 bits.
-        assert_eq!(capabilities_decode(&[0x00, 0x13]), 0x0013);
-    }
-
-    #[test]
-    fn capabilities_decode_eight_bytes_saturates_u64() {
-        let bytes = [0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe];
-        assert_eq!(capabilities_decode(&bytes), 0xdeadbeefcafebabe);
-    }
-
-    #[test]
-    fn capabilities_decode_oversize_truncates_to_first_eight() {
-        // A future >64-bit advertisement: only the leading 8 bytes fit
-        // in u64. Spec lets us drop the rest; the wire is round-trip
-        // consistent regardless because we don't echo what we didn't
-        // parse.
-        let bytes = [
-            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0xff, 0xff, 0xff,
+    fn capabilities_decode_reads_every_width() {
+        // Bit 16, CAPABILITY_CARDS, is the first a 2-byte field cannot
+        // hold.
+        let cases: &[(&[u8], u64)] = &[
+            // Pre-spec servers can advertise the chunk with no payload.
+            (&[], 0),
+            (&[0x42], 0x42),
+            (&[0x00, 0x13], 0x0013),
+            (&[0x01, 0x00, 0x02], 0x0001_0002),
+            (&[0x00, 0x01, 0x00, 0x02], 0x0001_0002),
+            (
+                &[0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02],
+                (1 << 40) | 2,
+            ),
+            (
+                &[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe],
+                0xdeadbeefcafebabe,
+            ),
+            // Wider than 8 bytes: the low 64 bits, which hold every
+            // defined capability; the leading bytes cannot.
+            (
+                &[
+                    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x01, 0x00, 0x42,
+                ],
+                0x0001_0042,
+            ),
         ];
-        assert_eq!(capabilities_decode(&bytes), 0x123456789abcdef0);
+        for &(bytes, want) in cases {
+            assert_eq!(capabilities_decode(bytes), want, "{bytes:02x?}");
+        }
     }
 
     // ---- news dirlist: folderitem ----
