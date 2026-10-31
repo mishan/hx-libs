@@ -175,6 +175,7 @@ fn a_1_2_server_gets_the_name_in_a_user_change() {
 #[test]
 fn logged_in_says_what_the_login_reply_did() {
     use hxproto::inline_media::LimitsAdvertisement;
+    use hxproto::messaging::CAP_MESSAGING;
     use hxproto::video::{Limits, VideoKind};
     let camera = Limits {
         kind: VideoKind::Camera,
@@ -203,6 +204,8 @@ fn logged_in_says_what_the_login_reply_did() {
         (tag::HISTORY_MAX_DAYS, &[0, 0, 0, 0]),
         (tag::VIDEO_LIMITS, &camera_bytes),
         (tag::VIDEO_LIMITS, &screen_bytes),
+        (tag::MAX_MESSAGE_BYTES, &[0, 0, 16, 0]),
+        (tag::MAX_REQUEST_MESSAGES, &[0, 0, 0, 5]),
     ];
     let cases = [
         (
@@ -212,7 +215,7 @@ fn logged_in_says_what_the_login_reply_did() {
                 name: Some("Full\nHouse".into()),
                 uid: Some(7),
                 // Only what was offered.
-                caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA,
+                caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA | CAP_MESSAGING,
                 media: LimitsAdvertisement {
                     max_bytes: Some(1024),
                     chunk_size: Some(256),
@@ -221,6 +224,29 @@ fn logged_in_says_what_the_login_reply_did() {
                 history_max_msgs: Some(50),
                 history_max_days: Some(0),
                 video: vec![camera, screen],
+                messaging: Some(hxproto::messaging::Limits {
+                    max_message_bytes: Some(4096),
+                    max_request_messages: Some(5),
+                    ..Default::default()
+                }),
+            },
+        ),
+        // The messaging limits without the bit they belong to.
+        (
+            vec![
+                (tag::CAPABILITIES, &[0, 0x02][..]),
+                (tag::MAX_REQUEST_MESSAGES, &[0, 0, 0, 5]),
+            ],
+            ServerInfo {
+                version: 0,
+                name: None,
+                uid: None,
+                caps: cap::TEXT_ENCODING,
+                media: LimitsAdvertisement::empty(),
+                history_max_msgs: None,
+                history_max_days: None,
+                video: vec![],
+                messaging: None,
             },
         ),
         // A 1.2 server: no version, no name, nothing of the extensions.
@@ -235,12 +261,13 @@ fn logged_in_says_what_the_login_reply_did() {
                 history_max_msgs: None,
                 history_max_days: None,
                 video: vec![],
+                messaging: None,
             },
         ),
     ];
     for (fields, want) in cases {
         let mut s = logging_in(Config {
-            caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA,
+            caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA | CAP_MESSAGING,
             ..Config::guest("me")
         });
         s.feed(&server(TASK, 1, 0, &fields), T0);

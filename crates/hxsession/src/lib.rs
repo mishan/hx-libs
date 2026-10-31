@@ -240,6 +240,9 @@ pub struct ServerInfo {
     pub history_max_days: Option<u32>,
     /// Video's ceilings, one for each kind the server described.
     pub video: Vec<hxproto::video::Limits>,
+    /// The messaging extension's limits, where the server agreed to it;
+    /// a request bound among them says it serves message requests.
+    pub messaging: Option<hxproto::messaging::Limits>,
 }
 
 /// One user on the server.
@@ -2452,6 +2455,8 @@ impl Session {
                 .into_iter()
                 .chain(info.video_screen)
                 .collect(),
+            messaging: (caps & hxproto::messaging::CAP_MESSAGING != 0)
+                .then(|| hxproto::messaging::Limits::extract(&t.buf, len)),
         };
         let version = server.version;
         self.server = Some(server.clone());
