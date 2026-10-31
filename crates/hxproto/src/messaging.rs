@@ -1237,8 +1237,9 @@ pub fn build_login_only_chunks(login: &[u8], chunks: &mut [HxChunk], scratch: &m
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Presence<'a> {
     /// Never [`PresenceState::Offline`], which a client does not set for
-    /// itself.
-    pub state: PresenceState,
+    /// itself. `None` changes a setting alone, which sending a state would
+    /// not: a state ends an Invisible set from another client.
+    pub state: Option<PresenceState>,
     /// `None` leaves the stored text as it is; `Some(b"")` clears it. The
     /// two are different requests.
     pub status_text: Option<&'a [u8]>,
@@ -1254,8 +1255,10 @@ pub fn build_set_presence_chunks(
     scratch: &mut [u8],
 ) -> usize {
     build(chunks, scratch, |f| {
-        (p.state != PresenceState::Offline).then_some(())?;
-        f.put_int(tag::PRESENCE_STATE, &p.state.wire().to_be_bytes())?;
+        if let Some(state) = p.state {
+            (state != PresenceState::Offline).then_some(())?;
+            f.put_int(tag::PRESENCE_STATE, &state.wire().to_be_bytes())?;
+        }
         if let Some(t) = p.status_text {
             f.put(tag::PRESENCE_STATUS_TEXT, t)?;
         }
@@ -2333,7 +2336,7 @@ mod tests {
                 "808 clearing the status, with every preference",
                 run(|c, s| {
                     let p = Presence {
-                        state: PresenceState::Away,
+                        state: Some(PresenceState::Away),
                         status_text: Some(b""),
                         discoverable: Some(true),
                         takes_requests: Some(false),
@@ -2351,7 +2354,7 @@ mod tests {
                 "808 leaving the status as it is",
                 run(|c, s| {
                     let p = Presence {
-                        state: PresenceState::Online,
+                        state: Some(PresenceState::Online),
                         status_text: None,
                         discoverable: None,
                         takes_requests: None,
@@ -2359,6 +2362,19 @@ mod tests {
                     build_set_presence_chunks(&p, c, s)
                 }),
                 owned(&[(tag::PRESENCE_STATE, &[0, 1])]),
+            ),
+            (
+                "808 changing a setting alone",
+                run(|c, s| {
+                    let p = Presence {
+                        state: None,
+                        status_text: None,
+                        discoverable: None,
+                        takes_requests: Some(true),
+                    };
+                    build_set_presence_chunks(&p, c, s)
+                }),
+                owned(&[(tag::TAKES_REQUESTS, &[0, 1])]),
             ),
             (
                 "810 signed",
@@ -2554,7 +2570,7 @@ mod tests {
                 "808 setting ourselves offline",
                 run(|c, s| {
                     let p = Presence {
-                        state: PresenceState::Offline,
+                        state: Some(PresenceState::Offline),
                         status_text: None,
                         discoverable: None,
                         takes_requests: None,
@@ -2566,7 +2582,7 @@ mod tests {
                 "808 into too few chunks",
                 run(|c, s| {
                     let p = Presence {
-                        state: PresenceState::Online,
+                        state: Some(PresenceState::Online),
                         status_text: Some(b"x"),
                         discoverable: Some(true),
                         takes_requests: Some(true),
@@ -2578,7 +2594,7 @@ mod tests {
                 "808 with too little scratch",
                 run(|c, s| {
                     let p = Presence {
-                        state: PresenceState::Online,
+                        state: Some(PresenceState::Online),
                         status_text: None,
                         discoverable: Some(true),
                         takes_requests: Some(true),
