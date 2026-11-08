@@ -478,7 +478,8 @@ fn pushes_become_events() {
                 cid: 0,
                 uid: 5,
                 text: "    bob:  hi".into(),
-                media: None
+                media: None,
+                line: None
             },
             Event::Message {
                 uid: 5,
@@ -532,7 +533,8 @@ fn text_follows_the_negotiated_encoding() {
         cid: 0,
         uid: 0,
         text: "café".into(),
-        media: None
+        media: None,
+        line: None
     }));
 }
 
@@ -1538,7 +1540,7 @@ fn the_session_says_when_the_stream_stopped_part_way() {
 fn raw_ready(handled: Handled, caps: u64) -> Session {
     let mut s = logging_in(Config {
         handled,
-        caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA | cap::CHAT_HISTORY,
+        caps: cap::TEXT_ENCODING | cap::INLINE_MEDIA | cap::CHAT_HISTORY | cap::STRUCTURED_CHAT,
         ..raw()
     });
     s.feed(&login_reply(Some(190), Some(caps)), T0);
@@ -1608,6 +1610,7 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
             uid: 5,
             text: "bob:  hi".into(),
             media: None,
+            line: None,
         },
         Event::ChatInvite {
             cid: 9,
@@ -1827,12 +1830,90 @@ fn a_chat_line_carries_its_media_where_it_was_agreed() {
                     cid: 0,
                     uid: 0,
                     text: "look".into(),
-                    media
+                    media,
+                    line: None
                 }],
                 "{what}"
             ),
             None => assert!(got.is_empty(), "{what}: dropped whole"),
         }
+    }
+}
+
+#[test]
+fn a_chat_line_carries_its_entry_where_structured_chat_was_agreed() {
+    let body: (u16, &[u8]) = (tag::BODY, b"\r a-long-nick: x:  a: b");
+    let uid: (u16, &[u8]) = (tag::UID, &[0, 7]);
+    let entry = |nick: &[u8], text: &[u8]| {
+        hxproto::build::build_history_entry(1000, 1_793_534_400, 8, 128, nick, text, &[]).unwrap()
+    };
+    let parsed = |nick: &str, text: &str| HistoryEntry {
+        message_id: 1000,
+        timestamp: 1_793_534_400,
+        flags: 8,
+        icon: 128,
+        nick: nick.into(),
+        text: text.into(),
+    };
+    let whole = entry(b"a-long-nick: x", b"a: b\rc");
+    let (nick, text) = ("n".repeat(MAX_NICK), "t".repeat(MAX_BODY));
+    let longest = entry(nick.as_bytes(), text.as_bytes());
+    let cases = [
+        (
+            "agreed",
+            cap::STRUCTURED_CHAT,
+            Some(whole.clone()),
+            Some(parsed("a-long-nick: x", "a: b\nc")),
+        ),
+        ("none sent", cap::STRUCTURED_CHAT, None, None),
+        (
+            "cut short",
+            cap::STRUCTURED_CHAT,
+            Some(whole[..whole.len() - 1].to_vec()),
+            None,
+        ),
+        ("not agreed", 0, Some(whole), None),
+        (
+            "control bytes in the nick",
+            cap::STRUCTURED_CHAT,
+            Some(entry(b"\x1bbob", b"hi")),
+            Some(parsed("[bob", "hi")),
+        ),
+        (
+            "as long as the text may be",
+            cap::STRUCTURED_CHAT,
+            Some(longest),
+            Some(parsed(&nick, &text)),
+        ),
+        (
+            "a nick longer",
+            cap::STRUCTURED_CHAT,
+            Some(entry(format!("{nick}n").as_bytes(), b"hi")),
+            None,
+        ),
+        (
+            "a text longer",
+            cap::STRUCTURED_CHAT,
+            Some(entry(b"bob", format!("{text}t").as_bytes())),
+            None,
+        ),
+    ];
+    for (what, caps, line_field, line) in cases {
+        let mut fields = vec![body, uid];
+        fields.extend(line_field.as_deref().map(|d| (tag::CHAT_LINE, d)));
+        let mut s = raw_ready(Handled::CHAT, caps);
+        s.feed(&server(0x6a, 0, 0, &fields), T0);
+        assert_eq!(
+            events(&mut s),
+            [Event::Chat {
+                cid: 0,
+                uid: 7,
+                text: " a-long-nick: x:  a: b".into(),
+                media: None,
+                line,
+            }],
+            "{what}"
+        );
     }
 }
 

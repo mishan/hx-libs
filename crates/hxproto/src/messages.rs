@@ -449,6 +449,10 @@ pub mod tag {
     pub const HISTORY_MAX_MSGS: u16 = 0x0f07;
     /// `0x0f08` — chat-history retention hint: max age in days (LOGIN reply).
     pub const HISTORY_MAX_DAYS: u16 = 0x0f08;
+    /// `0x0f33` — one live chat line on CHAT (106), packed as a
+    /// [`HISTORY_ENTRY`] is, to a session that agreed to the Structured
+    /// Chat draft (capability bit 17). Not allocated.
+    pub const CHAT_LINE: u16 = 0x0f33;
     /// `0x012c` — user-list record (server → client).
     pub const USER_LIST: u16 = 0x012c;
     /// `0x0140` — 1.5 news directory-listing entry (folder or category).
