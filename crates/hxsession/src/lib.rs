@@ -52,9 +52,9 @@
 //! changes, and asking for a transfer or the server's banner, which the
 //! server answers with the reference a transfer connection opens with.
 //! That connection (HTXF) is not here. Of the extensions, chat history,
-//! inline media and GIF icons are, and voice and video's requests; what
-//! voice and video send unasked (the offers, candidates and who is in the
-//! room) arrives whole, as [`Event::Unhandled`].
+//! structured chat, inline media and GIF icons are, and voice and video's
+//! requests; what voice and video send unasked (the offers, candidates and
+//! who is in the room) arrives whole, as [`Event::Unhandled`].
 //! [`Session::request`] sends any transaction and hands its reply back
 //! whole, for what has no method of its own.
 
@@ -92,6 +92,9 @@ pub mod cap {
     pub const CHAT_HISTORY: u64 = 0x0010;
     /// Never agreed without [`VOICE`].
     pub const VIDEO: u64 = 0x0400;
+    /// The Structured Chat draft's, and not allocated: a chat line also
+    /// comes as its history entry.
+    pub const STRUCTURED_CHAT: u64 = 0x0002_0000;
 }
 
 /// The trans the login goes out on, as GtkHx sends it.
@@ -128,7 +131,8 @@ pub struct Config {
     pub version: u16,
     /// Capabilities to offer. The session itself understands
     /// [`cap::TEXT_ENCODING`], the media a chat line carries under
-    /// [`cap::INLINE_MEDIA`], and [`cap::CHAT_HISTORY`]; offering others
+    /// [`cap::INLINE_MEDIA`], [`cap::CHAT_HISTORY`], and the entry a chat
+    /// line carries under [`cap::STRUCTURED_CHAT`]; offering others
     /// means the caller handles what they bring, through
     /// [`Session::request`] and [`Event::Unhandled`].
     pub caps: u64,
@@ -410,13 +414,16 @@ pub struct MediaPart {
     pub last: bool,
 }
 
-/// One line of a chat's history, under [`cap::CHAT_HISTORY`].
+/// One line of a chat's history, under [`cap::CHAT_HISTORY`], or a live
+/// line under [`cap::STRUCTURED_CHAT`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
+    /// A live line's is 0 when it cannot be named.
     pub message_id: u64,
     /// Seconds since 1970, UTC.
     pub timestamp: i64,
-    /// 1 an emote, 2 from the server, 4 deleted.
+    /// 1 an emote, 2 from the server, 4 deleted, and on a live line alone,
+    /// 8 an id from the chat's own count rather than its history's.
     pub flags: u16,
     pub icon: u16,
     pub nick: String,
@@ -426,18 +433,20 @@ pub struct HistoryEntry {
 impl HistoryEntry {
     /// One entry as a history reply packs it; `None` when it does not hold
     /// together. Its line breaks and control bytes are read as a live chat
-    /// line's are.
+    /// line's are, and the nick's control bytes too.
     pub fn parse(data: &[u8]) -> Option<Self> {
         let e = parse::parse_history_entry(data)?;
         let mut text = e.message.to_vec();
         hxproto::sanitize::cr2lf(&mut text);
         hxproto::sanitize::strip_ansi(&mut text);
+        let mut nick = e.nick.to_vec();
+        hxproto::sanitize::strip_ansi(&mut nick);
         Some(HistoryEntry {
             message_id: e.message_id,
             timestamp: e.timestamp,
             flags: e.flags,
             icon: e.icon_id,
-            nick: text_in(e.nick),
+            nick: text_in(&nick),
             text: text_in(&text),
         })
     }
@@ -542,12 +551,15 @@ pub enum Event {
     /// the login; requests may follow.
     Ready,
     /// A chat line. One that came with half of its media is dropped, as
-    /// the extension says.
+    /// the extension says. `line` is the line as data, where the server
+    /// agreed to [`cap::STRUCTURED_CHAT`] and sent an entry that holds
+    /// together; `text` is what to show either way.
     Chat {
         cid: u32,
         uid: u16,
         text: String,
         media: Option<ChatMedia>,
+        line: Option<HistoryEntry>,
     },
     /// An invitation to private chat `cid`, from `uid`.
     ChatInvite {
@@ -1879,11 +1891,27 @@ impl Session {
                 };
                 let c = parse::parse_chat(&t.buf, len, MAX_BODY);
                 let text = self.decode(c.text());
+                let line = self
+                    .agreed(cap::STRUCTURED_CHAT)
+                    .then(|| {
+                        // Held to the bounds the formatted text is, which
+                        // is what is shown where the entry is not.
+                        hxproto::wire::ChunkIter::over_message(&t.buf, len)
+                            .find(|c| c.tag == tag::CHAT_LINE)
+                            .filter(|c| {
+                                parse::parse_history_entry(c.data).is_some_and(|e| {
+                                    e.nick.len() <= MAX_NICK && e.message.len() <= MAX_BODY
+                                })
+                            })
+                            .and_then(|c| HistoryEntry::parse(c.data))
+                    })
+                    .flatten();
                 self.events.push_back(Event::Chat {
                     cid: c.cid,
                     uid: c.uid,
                     text,
                     media,
+                    line,
                 });
             }
             HandlerKind::ChatInvite => {
