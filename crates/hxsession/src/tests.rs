@@ -229,6 +229,7 @@ fn logged_in_says_what_the_login_reply_did() {
                     max_request_messages: Some(5),
                     ..Default::default()
                 }),
+                reactions: None,
             },
         ),
         // The messaging limits without the bit they belong to.
@@ -247,6 +248,7 @@ fn logged_in_says_what_the_login_reply_did() {
                 history_max_days: None,
                 video: vec![],
                 messaging: None,
+                reactions: None,
             },
         ),
         // A 1.2 server: no version, no name, nothing of the extensions.
@@ -262,6 +264,7 @@ fn logged_in_says_what_the_login_reply_did() {
                 history_max_days: None,
                 video: vec![],
                 messaging: None,
+                reactions: None,
             },
         ),
     ];
@@ -272,6 +275,55 @@ fn logged_in_says_what_the_login_reply_did() {
         });
         s.feed(&server(TASK, 1, 0, &fields), T0);
         assert_eq!(events(&mut s)[0], Event::LoggedIn(want));
+    }
+}
+
+#[test]
+fn reactions_are_the_sessions_only_beside_the_bits_they_need_and_their_targets() {
+    use hxproto::reactions::Limits;
+    let all = cap::TEXT_ENCODING | cap::STRUCTURED_CHAT | cap::REACTIONS;
+    let limits = Some(Limits {
+        targets: 0x52,
+        max_keys: Some(20),
+        max_per_user: Some(5),
+    });
+    for (case, offered, echoed, targets, want) in [
+        ("agreed", all, all, true, limits),
+        ("no targets", all, all, false, None),
+        (
+            "without text encoding",
+            all,
+            all & !cap::TEXT_ENCODING,
+            true,
+            None,
+        ),
+        (
+            "without structured chat",
+            all,
+            all & !cap::STRUCTURED_CHAT,
+            true,
+            None,
+        ),
+        ("not offered", all & !cap::REACTIONS, all, true, None),
+    ] {
+        let mut s = logging_in(Config {
+            caps: offered,
+            ..Config::guest("me")
+        });
+        let mut buf = [0u8; 8];
+        let mut fields: Vec<(u16, &[u8])> = vec![
+            (
+                tag::CAPABILITIES,
+                hxproto::build::capabilities_encode(echoed, &mut buf),
+            ),
+            (tag::MAX_REACTION_KEYS, &[0, 0, 0, 20]),
+            (tag::MAX_REACTIONS_PER_USER, &[0, 0, 0, 5]),
+        ];
+        if targets {
+            fields.push((tag::REACTION_TARGETS, &[0, 0x52]));
+        }
+        s.feed(&server(TASK, 1, 0, &fields), T0);
+        assert_eq!(s.server().unwrap().reactions, want, "{case}");
     }
 }
 
@@ -1854,6 +1906,7 @@ fn a_chat_line_carries_its_entry_where_structured_chat_was_agreed() {
         icon: 128,
         nick: nick.into(),
         text: text.into(),
+        reactions: None,
     };
     let whole = entry(b"a-long-nick: x", b"a: b\rc");
     let (nick, text) = ("n".repeat(MAX_NICK), "t".repeat(MAX_BODY));
@@ -2072,6 +2125,7 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
         icon: 7,
         nick: nick.into(),
         text: text.into(),
+        reactions: None,
     };
     assert_eq!(
         events(&mut s),
@@ -2091,6 +2145,100 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
             },
         ]
     );
+}
+
+#[test]
+fn a_history_entrys_reactions_are_read_only_where_the_session_has_reactions() {
+    use hxproto::reactions::{Key, Mine, Summary, SUBFIELD_REACTIONS, SUBFIELD_REACTIONS_MINE};
+    let thumbs = "\u{1F44D}";
+    let summary = [&[0, 1, 0, 0, 0, 2, 0, 5, 1][..], thumbs.as_bytes()].concat();
+    let sub = |ty: u16, data: &[u8]| {
+        [
+            &ty.to_be_bytes()[..],
+            &(data.len() as u16).to_be_bytes(),
+            data,
+        ]
+        .concat()
+    };
+    let entry = |trailer: Vec<u8>| [history_entry(10, 0, b"ann", b"hi"), trailer].concat();
+    let both = entry(
+        [
+            sub(SUBFIELD_REACTIONS, &summary),
+            sub(SUBFIELD_REACTIONS_MINE, &[1, 0]),
+        ]
+        .concat(),
+    );
+    let shown = |mine| {
+        Some((
+            Summary {
+                entries: vec![(Key::Emoji(thumbs.into()), 2)],
+            },
+            Mine(mine),
+        ))
+    };
+    let all = cap::TEXT_ENCODING | cap::CHAT_HISTORY | cap::STRUCTURED_CHAT | cap::REACTIONS;
+    for (case, echoed, targets, entry, want) in [
+        ("agreed", all, true, both.clone(), shown(vec![0])),
+        (
+            "none of them the reader's",
+            all,
+            true,
+            entry(sub(SUBFIELD_REACTIONS, &summary)),
+            shown(vec![]),
+        ),
+        ("a line with none", all, true, entry(vec![]), None),
+        (
+            "a summary that does not parse",
+            all,
+            true,
+            entry(sub(SUBFIELD_REACTIONS, &summary[1..])),
+            None,
+        ),
+        (
+            "mine alone",
+            all,
+            true,
+            entry(sub(SUBFIELD_REACTIONS_MINE, &[1, 0])),
+            None,
+        ),
+        (
+            "bit 19 not agreed",
+            all & !cap::REACTIONS,
+            true,
+            both.clone(),
+            None,
+        ),
+        ("no targets in the login", all, false, both, None),
+    ] {
+        let mut s = logging_in(Config {
+            handled: Handled::CHAT,
+            caps: all,
+            ..raw()
+        });
+        let mut buf = [0u8; 8];
+        let mut fields: Vec<(u16, &[u8])> = vec![(
+            tag::CAPABILITIES,
+            hxproto::build::capabilities_encode(echoed, &mut buf),
+        )];
+        if targets {
+            fields.push((tag::REACTION_TARGETS, &[0, 2]));
+        }
+        s.feed(&server(TASK, 1, 0, &fields), T0);
+        s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+        sent(&mut s);
+        events(&mut s);
+        let t = s.take_trans();
+        s.expect(t, Expect::ChatHistory { cid: 0 }).unwrap();
+        s.send_raw(&caller(700, t)).unwrap();
+        s.feed(&server(TASK, t, 0, &[(tag::HISTORY_ENTRY, &entry)]), T0);
+        match &events(&mut s)[..] {
+            [Event::ChatHistory { entries, .. }] => {
+                assert_eq!(entries.len(), 1, "{case}");
+                assert_eq!(entries[0].reactions, want, "{case}");
+            }
+            other => panic!("{case}: {other:?}"),
+        }
+    }
 }
 
 #[test]

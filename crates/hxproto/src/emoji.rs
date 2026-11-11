@@ -230,6 +230,21 @@ fn emit(s: &str, dst: &mut [u8]) -> usize {
     bytes.len()
 }
 
+/// The fully-qualified form of one emoji, with U+FE0F wherever the
+/// Unicode emoji set has one, so that a reaction picked as U+2764 is sent
+/// as U+2764 U+FE0F and counts with everyone else's. What the encode
+/// table does not hold, whatever its selectors, comes back as it was.
+pub fn qualify(emoji: &str) -> &str {
+    fn bare(s: &str) -> impl Iterator<Item = char> + '_ {
+        s.chars().filter(|&c| c != '\u{FE0F}')
+    }
+    ENCODE
+        .iter()
+        .map(|&(key, _)| key)
+        .find(|key| bare(key).eq(bare(emoji)))
+        .unwrap_or(emoji)
+}
+
 /// Buffer-fill encode for the FFI. `input` is interpreted as UTF-8
 /// (lossily — the send path feeds valid UTF-8, but be defensive). Writes
 /// the `:shortcode:`-rewritten text into `dst` and returns the full
@@ -493,5 +508,32 @@ mod tests {
         assert!(!wire.contains('🎉') && !wire.contains('🚀'));
         assert!(wire.is_ascii(), "wire form must be ASCII: {wire:?}");
         assert_eq!(shortcodes_to_emoji(&wire), msg);
+    }
+
+    #[test]
+    fn qualify_puts_back_each_selector_the_emoji_set_has() {
+        for (given, want) in [
+            ("\u{2764}", "\u{2764}\u{FE0F}"),
+            ("\u{2764}\u{FE0F}", "\u{2764}\u{FE0F}"),
+            ("\u{2764}\u{FE0F}\u{FE0F}", "\u{2764}\u{FE0F}"),
+            ("\u{1F44D}", "\u{1F44D}"),
+            ("\u{1F44D}\u{FE0F}", "\u{1F44D}"),
+            (
+                "\u{2764}\u{200D}\u{1F525}",
+                "\u{2764}\u{FE0F}\u{200D}\u{1F525}",
+            ),
+            ("1\u{20E3}", "1\u{FE0F}\u{20E3}"),
+            ("\u{2764}\u{FE0E}", "\u{2764}\u{FE0E}"),
+            ("a", "a"),
+            ("", ""),
+        ] {
+            assert_eq!(qualify(given), want, "{given:?}");
+        }
+        // Every emoji the table holds, its selectors taken out, comes back
+        // as the one the table holds: no two differ only by them.
+        for &(key, _) in ENCODE {
+            let bare: String = key.chars().filter(|&c| c != '\u{FE0F}').collect();
+            assert_eq!(qualify(&bare), key);
+        }
     }
 }
