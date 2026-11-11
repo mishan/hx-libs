@@ -435,12 +435,6 @@ pub struct HistorySubfield<'a> {
 /// Build one `DATA_HISTORY_ENTRY` body: the encoder for what
 /// [`crate::parse::parse_history_entry`] reads.
 ///
-/// Not quite an inverse, in the one place it matters: the parser walks
-/// past the mini-TLV trailer without surfacing it, so a body built with
-/// sub-fields and read back comes out with its fixed fields intact and
-/// its sub-fields gone. The trailer is written for the clients that will
-/// read it once the types are allocated, not for this crate's own parser.
-///
 /// Returns `None` when a text or subfield cannot be represented by its
 /// u16 length, or when the complete body would not fit in one Hotline
 /// data chunk.
@@ -4401,6 +4395,8 @@ mod tests {
         assert_eq!(parsed.icon_id, 128);
         assert_eq!(parsed.nick, b"alice");
         assert_eq!(parsed.message, b"waves");
+        let read: Vec<_> = parsed.subfields().collect();
+        assert_eq!(read, [(0x1234, &b"future"[..])]);
     }
 
     #[test]

@@ -453,6 +453,35 @@ pub mod tag {
     /// [`HISTORY_ENTRY`] is, to a session that agreed to the Structured
     /// Chat draft (capability bit 17). Not allocated.
     pub const CHAT_LINE: u16 = 0x0f33;
+    /// `0x0f2a`: the Structured Chat draft family's reason code (u16);
+    /// see [`crate::structured_chat`]. Not allocated.
+    pub const CHAT_REASON: u16 = 0x0f2a;
+    /// `0x0f24`: the Replies draft's packed target; see
+    /// [`crate::target`]. Not allocated.
+    pub const TARGET: u16 = 0x0f24;
+
+    // The Reactions draft's (capability bit 19), not allocated; shapes in
+    // [`crate::reactions`].
+
+    /// `0x0f25`: a packed [`crate::reactions::Key`].
+    pub const REACTION_KEY: u16 = 0x0f25;
+    /// `0x0f26`: u16, [`crate::reactions::ADD`] or an action beside it.
+    pub const REACTION_ACTION: u16 = 0x0f26;
+    /// `0x0f27`: u32, a key's count on a target in Send Reaction's reply.
+    pub const REACTION_COUNT: u16 = 0x0f27;
+    /// `0x0f29`: a packed [`crate::reactions::Summary`].
+    pub const REACTION_SUMMARY: u16 = 0x0f29;
+    /// `0x0f2b`: u16 in the LOGIN reply, the target kinds reactions are taken
+    /// on; see [`crate::reactions::Limits`].
+    pub const REACTION_TARGETS: u16 = 0x0f2b;
+    /// `0x0f2c`: u32 in the LOGIN reply, distinct keys one target may carry.
+    pub const MAX_REACTION_KEYS: u16 = 0x0f2c;
+    /// `0x0f2d`: u32 in the LOGIN reply, keys one account may hold on one
+    /// target.
+    pub const MAX_REACTIONS_PER_USER: u16 = 0x0f2d;
+    /// `0x0f31`: a packed [`crate::reactions::Mine`], always last in its
+    /// group.
+    pub const REACTION_MINE: u16 = 0x0f31;
     /// `0x012c` — user-list record (server → client).
     pub const USER_LIST: u16 = 0x012c;
     /// `0x0140` — 1.5 news directory-listing entry (folder or category).

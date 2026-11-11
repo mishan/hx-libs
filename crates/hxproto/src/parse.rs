@@ -740,20 +740,19 @@ pub fn parse_news_thread_reply(buf: &[u8], len: usize, max_text: usize) -> NewsT
 //   offset 22 + nick_len   u16  msg_len
 //   offset 24 + nick_len   bytes[msg_len]   message
 //   offset 24 + nick_len + msg_len  optional mini-TLV trailer
-//                                   (u16 type + u16 len + bytes; no
-//                                   sub-types defined in v1)
+//                                   (u16 type + u16 len + bytes)
 //
 // Minimum legal body = 24 bytes (empty nick + empty message).
 // Sub-fields whose declared length runs past the buffer are
 // skipped silently — the entry stays valid, we just don't surface
-// the sub-fields we couldn't parse (matches the C extractor's
+// the sub-fields from there on (matches the C extractor's
 // debug-log-and-break behaviour).
 //
 // Sanitisation: none. The server already transcoded nick + message
 // to the negotiated text encoding (UTF-8 if CAP_TEXT_ENCODING was
 // set, Mac Roman otherwise); callers run their own conversion.
 
-/// Parsed `HTLS_DATA_HISTORY_ENTRY` chunk. `nick` / `message`
+/// Parsed `HTLS_DATA_HISTORY_ENTRY` chunk. `nick` / `message` / `trailer`
 /// borrow into the caller's input — copy them out before the
 /// input goes away.
 #[derive(Debug, Clone)]
@@ -767,6 +766,22 @@ pub struct HistoryEntry<'a> {
     pub icon_id: u16,
     pub nick: &'a [u8],
     pub message: &'a [u8],
+    /// The optional sub-fields' bytes, read by [`HistoryEntry::subfields`].
+    pub trailer: &'a [u8],
+}
+
+impl<'a> HistoryEntry<'a> {
+    /// The optional sub-fields, as type and bytes, up to the first that
+    /// runs past the entry.
+    pub fn subfields(&self) -> impl Iterator<Item = (u16, &'a [u8])> {
+        let mut rest = self.trailer;
+        std::iter::from_fn(move || {
+            let (hdr, after) = rest.split_first_chunk::<4>()?;
+            let data = after.get(..usize::from(u16::from_be_bytes([hdr[2], hdr[3]])))?;
+            rest = &after[data.len()..];
+            Some((u16::from_be_bytes([hdr[0], hdr[1]]), data))
+        })
+    }
 }
 
 /// Parse a single `HTLS_DATA_HISTORY_ENTRY` chunk body. Returns
@@ -779,8 +794,8 @@ pub struct HistoryEntry<'a> {
 /// - A `msg_len` that runs past the buffer.
 ///
 /// Sub-field trailer (mini-TLV) walk is best-effort: a malformed
-/// sub-field stops the walk but the entry is still returned (no
-/// sub-fields are surfaced in v1 anyway). The C extractor's
+/// sub-field stops [`HistoryEntry::subfields`] but the entry is still
+/// returned. The C extractor's
 /// `debug_log("chat-history", ...)` on the malformed-sub-field
 /// path is purely diagnostic and isn't reproduced here — the
 /// caller's wider context already knows the entry shape.
@@ -815,20 +830,6 @@ pub fn parse_history_entry(data: &[u8]) -> Option<HistoryEntry<'_>> {
     let msg_start = 24 + nick_len;
     let message = &data[msg_start..msg_start + msg_len];
 
-    // Mini-TLV sub-fields follow after the message body. Walk
-    // past any that appear (spec defines none in v1; future
-    // servers may emit some). Malformed sub-fields stop the walk
-    // silently — entry is still valid.
-    let mut off = 24 + nick_len + msg_len;
-    while off + 4 <= data.len() {
-        let _sub_type = u16::from_be_bytes([data[off], data[off + 1]]);
-        let sub_len = u16::from_be_bytes([data[off + 2], data[off + 3]]) as usize;
-        if off + 4 + sub_len > data.len() {
-            break;
-        }
-        off += 4 + sub_len;
-    }
-
     Some(HistoryEntry {
         message_id,
         timestamp,
@@ -836,6 +837,7 @@ pub fn parse_history_entry(data: &[u8]) -> Option<HistoryEntry<'_>> {
         icon_id,
         nick,
         message,
+        trailer: &data[msg_start + msg_len..],
     })
 }
 
@@ -3610,9 +3612,8 @@ mod tests {
 
     #[test]
     fn history_entry_walks_past_unknown_subfields() {
-        // v1 defines no sub-field types but the parser must walk
-        // past any that appear cleanly. Two trailing sub-fields:
-        // type=0xCAFE len=3 + type=0xBABE len=0.
+        // Two trailing sub-fields: type=0xCAFE len=3 + type=0xBABE
+        // len=0.
         let mut trailer = Vec::new();
         trailer.extend_from_slice(&0xCAFEu16.to_be_bytes());
         trailer.extend_from_slice(&3u16.to_be_bytes());
@@ -3624,13 +3625,15 @@ mod tests {
         let e = parse_history_entry(&body).expect("ok");
         assert_eq!(e.nick, b"x");
         assert_eq!(e.message, b"y");
+        let read: Vec<_> = e.subfields().collect();
+        assert_eq!(read, [(0xCAFE, &[0xaa, 0xbb, 0xcc][..]), (0xBABE, &[])]);
     }
 
     #[test]
     fn history_entry_malformed_subfield_does_not_invalidate_entry() {
         // Sub-field claims length 100 but only 3 bytes follow.
-        // Walk stops silently; entry stays valid.
-        let mut trailer = Vec::new();
+        // Walk stops silently there; entry stays valid.
+        let mut trailer = vec![0xBA, 0xBE, 0, 1, 0xdd];
         trailer.extend_from_slice(&0xCAFEu16.to_be_bytes());
         trailer.extend_from_slice(&100u16.to_be_bytes()); // LIES
         trailer.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
@@ -3638,6 +3641,8 @@ mod tests {
         let e = parse_history_entry(&body).expect("ok");
         assert_eq!(e.nick, b"a");
         assert_eq!(e.message, b"b");
+        let read: Vec<_> = e.subfields().collect();
+        assert_eq!(read, [(0xBABE, &[0xdd][..])]);
     }
 
     // ---- file_list entry walker ----
