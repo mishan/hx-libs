@@ -477,7 +477,80 @@ fn a_failed_request_says_why() {
         events(&mut s),
         [Event::Failed {
             trans: t,
+            chat_reason: None,
             reason: Some("Refuses messages.".into())
+        }]
+    );
+}
+
+#[test]
+fn a_refusal_carries_the_familys_reason_code_only_where_a_draft_defining_it_was_agreed() {
+    let slow = Some(hxproto::structured_chat::RATE_LIMITED);
+    let history = cap::TEXT_ENCODING | cap::CHAT_HISTORY;
+    let structured = history | cap::STRUCTURED_CHAT;
+    let emoji = history | cap::SERVER_EMOJI;
+    let bare_emoji = emoji ^ cap::TEXT_ENCODING;
+    for (case, agreed, field, want) in [
+        ("a code", structured, Some(&[0, 6][..]), slow),
+        ("four bytes wide", structured, Some(&[0, 0, 0, 6]), slow),
+        ("under Server Emoji alone", emoji, Some(&[0, 6]), slow),
+        ("no code", structured, None, None),
+        ("an odd width", structured, Some(&[6]), None),
+        ("past a UInt16", structured, Some(&[0, 1, 0, 6]), None),
+        ("neither draft agreed", history, Some(&[0, 6]), None),
+        (
+            "Server Emoji without bit 1",
+            bare_emoji,
+            Some(&[0, 6]),
+            None,
+        ),
+    ] {
+        let mut s = logging_in(Config {
+            caps: structured | cap::SERVER_EMOJI,
+            ..Config::guest("me")
+        });
+        s.feed(&login_reply(Some(190), Some(agreed)), T0);
+        s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+        sent(&mut s);
+        events(&mut s);
+        let t = s.chat_history(0, 0, 0, 50).unwrap();
+        let mut fields: Vec<(u16, &[u8])> = vec![(tag::TASK_ERROR, b"Slow down.")];
+        fields.extend(field.map(|f| (tag::CHAT_REASON, f)));
+        s.feed(&server(TASK, t, 1, &fields), T0);
+        assert_eq!(
+            events(&mut s),
+            [Event::Failed {
+                trans: t,
+                chat_reason: want,
+                reason: Some("Slow down.".into()),
+            }],
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_on_a_trans_the_session_does_not_know_carries_the_reason_code_too() {
+    let structured = cap::TEXT_ENCODING | cap::STRUCTURED_CHAT;
+    let mut s = logging_in(Config {
+        caps: structured,
+        ..Config::guest("me")
+    });
+    s.feed(&login_reply(Some(190), Some(structured)), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    events(&mut s);
+    let fields: [(u16, &[u8]); 2] = [
+        (tag::TASK_ERROR, b"Slow down."),
+        (tag::CHAT_REASON, &[0, 6]),
+    ];
+    s.feed(&server(TASK, 0x7777, 1, &fields), T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::Failed {
+            trans: 0x7777,
+            chat_reason: Some(hxproto::structured_chat::RATE_LIMITED),
+            reason: Some("Slow down.".into()),
         }]
     );
 }
@@ -829,7 +902,7 @@ fn a_cut_short_reply_fails_its_request() {
     s.feed(&frag(&whole[..20], total + 1), T0);
     assert!(events(&mut s)
         .iter()
-        .any(|e| matches!(e, Event::Failed { trans, reason: Some(_) } if *trans == t)));
+        .any(|e| matches!(e, Event::Failed { trans, reason: Some(_), .. } if *trans == t)));
 }
 
 #[test]
@@ -844,6 +917,7 @@ fn chat_says_which_trans_a_refusal_would_carry() {
         events(&mut s),
         [Event::Failed {
             trans: t,
+            chat_reason: None,
             reason: Some("No chat for you.".into())
         }]
     );
@@ -968,6 +1042,7 @@ fn an_empty_folder_lists_nothing_and_a_refusal_says_why() {
         events(&mut s),
         [Event::Failed {
             trans: t,
+            chat_reason: None,
             reason: Some("No files here.".into())
         }]
     );
@@ -2647,6 +2722,7 @@ fn news_replies_expected_become_events() {
             },
             Event::Failed {
                 trans: refused,
+                chat_reason: None,
                 reason: Some("Not allowed.".into())
             },
         ]
@@ -2817,6 +2893,7 @@ fn file_replies_expected_become_events() {
             },
             Event::Failed {
                 trans: refused,
+                chat_reason: None,
                 reason: Some("Not allowed.".into())
             },
         ]
@@ -3252,6 +3329,7 @@ fn user_replies_expected_become_events() {
             Event::AccountChanged { trans: change },
             Event::Failed {
                 trans: refused,
+                chat_reason: None,
                 reason: Some("Not allowed.".into()),
             },
         ]
@@ -3274,10 +3352,12 @@ fn an_expected_reply_that_fails_says_why() {
         [
             Event::Failed {
                 trans: refused,
+                chat_reason: None,
                 reason: Some("Not here.".into())
             },
             Event::Failed {
                 trans: cut,
+                chat_reason: None,
                 reason: Some("the server's reply was cut short".into())
             },
         ]
@@ -3845,6 +3925,7 @@ fn extension_replies_expected_become_events() {
             },
             Event::Failed {
                 trans: odd_icon,
+                chat_reason: None,
                 reason: None,
             },
             malformed(odd_up),
@@ -4011,11 +4092,13 @@ fn voice_replies_expected_become_events() {
             },
             Event::Failed {
                 trans: odd,
+                chat_reason: None,
                 reason: None,
             },
             Event::VoiceDone { trans: muted },
             Event::Failed {
                 trans: refused,
+                chat_reason: None,
                 reason: Some("Not in voice.".into()),
             },
         ]

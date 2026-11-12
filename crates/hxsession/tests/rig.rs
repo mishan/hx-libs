@@ -228,7 +228,7 @@ fn log_in_chat_and_message_on_every_server() {
                 }
             }
             for e in b.step() {
-                if let Event::Failed { trans, reason } = e {
+                if let Event::Failed { trans, reason, .. } = e {
                     if trans == t {
                         let reason =
                             reason.unwrap_or_else(|| panic!("{name}: refused without a reason"));
@@ -350,7 +350,7 @@ fn a_broadcast_reaches_everyone_on_every_server() {
                 }
             }
             for e in a.step() {
-                if let Event::Failed { trans, reason } = e {
+                if let Event::Failed { trans, reason, .. } = e {
                     if trans == t {
                         assert_eq!(name, "hxd-ng", "{name}: refused: {reason:?}");
                         let reason =
@@ -408,20 +408,20 @@ fn users_kicks_and_accounts_on_every_server() {
         let t = b.s.kick(a_uid, false).unwrap();
         b.until(
             "a guest's kick refused",
-            |e| matches!(e, Event::Failed { trans, reason: Some(_) } if *trans == t),
+            |e| matches!(e, Event::Failed { trans, reason: Some(_), .. } if *trans == t),
         );
         let t = a.s.kick(b_uid, false).unwrap();
         if !admin {
             a.until(
                 "the kick refused",
-                |e| matches!(e, Event::Failed { trans, reason: Some(_) } if *trans == t),
+                |e| matches!(e, Event::Failed { trans, reason: Some(_), .. } if *trans == t),
             );
             // Account requests are refused too; one is enough, as each
             // costs a guest towards hxd-ng's flood limit.
             let t = a.s.account_read(b"guest").unwrap();
             a.until(
                 "the account refused",
-                |e| matches!(e, Event::Failed { trans, reason: Some(_) } if *trans == t),
+                |e| matches!(e, Event::Failed { trans, reason: Some(_), .. } if *trans == t),
             );
             eprintln!("{name}: self-info, user info, kicks and accounts refused");
             continue;
@@ -1427,7 +1427,9 @@ fn outcomes(c: &mut Client, ts: &[u32]) -> Vec<Result<(), Option<String>>> {
     c.until("the answers", |e| {
         match e {
             Event::VoiceDone { trans } => got.borrow_mut().insert(*trans, Ok(())),
-            Event::Failed { trans, reason } => got.borrow_mut().insert(*trans, Err(reason.clone())),
+            Event::Failed { trans, reason, .. } => {
+                got.borrow_mut().insert(*trans, Err(reason.clone()))
+            }
             _ => None,
         };
         ts.iter().all(|t| got.borrow().contains_key(t))
