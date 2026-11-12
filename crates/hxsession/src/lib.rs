@@ -53,10 +53,10 @@
 //! server answers with the reference a transfer connection opens with.
 //! That connection (HTXF) is not here. Of the extensions, chat history,
 //! structured chat, the reactions a history entry carries, the target a
-//! line or message answers, inline media and GIF icons are, and voice
-//! and video's requests; what voice and video send unasked (the offers,
-//! candidates and who is in the room) arrives whole, as
-//! [`Event::Unhandled`].
+//! line or message answers, a private message's reference, inline media
+//! and GIF icons are, and voice and video's requests; what voice and
+//! video send unasked (the offers, candidates and who is in the room)
+//! arrives whole, as [`Event::Unhandled`].
 //! [`Session::request`] sends any transaction and hands its reply back
 //! whole, for what has no method of its own.
 
@@ -519,7 +519,7 @@ pub enum Expect {
     ChatCreate,
     /// Joining private chat `cid`: an [`Event::ChatJoined`].
     ChatJoin { cid: u32 },
-    /// A private message or a broadcast: nothing, once it worked.
+    /// A private message or a broadcast: an [`Event::MessageSent`].
     Message,
     /// What the server says of a user: an [`Event::UserInfo`].
     UserInfo,
@@ -642,6 +642,16 @@ pub enum Event {
         media: Option<ChatMedia>,
         /// What it answers, where the session has replies.
         reply_to: Option<hxproto::target::Target>,
+        /// Its reference, where the session has replies or reactions and
+        /// the server sent one: whether the server stores it, and the
+        /// bytes a kind 5 target names it by.
+        pm_id: Option<(bool, [u8; 16])>,
+    },
+    /// The private message or broadcast sent on `trans` went; `pm_id` as
+    /// [`Event::Message`]'s, where the server named the message.
+    MessageSent {
+        trans: u32,
+        pm_id: Option<(bool, [u8; 16])>,
     },
     /// A broadcast, or a message from the server itself; who sent it, when
     /// the server says.
@@ -868,7 +878,7 @@ enum State {
 /// What a sent request's reply should become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pending {
-    /// Replies nobody reads: the agreement, a message, a news post. Their
+    /// Replies nobody reads: the agreement, a news post. Their
     /// errors still surface.
     Quiet,
     /// The keep-alive ping; its answer is not read, and its failure is
@@ -1246,7 +1256,7 @@ impl Session {
         self.ensure_ready()?;
         let body = self.body_out(text);
         let r = request::msg(uid, &body).ok_or(Error::TooLong)?;
-        Ok(self.send(&r, Some(Pending::Quiet)))
+        Ok(self.send(&r, Some(Pending::Expected(Expect::Message))))
     }
 
     pub fn user_list(&mut self) -> Result<u32, Error> {
@@ -2019,6 +2029,7 @@ impl Session {
                                     .find_map(|c| hxproto::target::Target::parse(c.data))
                             })
                             .flatten(),
+                        pm_id: self.pm_id(&t.buf),
                     });
                 }
             }
@@ -2450,6 +2461,10 @@ impl Session {
                 trans: t.trans,
                 frame: t.buf,
             }),
+            Some(Pending::Expected(Expect::Message)) => self.events.push_back(Event::MessageSent {
+                trans: t.trans,
+                pm_id: self.pm_id(&t.buf),
+            }),
             Some(Pending::Expected(Expect::ChatHistory { cid })) => {
                 let mut entries = Vec::new();
                 let mut has_more = false;
@@ -2481,7 +2496,6 @@ impl Session {
             Some(Pending::Quiet)
             | Some(Pending::Keepalive)
             | Some(Pending::Expected(Expect::ChatInvite))
-            | Some(Pending::Expected(Expect::Message))
             | Some(Pending::Expected(Expect::NewsChange))
             | Some(Pending::Expected(Expect::IconSet))
             | None => {}
@@ -2684,6 +2698,17 @@ impl Session {
 
     fn has_replies(&self) -> bool {
         self.server.as_ref().is_some_and(|s| s.replies.is_some())
+    }
+
+    /// A message's reference, which the drafts send only to a session
+    /// with replies or reactions.
+    fn pm_id(&self, buf: &[u8]) -> Option<(bool, [u8; 16])> {
+        self.server
+            .as_ref()
+            .filter(|s| s.replies.is_some() || s.reactions.is_some())?;
+        hxproto::wire::ChunkIter::over_message(buf, buf.len())
+            .filter(|c| c.tag == tag::PM_ID)
+            .find_map(|c| hxproto::target::parse_pm_id(c.data))
     }
 
     /// The picture a chat line or a message carries, where inline media was

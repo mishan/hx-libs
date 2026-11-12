@@ -87,16 +87,18 @@ impl Target {
                     sender: sender.to_vec(),
                 })
             }
-            PM => {
-                let (&flags, reference) = rest.split_first()?;
-                Some(Target::Pm {
-                    stored: flags & STORED != 0,
-                    reference: reference.try_into().ok()?,
-                })
-            }
+            PM => parse_pm_id(rest).map(|(stored, reference)| Target::Pm { stored, reference }),
             _ => None,
         }
     }
+}
+
+/// A private message's reference as [`tag::PM_ID`](crate::messages::tag::PM_ID)
+/// carries it, and a kind 5 target after its kind: whether the server
+/// stores the message, and its 16 bytes. `None` for any other length.
+pub fn parse_pm_id(b: &[u8]) -> Option<(bool, [u8; 16])> {
+    let (&flags, reference) = b.split_first()?;
+    Some((flags & STORED != 0, reference.try_into().ok()?))
 }
 
 #[cfg(test)]
