@@ -460,6 +460,21 @@ pub mod tag {
     /// [`crate::target`]. Not allocated.
     pub const TARGET: u16 = 0x0f24;
 
+    // The Replies draft's (capability bit 18), not allocated; shapes in
+    // [`crate::replies`].
+
+    /// `0x0f20`: u64, a line's history id, repeated in a Get Chat History
+    /// (700) request for lines by id.
+    pub const LINE_ID: u16 = 0x0f20;
+    /// `0x0f21`: the packed [`crate::target::Target`] a line or message
+    /// answers.
+    pub const REPLY_TO: u16 = 0x0f21;
+    /// `0x0f22`: u16 in the LOGIN reply, the target kinds replies are kept
+    /// for; see [`crate::replies::Targets`].
+    pub const REPLY_TARGETS: u16 = 0x0f22;
+    /// `0x0f2e`: u32, the notification types a session wants or is granted.
+    pub const NOTIFY_TYPES: u16 = 0x0f2e;
+
     // The Reactions draft's (capability bit 19), not allocated; shapes in
     // [`crate::reactions`].
 

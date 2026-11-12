@@ -425,6 +425,42 @@ pub fn build_get_chat_history_chunks(
     hc
 }
 
+/// Build the chunk array for `HTLC_HDR_GET_CHAT_HISTORY` asking for lines
+/// by id, under the Replies draft: `channel_id`, then one
+/// [`tag::LINE_ID`] per id, and never a cursor beside them. Scratch
+/// layout: channel @0..4, then each id's 8 bytes. Returns the chunk
+/// count, or 0 when `ids` is empty or longer than
+/// [`crate::replies::MAX_IDS`], or `chunks` has fewer than `1 + ids.len()`
+/// slots or `scratch` fewer than `4 + 8 * ids.len()` bytes.
+pub fn build_get_chat_history_ids_chunks(
+    channel_id: u32,
+    ids: &[u64],
+    chunks: &mut [HxChunk],
+    scratch: &mut [u8],
+) -> usize {
+    let n = ids.len();
+    if n == 0 || n > crate::replies::MAX_IDS || chunks.len() < 1 + n || scratch.len() < 4 + 8 * n {
+        return 0;
+    }
+    scratch[0..4].copy_from_slice(&channel_id.to_be_bytes());
+    for (slot, id) in scratch[4..4 + 8 * n].chunks_exact_mut(8).zip(ids) {
+        slot.copy_from_slice(&id.to_be_bytes());
+    }
+    chunks[0] = HxChunk {
+        tag: tag::CHANNEL_ID,
+        len: 4,
+        data: scratch[0..4].as_ptr(),
+    };
+    for (i, chunk) in chunks[1..=n].iter_mut().enumerate() {
+        *chunk = HxChunk {
+            tag: tag::LINE_ID,
+            len: 8,
+            data: scratch[4 + 8 * i..].as_ptr(),
+        };
+    }
+    1 + n
+}
+
 /// One mini-TLV in the optional trailer of a packed chat-history entry.
 #[derive(Debug, Clone, Copy)]
 pub struct HistorySubfield<'a> {
@@ -4397,6 +4433,48 @@ mod tests {
         assert_eq!(parsed.message, b"waves");
         let read: Vec<_> = parsed.subfields().collect();
         assert_eq!(read, [(0x1234, &b"future"[..])]);
+    }
+
+    #[test]
+    fn history_by_ids_names_each_id_after_the_channel_and_nothing_else() {
+        let mut chunks = [HxChunk::EMPTY; 1 + crate::replies::MAX_IDS + 1];
+        let mut scratch = [0u8; 4 + 8 * (crate::replies::MAX_IDS + 1)];
+        let most: Vec<u64> = (1..=crate::replies::MAX_IDS as u64)
+            .map(|i| i << 40 | 7)
+            .collect();
+        let past = [&most[..], &[1 << 50]].concat();
+        for (case, ids, built) in [
+            ("one", &[0x0102_0304_0506_0708][..], true),
+            ("the most", &most[..], true),
+            ("none", &[], false),
+            ("past the most", &past[..], false),
+        ] {
+            let hc = build_get_chat_history_ids_chunks(9, ids, &mut chunks, &mut scratch);
+            if !built {
+                assert_eq!(hc, 0, "{case}");
+                continue;
+            }
+            let got: Vec<_> = chunks[..hc]
+                .iter()
+                .map(|c| (c.tag, unsafe { chunk_bytes(c) }.to_vec()))
+                .collect();
+            let want: Vec<_> = std::iter::once((tag::CHANNEL_ID, 9u32.to_be_bytes().to_vec()))
+                .chain(
+                    ids.iter()
+                        .map(|id| (tag::LINE_ID, id.to_be_bytes().to_vec())),
+                )
+                .collect();
+            assert_eq!(got, want, "{case}");
+        }
+        let (mut few, mut short) = ([HxChunk::EMPTY; 2], [0u8; 11]);
+        assert_eq!(
+            build_get_chat_history_ids_chunks(9, &[1, 2], &mut few, &mut scratch),
+            0
+        );
+        assert_eq!(
+            build_get_chat_history_ids_chunks(9, &[1], &mut chunks, &mut short),
+            0
+        );
     }
 
     #[test]

@@ -144,7 +144,7 @@ pub struct Limits {
 
 /// A UInt16 or UInt32 field, at either width a Hotline integer is sent
 /// as.
-fn uint(c: &Chunk<'_>) -> Option<u32> {
+pub(crate) fn uint(c: &Chunk<'_>) -> Option<u32> {
     matches!(c.data.len(), 2 | 4).then(|| c.as_uint())
 }
 
