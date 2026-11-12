@@ -31,9 +31,9 @@
 //!   the chunk array to `hlwrite_chunks()` for actual wire encoding.
 //! - [`messaging`] — the instant messaging extension and its drafts:
 //!   their enumerations, the grouped listings, and the client's requests.
-//! - [`target`], [`structured_chat`] and [`reactions`]: the Replies
-//!   draft's packed target, the reason codes its family shares, and the
-//!   Reactions draft's codecs.
+//! - [`target`], [`structured_chat`], [`replies`] and [`reactions`]: the
+//!   Replies draft's packed target, the reason codes its family shares,
+//!   and the Replies and Reactions drafts' codecs.
 //!
 //! The crate exports no C ABI. A consumer with a C side (GtkHx) keeps its
 //! `extern "C"` entry points in its own tree, over this Rust API.
@@ -54,6 +54,7 @@ pub mod messages;
 pub mod messaging;
 pub mod parse;
 pub mod reactions;
+pub mod replies;
 pub mod sanitize;
 pub mod structured_chat;
 pub mod target;

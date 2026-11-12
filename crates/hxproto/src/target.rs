@@ -30,6 +30,17 @@ pub enum Target {
 }
 
 impl Target {
+    /// The kind number the draft gives it, as a login reply's target
+    /// kinds name it (`1 << kind`).
+    pub fn kind(&self) -> u8 {
+        match self {
+            Target::Line { .. } => LINE,
+            Target::Im { .. } => IM,
+            Target::Ephemeral { .. } => EPHEMERAL,
+            Target::Pm { .. } => PM,
+        }
+    }
+
     /// The packed form, or `None` for an instant message whose Login is
     /// empty or would take it past [`MAX_LEN`].
     pub fn pack(&self) -> Option<Vec<u8>> {

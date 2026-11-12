@@ -52,10 +52,11 @@
 //! changes, and asking for a transfer or the server's banner, which the
 //! server answers with the reference a transfer connection opens with.
 //! That connection (HTXF) is not here. Of the extensions, chat history,
-//! structured chat, the reactions a history entry carries, inline media
-//! and GIF icons are, and voice and video's
-//! requests; what voice and video send unasked (the offers, candidates and
-//! who is in the room) arrives whole, as [`Event::Unhandled`].
+//! structured chat, the reactions a history entry carries, the target a
+//! line or message answers, inline media and GIF icons are, and voice
+//! and video's requests; what voice and video send unasked (the offers,
+//! candidates and who is in the room) arrives whole, as
+//! [`Event::Unhandled`].
 //! [`Session::request`] sends any transaction and hands its reply back
 //! whole, for what has no method of its own.
 
@@ -96,6 +97,9 @@ pub mod cap {
     /// The Structured Chat draft's, and not allocated: a chat line also
     /// comes as its history entry.
     pub const STRUCTURED_CHAT: u64 = 0x0002_0000;
+    /// The Replies draft's, and not allocated. Only beside
+    /// [`TEXT_ENCODING`] and [`STRUCTURED_CHAT`].
+    pub const REPLIES: u64 = 0x0004_0000;
     /// The Reactions draft's, and not allocated. Only beside
     /// [`TEXT_ENCODING`] and [`STRUCTURED_CHAT`].
     pub const REACTIONS: u64 = 0x0008_0000;
@@ -136,9 +140,10 @@ pub struct Config {
     /// Capabilities to offer. The session itself understands
     /// [`cap::TEXT_ENCODING`], the media a chat line carries under
     /// [`cap::INLINE_MEDIA`], [`cap::CHAT_HISTORY`], the entry a chat
-    /// line carries under [`cap::STRUCTURED_CHAT`], and the reactions a
+    /// line carries under [`cap::STRUCTURED_CHAT`], the reactions a
     /// history entry carries under [`cap::REACTIONS`], the rest of which
-    /// is the caller's; offering others
+    /// is the caller's, and the target a line or message answers under
+    /// [`cap::REPLIES`], whose requests are the caller's; offering others
     /// means the caller handles what they bring, through
     /// [`Session::request`] and [`Event::Unhandled`].
     pub caps: u64,
@@ -258,6 +263,10 @@ pub struct ServerInfo {
     /// kinds it takes, which the draft requires; otherwise the session
     /// has no reactions.
     pub reactions: Option<hxproto::reactions::Limits>,
+    /// The target kinds the server keeps replies to, where it agreed to
+    /// [`cap::REPLIES`] beside the bits it needs and sent them, which the
+    /// draft requires; otherwise the session has no replies.
+    pub replies: Option<hxproto::replies::Targets>,
 }
 
 /// One user on the server.
@@ -442,18 +451,35 @@ pub struct HistoryEntry {
     /// The line's reactions and which of them are the reader's, where the
     /// session has reactions and the line has any.
     pub reactions: Option<(hxproto::reactions::Summary, hxproto::reactions::Mine)>,
+    /// The line it answers, where the session has replies and the line
+    /// names one this crate reads.
+    pub reply_to: Option<hxproto::target::Target>,
+}
+
+/// Which of an entry's sub-fields [`HistoryEntry::parse`] reads: each only
+/// for a session that agreed to its bit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Subfields {
+    /// Never on a live line.
+    pub reactions: bool,
+    /// On a live line as on a history entry.
+    pub replies: bool,
 }
 
 impl HistoryEntry {
     /// One entry as a history reply packs it; `None` when it does not hold
     /// together. Its line breaks and control bytes are read as a live chat
-    /// line's are, and the nick's control bytes too. Its reactions are
-    /// read only with `reactions`, as a sub-field is only for a session
-    /// that agreed to its bit; a live line carries none.
-    pub fn parse(data: &[u8], reactions: bool) -> Option<Self> {
+    /// line's are, and the nick's control bytes too. Of its sub-fields,
+    /// only those `with` names are read.
+    pub fn parse(data: &[u8], with: Subfields) -> Option<Self> {
         let e = parse::parse_history_entry(data)?;
         let sub = |ty| e.subfields().find(|&(t, _)| t == ty).map(|(_, d)| d);
-        let reactions = reactions
+        let reply_to = with
+            .replies
+            .then(|| hxproto::target::Target::parse(sub(hxproto::replies::SUBFIELD_REPLY_TO)?))
+            .flatten();
+        let reactions = with
+            .reactions
             .then(|| {
                 use hxproto::reactions::{
                     parse_summary_and_mine, SUBFIELD_REACTIONS, SUBFIELD_REACTIONS_MINE,
@@ -474,6 +500,7 @@ impl HistoryEntry {
             nick: text_in(&nick),
             text: text_in(&text),
             reactions,
+            reply_to,
         })
     }
 }
@@ -613,6 +640,8 @@ pub enum Event {
         from: String,
         text: String,
         media: Option<ChatMedia>,
+        /// What it answers, where the session has replies.
+        reply_to: Option<hxproto::target::Target>,
     },
     /// A broadcast, or a message from the server itself; who sent it, when
     /// the server says.
@@ -1929,7 +1958,15 @@ impl Session {
                                     e.nick.len() <= MAX_NICK && e.message.len() <= MAX_BODY
                                 })
                             })
-                            .and_then(|c| HistoryEntry::parse(c.data, false))
+                            .and_then(|c| {
+                                HistoryEntry::parse(
+                                    c.data,
+                                    Subfields {
+                                        reactions: false,
+                                        replies: self.has_replies(),
+                                    },
+                                )
+                            })
                     })
                     .flatten();
                 self.events.push_back(Event::Chat {
@@ -1974,6 +2011,14 @@ impl Session {
                         from,
                         text,
                         media,
+                        reply_to: self
+                            .has_replies()
+                            .then(|| {
+                                hxproto::wire::ChunkIter::over_message(&t.buf, len)
+                                    .filter(|c| c.tag == tag::REPLY_TO)
+                                    .find_map(|c| hxproto::target::Target::parse(c.data))
+                            })
+                            .flatten(),
                     });
                 }
             }
@@ -2408,14 +2453,15 @@ impl Session {
             Some(Pending::Expected(Expect::ChatHistory { cid })) => {
                 let mut entries = Vec::new();
                 let mut has_more = false;
-                let reactions = self.server.as_ref().is_some_and(|s| s.reactions.is_some());
+                let with = Subfields {
+                    reactions: self.server.as_ref().is_some_and(|s| s.reactions.is_some()),
+                    replies: self.has_replies(),
+                };
                 for c in hxproto::wire::ChunkIter::over_message(&t.buf, len) {
                     match c.tag {
                         // A malformed entry is skipped; its neighbors
                         // still read.
-                        tag::HISTORY_ENTRY => {
-                            entries.extend(HistoryEntry::parse(c.data, reactions))
-                        }
+                        tag::HISTORY_ENTRY => entries.extend(HistoryEntry::parse(c.data, with)),
                         tag::HISTORY_HAS_MORE => {
                             if let Some(&b) = c.data.first() {
                                 has_more = b != 0;
@@ -2518,6 +2564,12 @@ impl Session {
                 let needs = cap::TEXT_ENCODING | cap::STRUCTURED_CHAT | cap::REACTIONS;
                 (caps & needs == needs)
                     .then(|| hxproto::reactions::Limits::extract(&t.buf, len))
+                    .flatten()
+            },
+            replies: {
+                let needs = cap::TEXT_ENCODING | cap::STRUCTURED_CHAT | cap::REPLIES;
+                (caps & needs == needs)
+                    .then(|| hxproto::replies::Targets::extract(&t.buf, len))
                     .flatten()
             },
         };
@@ -2628,6 +2680,10 @@ impl Session {
 
     fn agreed(&self, bit: u64) -> bool {
         self.server.as_ref().is_some_and(|s| s.caps & bit != 0)
+    }
+
+    fn has_replies(&self) -> bool {
+        self.server.as_ref().is_some_and(|s| s.replies.is_some())
     }
 
     /// The picture a chat line or a message carries, where inline media was

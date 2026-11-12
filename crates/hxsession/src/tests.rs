@@ -230,6 +230,7 @@ fn logged_in_says_what_the_login_reply_did() {
                     ..Default::default()
                 }),
                 reactions: None,
+                replies: None,
             },
         ),
         // The messaging limits without the bit they belong to.
@@ -249,6 +250,7 @@ fn logged_in_says_what_the_login_reply_did() {
                 video: vec![],
                 messaging: None,
                 reactions: None,
+                replies: None,
             },
         ),
         // A 1.2 server: no version, no name, nothing of the extensions.
@@ -265,6 +267,7 @@ fn logged_in_says_what_the_login_reply_did() {
                 video: vec![],
                 messaging: None,
                 reactions: None,
+                replies: None,
             },
         ),
     ];
@@ -537,7 +540,8 @@ fn pushes_become_events() {
                 uid: 5,
                 from: "bob".into(),
                 text: "psst".into(),
-                media: None
+                media: None,
+                reply_to: None
             },
             Event::Broadcast {
                 uid: 0,
@@ -1705,6 +1709,7 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
             from: "bob".into(),
             text: "psst".into(),
             media: None,
+            reply_to: None,
         },
         Event::Disconnecting("Bye.".into()),
     ];
@@ -1907,6 +1912,7 @@ fn a_chat_line_carries_its_entry_where_structured_chat_was_agreed() {
         nick: nick.into(),
         text: text.into(),
         reactions: None,
+        reply_to: None,
     };
     let whole = entry(b"a-long-nick: x", b"a: b\rc");
     let (nick, text) = ("n".repeat(MAX_NICK), "t".repeat(MAX_BODY));
@@ -2010,7 +2016,8 @@ fn a_message_carries_its_media_where_it_was_agreed() {
                     uid: 5,
                     from: "bob".into(),
                     text: "look".into(),
-                    media
+                    media,
+                    reply_to: None
                 }],
                 "{what}"
             ),
@@ -2126,6 +2133,7 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
         nick: nick.into(),
         text: text.into(),
         reactions: None,
+        reply_to: None,
     };
     assert_eq!(
         events(&mut s),
@@ -2238,6 +2246,173 @@ fn a_history_entrys_reactions_are_read_only_where_the_session_has_reactions() {
             }
             other => panic!("{case}: {other:?}"),
         }
+    }
+}
+
+const REPLIES_NEED: u64 = cap::TEXT_ENCODING | cap::STRUCTURED_CHAT | cap::REPLIES;
+
+/// A raw session past its login, having offered every bit replies need
+/// and chat history, the server agreeing to `echoed` and naming the
+/// target kinds it keeps where `targets`.
+fn replies_ready(handled: Handled, echoed: u64, targets: bool) -> Session {
+    let mut s = logging_in(Config {
+        handled,
+        caps: REPLIES_NEED | cap::CHAT_HISTORY,
+        ..raw()
+    });
+    let mut buf = [0u8; 8];
+    let mut fields: Vec<(u16, &[u8])> = vec![(
+        tag::CAPABILITIES,
+        hxproto::build::capabilities_encode(echoed, &mut buf),
+    )];
+    if targets {
+        fields.push((tag::REPLY_TARGETS, &[0, 0x32]));
+    }
+    s.feed(&server(TASK, 1, 0, &fields), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    events(&mut s);
+    s
+}
+
+#[test]
+fn replies_are_the_sessions_only_beside_the_bits_they_need_and_their_targets() {
+    let all = REPLIES_NEED | cap::CHAT_HISTORY;
+    let kept = Some(hxproto::replies::Targets(0x32));
+    for (case, echoed, targets, want) in [
+        ("agreed", all, true, kept),
+        ("no targets", all, false, None),
+        (
+            "without text encoding",
+            all & !cap::TEXT_ENCODING,
+            true,
+            None,
+        ),
+        (
+            "without structured chat",
+            all & !cap::STRUCTURED_CHAT,
+            true,
+            None,
+        ),
+        ("not agreed", all & !cap::REPLIES, true, None),
+    ] {
+        let s = replies_ready(Handled::NONE, echoed, targets);
+        assert_eq!(s.server().unwrap().replies, want, "{case}");
+    }
+}
+
+#[test]
+fn a_lines_reply_to_is_read_only_where_the_session_has_replies() {
+    use hxproto::replies::SUBFIELD_REPLY_TO;
+    use hxproto::target::Target;
+    let line = Target::Line { channel: 0, id: 9 };
+    let packed = line.pack().unwrap();
+    let ephemeral = Target::Ephemeral { chat: 0, id: 3 };
+    let sub = |data: &[u8]| {
+        [
+            &SUBFIELD_REPLY_TO.to_be_bytes()[..],
+            &(data.len() as u16).to_be_bytes(),
+            data,
+        ]
+        .concat()
+    };
+    let entry = |trailer: Vec<u8>| [history_entry(10, 0, b"ann", b"hi"), trailer].concat();
+    let all = REPLIES_NEED | cap::CHAT_HISTORY;
+    for (case, echoed, targets, trailer, want) in [
+        ("agreed", all, true, sub(&packed), Some(line.clone())),
+        (
+            "an ephemeral line",
+            all,
+            true,
+            sub(&ephemeral.pack().unwrap()),
+            Some(ephemeral),
+        ),
+        ("a line answering none", all, true, vec![], None),
+        ("a target cut short", all, true, sub(&packed[..12]), None),
+        (
+            "a signed target",
+            all,
+            true,
+            sub(&[&[3][..], &[0; 80]].concat()),
+            None,
+        ),
+        (
+            "bit 18 not agreed",
+            all & !cap::REPLIES,
+            true,
+            sub(&packed),
+            None,
+        ),
+        ("no targets in the login", all, false, sub(&packed), None),
+    ] {
+        let entry = entry(trailer);
+        let mut s = replies_ready(Handled::CHAT, echoed, targets);
+        let t = s.take_trans();
+        s.expect(t, Expect::ChatHistory { cid: 0 }).unwrap();
+        s.send_raw(&caller(700, t)).unwrap();
+        s.feed(&server(TASK, t, 0, &[(tag::HISTORY_ENTRY, &entry)]), T0);
+        s.feed(
+            &server(
+                0x6a,
+                0,
+                0,
+                &[(tag::BODY, b"\rann:  hi"), (tag::CHAT_LINE, &entry)],
+            ),
+            T0,
+        );
+        match &events(&mut s)[..] {
+            [Event::ChatHistory { entries, .. }, Event::Chat {
+                line: Some(live), ..
+            }] => {
+                assert_eq!(entries.len(), 1, "{case}");
+                assert_eq!(entries[0].text, "hi", "{case}");
+                assert_eq!(entries[0].reply_to, want, "{case}: in history");
+                assert_eq!(live.reply_to, want, "{case}: live");
+            }
+            other => panic!("{case}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_messages_reply_to_is_read_only_where_the_session_has_replies() {
+    use hxproto::target::Target;
+    let pm = Target::Pm {
+        stored: true,
+        reference: [4; 16],
+    };
+    let packed = pm.pack().unwrap();
+    let all = REPLIES_NEED;
+    for (case, echoed, reply_to, want) in [
+        ("agreed", all, Some(&packed[..]), Some(pm.clone())),
+        ("none sent", all, None, None),
+        ("a target cut short", all, Some(&packed[..17]), None),
+        (
+            "bit 18 not agreed",
+            all & !cap::REPLIES,
+            Some(&packed),
+            None,
+        ),
+    ] {
+        let mut s = replies_ready(Handled::MSG, echoed, true);
+        let mut fields: Vec<(u16, &[u8])> = vec![
+            (tag::UID, &[0, 5]),
+            (tag::NAME, b"bob"),
+            (tag::BODY, b"yes"),
+        ];
+        fields.extend(reply_to.map(|d| (tag::REPLY_TO, d)));
+        s.feed(&server(0x68, 0, 0, &fields), T0);
+        assert_eq!(
+            events(&mut s),
+            [Event::Message {
+                uid: 5,
+                from: "bob".into(),
+                text: "yes".into(),
+                media: None,
+                reply_to: want,
+            }],
+            "{case}"
+        );
     }
 }
 
