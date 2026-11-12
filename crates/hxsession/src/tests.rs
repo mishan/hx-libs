@@ -541,7 +541,8 @@ fn pushes_become_events() {
                 from: "bob".into(),
                 text: "psst".into(),
                 media: None,
-                reply_to: None
+                reply_to: None,
+                pm_id: None,
             },
             Event::Broadcast {
                 uid: 0,
@@ -1710,6 +1711,7 @@ fn raw_hands_over_only_what_handled_leaves_to_the_caller() {
             text: "psst".into(),
             media: None,
             reply_to: None,
+            pm_id: None,
         },
         Event::Disconnecting("Bye.".into()),
     ];
@@ -2017,7 +2019,8 @@ fn a_message_carries_its_media_where_it_was_agreed() {
                     from: "bob".into(),
                     text: "look".into(),
                     media,
-                    reply_to: None
+                    reply_to: None,
+                    pm_id: None,
                 }],
                 "{what}"
             ),
@@ -2146,6 +2149,10 @@ fn an_expected_reply_becomes_its_event_and_the_rest_stay_whole() {
                     entry(11, 1, "René", "café"),
                 ],
                 has_more: true,
+            },
+            Event::MessageSent {
+                trans: message,
+                pm_id: None,
             },
             Event::Reply {
                 trans: other,
@@ -2410,10 +2417,131 @@ fn a_messages_reply_to_is_read_only_where_the_session_has_replies() {
                 text: "yes".into(),
                 media: None,
                 reply_to: want,
+                pm_id: None,
             }],
             "{case}"
         );
     }
+}
+
+const PM_IDS_NEED: u64 = cap::TEXT_ENCODING | cap::STRUCTURED_CHAT;
+
+/// A session past its login, having offered replies and reactions, the
+/// server agreeing to `echoed` and naming the target kinds of both.
+fn pm_ids_ready(cfg: Config, echoed: u64) -> Session {
+    let mut s = logging_in(Config {
+        caps: PM_IDS_NEED | cap::REPLIES | cap::REACTIONS,
+        ..cfg
+    });
+    let mut buf = [0u8; 8];
+    s.feed(
+        &server(
+            TASK,
+            1,
+            0,
+            &[
+                (
+                    tag::CAPABILITIES,
+                    hxproto::build::capabilities_encode(echoed, &mut buf),
+                ),
+                (tag::REPLY_TARGETS, &[0, 0x20]),
+                (tag::REACTION_TARGETS, &[0, 0x40]),
+            ],
+        ),
+        T0,
+    );
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    sent(&mut s);
+    events(&mut s);
+    s
+}
+
+#[test]
+fn a_messages_reference_is_read_with_replies_or_reactions() {
+    let stored = [&[1][..], &[4; 16]].concat();
+    let ephemeral = [&[0][..], &[4; 16]].concat();
+    for (case, echoed, pm_id, want) in [
+        (
+            "replies",
+            PM_IDS_NEED | cap::REPLIES,
+            Some(&stored[..]),
+            Some((true, [4; 16])),
+        ),
+        (
+            "reactions",
+            PM_IDS_NEED | cap::REACTIONS,
+            Some(&stored),
+            Some((true, [4; 16])),
+        ),
+        (
+            "not stored",
+            PM_IDS_NEED | cap::REPLIES,
+            Some(&ephemeral),
+            Some((false, [4; 16])),
+        ),
+        ("none sent", PM_IDS_NEED | cap::REPLIES, None, None),
+        (
+            "cut short",
+            PM_IDS_NEED | cap::REPLIES,
+            Some(&stored[..16]),
+            None,
+        ),
+        (
+            "run long",
+            PM_IDS_NEED | cap::REPLIES,
+            Some(&[&stored[..], &[0]].concat()),
+            None,
+        ),
+        ("neither agreed", PM_IDS_NEED, Some(&stored), None),
+    ] {
+        let mut s = pm_ids_ready(
+            Config {
+                handled: Handled::MSG,
+                ..raw()
+            },
+            echoed,
+        );
+        let mut fields: Vec<(u16, &[u8])> = vec![
+            (tag::UID, &[0, 5]),
+            (tag::NAME, b"bob"),
+            (tag::BODY, b"yes"),
+        ];
+        let named: Vec<(u16, &[u8])> = pm_id.map(|d| (tag::PM_ID, d)).into_iter().collect();
+        fields.extend(&named);
+        s.feed(&server(0x68, 0, 0, &fields), T0);
+        let t = s.take_trans();
+        s.expect(t, Expect::Message).unwrap();
+        s.send_raw(&caller(108, t)).unwrap();
+        s.feed(&server(TASK, t, 0, &named), T0);
+        let mut want_events = vec![Event::Message {
+            uid: 5,
+            from: "bob".into(),
+            text: "yes".into(),
+            media: None,
+            reply_to: None,
+            pm_id: want,
+        }];
+        want_events.push(Event::MessageSent {
+            trans: t,
+            pm_id: want,
+        });
+        assert_eq!(events(&mut s), want_events, "{case}");
+    }
+}
+
+#[test]
+fn a_message_the_session_sends_is_answered_with_its_reference() {
+    let stored = [&[1][..], &[4; 16]].concat();
+    let mut s = pm_ids_ready(Config::guest("me"), PM_IDS_NEED | cap::REACTIONS);
+    let t = s.message(5, "yes").unwrap();
+    s.feed(&server(TASK, t, 0, &[(tag::PM_ID, &stored)]), T0);
+    assert_eq!(
+        events(&mut s),
+        [Event::MessageSent {
+            trans: t,
+            pm_id: Some((true, [4; 16])),
+        }]
+    );
 }
 
 #[test]

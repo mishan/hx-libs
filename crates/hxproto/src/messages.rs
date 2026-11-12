@@ -472,6 +472,9 @@ pub mod tag {
     /// `0x0f22`: u16 in the LOGIN reply, the target kinds replies are kept
     /// for; see [`crate::replies::Targets`].
     pub const REPLY_TARGETS: u16 = 0x0f22;
+    /// `0x0f23`: a private message's reference, to a session that agreed
+    /// to replies or reactions; see [`crate::target::parse_pm_id`].
+    pub const PM_ID: u16 = 0x0f23;
     /// `0x0f2e`: u32, the notification types a session wants or is granted.
     pub const NOTIFY_TYPES: u16 = 0x0f2e;
 
