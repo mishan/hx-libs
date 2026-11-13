@@ -53,9 +53,9 @@
 //! server answers with the reference a transfer connection opens with.
 //! That connection (HTXF) is not here. Of the extensions, chat history,
 //! structured chat, the reactions a history entry carries, the target a
-//! line or message answers, a private message's reference, inline media
-//! and GIF icons are, and voice and video's requests; what voice and
-//! video send unasked (the offers, candidates and who is in the room)
+//! line or message answers, a private message's reference, the reason
+//! code a refusal carries, inline media and GIF icons are, and voice
+//! and video's requests; what voice and video send unasked (the offers, candidates and who is in the room)
 //! arrives whole, as [`Event::Unhandled`].
 //! [`Session::request`] sends any transaction and hands its reply back
 //! whole, for what has no method of its own.
@@ -103,6 +103,9 @@ pub mod cap {
     /// The Reactions draft's, and not allocated. Only beside
     /// [`TEXT_ENCODING`] and [`STRUCTURED_CHAT`].
     pub const REACTIONS: u64 = 0x0008_0000;
+    /// The Server Emoji draft's, and not allocated. Only beside
+    /// [`TEXT_ENCODING`]; its requests are the caller's.
+    pub const SERVER_EMOJI: u64 = 0x0010_0000;
 }
 
 /// The trans the login goes out on, as GtkHx sends it.
@@ -819,9 +822,14 @@ pub enum Event {
     VoiceDone {
         trans: u32,
     },
-    /// A request that went wrong; the server's reason, if it gave one.
+    /// A request that went wrong: the Structured Chat family's reason
+    /// code, where the server agreed to [`cap::STRUCTURED_CHAT`] or
+    /// [`cap::SERVER_EMOJI`] and sent a UInt16 (codes in
+    /// `hxproto::structured_chat` and `hxproto::reactions`), and the
+    /// server's reason, if it gave one.
     Failed {
         trans: u32,
+        chat_reason: Option<u16>,
         reason: Option<String>,
     },
     /// The reply to [`Session::request`], whole; [`fields`] reads it. In
@@ -1145,6 +1153,7 @@ impl Session {
                         trans,
                         &p,
                         inline_media::MediaErrorCode::Generic,
+                        None,
                         Some("the server's reply was cut short".into()),
                     ),
                 }
@@ -2143,10 +2152,12 @@ impl Session {
                     let code = inline_media::extract_error_code(
                         hxproto::wire::ChunkIter::over_message(&t.buf, len),
                     );
-                    self.fail(t.trans, &p, code, reason);
+                    let chat_reason = self.chat_reason(&t.buf);
+                    self.fail(t.trans, &p, code, chat_reason, reason);
                 }
                 None => self.events.push_back(Event::Failed {
                     trans: t.trans,
+                    chat_reason: self.chat_reason(&t.buf),
                     reason,
                 }),
             }
@@ -2394,6 +2405,7 @@ impl Session {
                     },
                     None => Event::Failed {
                         trans: t.trans,
+                        chat_reason: None,
                         reason: None,
                     },
                 };
@@ -2449,6 +2461,7 @@ impl Session {
                     },
                     _ => Event::Failed {
                         trans: t.trans,
+                        chat_reason: None,
                         reason: None,
                     },
                 };
@@ -2503,12 +2516,13 @@ impl Session {
     }
 
     /// The request `pending` on `trans` failed: a picture's with the
-    /// extension's `code`, any other plainly.
+    /// extension's `code`, any other with the family's `chat_reason`.
     fn fail(
         &mut self,
         trans: u32,
         pending: &Pending,
         code: inline_media::MediaErrorCode,
+        chat_reason: Option<u16>,
         reason: Option<String>,
     ) {
         self.events.push_back(match pending {
@@ -2519,7 +2533,11 @@ impl Session {
                     reason,
                 }
             }
-            _ => Event::Failed { trans, reason },
+            _ => Event::Failed {
+                trans,
+                chat_reason,
+                reason,
+            },
         });
     }
 
@@ -2709,6 +2727,20 @@ impl Session {
         hxproto::wire::ChunkIter::over_message(buf, buf.len())
             .filter(|c| c.tag == tag::PM_ID)
             .find_map(|c| hxproto::target::parse_pm_id(c.data))
+    }
+
+    /// A refusal's `DATA_CHAT_REASON`, which only the drafts that define it
+    /// send; any other server's field of that number is not taken for one.
+    fn chat_reason(&self, buf: &[u8]) -> Option<u16> {
+        let emoji = cap::TEXT_ENCODING | cap::SERVER_EMOJI;
+        let caps = self.server.as_ref().map_or(0, |s| s.caps);
+        if caps & cap::STRUCTURED_CHAT == 0 && caps & emoji != emoji {
+            return None;
+        }
+        hxproto::wire::ChunkIter::over_message(buf, buf.len())
+            .find(|c| c.tag == tag::CHAT_REASON)
+            .filter(|c| matches!(c.data.len(), 2 | 4))
+            .and_then(|c| u16::try_from(c.as_uint()).ok())
     }
 
     /// The picture a chat line or a message carries, where inline media was
