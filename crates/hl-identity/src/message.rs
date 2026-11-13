@@ -402,8 +402,8 @@ impl Object for Article {
 /// included, so every form made from it is covered by the same `sig`.
 #[derive(Debug, Clone)]
 pub struct Signed<T> {
-    pub message: T,
-    pub cert: DeviceCert,
+    pub(crate) message: T,
+    pub(crate) cert: DeviceCert,
     pub(crate) whole: Value,
 }
 
@@ -564,6 +564,17 @@ impl<T: Object> Signed<T> {
             },
             (Place::Here, _) => Outcome::Verified { signer, sent_apart },
         }
+    }
+
+    /// What the signature covers. Read-only: a change to it would be a
+    /// message nobody signed, so a new one is made and signed instead.
+    pub fn message(&self) -> &T {
+        &self.message
+    }
+
+    /// The certificate that signed it, read-only for the same reason.
+    pub fn cert(&self) -> &DeviceCert {
+        &self.cert
     }
 
     /// SHA-256 of the certificate's identity key, never what a server

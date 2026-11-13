@@ -835,7 +835,7 @@ where
     check_signed(e, T::DOMAIN, &k.dev.public(), &signed);
 
     let whole = Signed::<T>::parse(&signed, at).unwrap_or_else(|e| panic!("{name}: {e}"));
-    assert_eq!(whole.message, built, "{name}");
+    assert_eq!(*whole.message(), built, "{name}");
     assert_eq!(whole.signer(), k.id.fingerprint(), "{name}");
 
     let texts = texts_of(e);
@@ -1045,7 +1045,7 @@ fn message_cert_window_vectors() {
     let v = vectors();
     for c in v["cert_window"]["cases"].as_array().unwrap() {
         let got = Signed::<ChatLine>::parse(&unhex(str_of(c, "signed_hex")), u64_of(c, "sent"))
-            .map(|s| (s.cert.issued, s.cert.expires));
+            .map(|s| (s.cert().issued, s.cert().expires));
         let want = match str_of(c, "expect") {
             "ok" => Ok((u64_of(c, "issued"), u64_of(c, "expires"))),
             error => Err(error.to_owned()),
@@ -1066,9 +1066,9 @@ fn mixed_order_key_vectors() {
     let device = unhex32(str_of(m, "device_hex"));
     let at = at_of(&v);
     let ok = Signed::<ChatLine>::parse(&unhex(str_of(&m["accepted"], "signed_hex")), at).unwrap();
-    assert_eq!(ok.cert.device, device);
+    assert_eq!(ok.cert().device, device);
     assert_eq!(
-        ok.cert,
+        *ok.cert(),
         DeviceCert::parse(&unhex(str_of(&m["accepted"], "cert_hex"))).unwrap()
     );
     let bad = &m["rejected"];

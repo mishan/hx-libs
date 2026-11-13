@@ -21,6 +21,9 @@ pub const RECOMMENDED_LIFETIME: u64 = 365 * 24 * 3600;
 /// as `handle@registrar` wherever a name goes.
 const MAX_HOST_BYTES: usize = 253;
 const MAX_HANDLE_BYTES: usize = 64;
+/// Encoded size at most: what the longest host and handle leave room
+/// for, with space to spare for keys a later version adds.
+pub const MAX_BYTES: usize = 1024;
 
 /// The character set a registrar host may use: hostname syntax, nothing
 /// that could be read as a different host by something downstream.
@@ -98,6 +101,9 @@ impl Attestation {
 
     /// Decode and check the signature against the embedded registrar key.
     pub fn parse(bytes: &[u8]) -> Result<Attestation, Error> {
+        if bytes.len() > MAX_BYTES {
+            return Err(Error::TooLarge);
+        }
         Self::from_envelope(Envelope::open(bytes)?, None)
     }
 
@@ -181,6 +187,12 @@ impl Attestation {
 mod tests {
     use super::*;
     use crate::keys::IdentityKey;
+
+    #[test]
+    fn a_standalone_attestation_is_bounded_before_it_is_decoded() {
+        let huge = vec![0u8; MAX_BYTES + 1];
+        assert_eq!(Attestation::parse(&huge), Err(Error::TooLarge));
+    }
 
     #[test]
     fn round_trip_and_registrar_check() {
