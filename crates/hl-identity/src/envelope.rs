@@ -9,7 +9,7 @@
 //! envelope. The salt is therefore derived from the registrar, the
 //! handle and the kind, and v1's parameters are fixed.
 
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use sha2::{Digest, Sha256};
@@ -184,8 +184,16 @@ fn derive(secret: &Secret, kdf: Kdf) -> Result<Keys, Error> {
     kdf.check()?;
     let params = Params::new(kdf.m, kdf.t, kdf.p, Some(64)).map_err(|_| Error::BadField("kdf"))?;
     let mut okm = Zeroizing::new([0u8; 64]);
+    // argon2 leaves the memory it allocates itself as it was, and its last
+    // block is enough to recompute the keys.
+    let mut blocks = Zeroizing::new(vec![Block::default(); params.block_count()]);
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into(secret.bytes().as_bytes(), &kdf.salt, &mut *okm)
+        .hash_password_into_with_memory(
+            secret.bytes().as_bytes(),
+            &kdf.salt,
+            &mut *okm,
+            &mut *blocks,
+        )
         .map_err(|_| Error::BadField("kdf"))?;
     let (mut enc, mut auth) = (Zeroizing::new([0u8; 32]), Zeroizing::new([0u8; 32]));
     enc.copy_from_slice(&okm[..32]);
@@ -426,6 +434,11 @@ impl RecoveryCode {
                 c => c,
             };
             if !c.is_ascii() || !CROCKFORD.contains(&(c as u8)) {
+                return None;
+            }
+            // Past 20 the push would reallocate and leave a whole code in
+            // memory nothing wipes.
+            if code.len() == 20 {
                 return None;
             }
             code.push(c);
