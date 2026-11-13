@@ -14,3 +14,10 @@ members = [
 # Debian trixie ships rustc 1.85. GtkHx supports that toolchain, so shared
 # crates keep the same floor even when another consumer can use a newer Rust.
 rust-version = "1.85"
+
+# Argon2id at the 64 MiB a key envelope demands takes seconds unoptimized,
+# and hl-identity's tests derive it many times.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
