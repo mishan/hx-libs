@@ -767,6 +767,9 @@ impl SignedList {
         if kind == ListKind::Log && list.fingerprint.is_some() {
             return Err(Error::BadField("fingerprint"));
         }
+        if list.more && list.entries.is_empty() {
+            return Err(Error::BadField("more"));
+        }
         let floor = list.since.unwrap_or(0);
         let mut prev: Option<u64> = None;
         for (seq, _) in &list.entries {
@@ -1139,6 +1142,20 @@ mod tests {
         assert_eq!(
             SignedList::parse(&bytes, ListKind::Records, keys(&k)),
             Err(Error::BadSignature)
+        );
+        // A continuation needs a last seq to continue from.
+        let endless = SignedList {
+            more: true,
+            entries: vec![],
+            ..list.clone()
+        };
+        assert_eq!(
+            SignedList::parse(
+                &endless.sign(ListKind::Records, &reg()),
+                ListKind::Records,
+                keys(&k)
+            ),
+            Err(Error::BadField("more"))
         );
         let backwards = SignedList {
             entries: vec![(5, vec![]), (5, vec![])],
