@@ -116,8 +116,9 @@ impl Kdf {
         mac.update(&[0]);
         mac.update(handle.to_ascii_lowercase().as_bytes());
         mac.update(&[0, kind as u8]);
-        let mut salt = [0u8; 16];
-        salt.copy_from_slice(&mac.finalize().into_bytes()[..16]);
+        let salt = mac.finalize().into_bytes()[..16]
+            .try_into()
+            .expect("SHA-256 is longer");
         Kdf::with_salt(salt)
     }
 
