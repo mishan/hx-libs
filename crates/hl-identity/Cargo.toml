@@ -37,6 +37,11 @@ unicode-normalization = "0.1"
 # what browsers and HTTP clients put in `Host`.
 url = "2"
 
+[features]
+# Sealing under a chosen salt and nonce, which only test vectors should do.
+test-vectors = []
+
 [dev-dependencies]
+hl-identity = { path = ".", features = ["test-vectors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

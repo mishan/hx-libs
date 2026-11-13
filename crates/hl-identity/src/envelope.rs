@@ -4,18 +4,21 @@
 //!
 //! A registrar holds the envelope and the hash of an `auth_key`; it can
 //! read neither the seed nor the secret. The `auth_key` and the sealing
-//! key come from one Argon2id derivation, so a device that knows only
-//! the handle and the secret must be able to make it before it holds the
-//! envelope. The salt is therefore derived from the registrar, the
-//! handle and the kind, and v1's parameters are fixed.
+//! key come from one Argon2id derivation over a salt chosen fresh at each
+//! seal, so replacing an envelope always replaces what fetches it. A
+//! device asks the registrar for the salt first, and a registrar answers
+//! that for a handle with no envelope as it would for one with, under a
+//! salt only it can make ([`Kdf::decoy`]).
 
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
+use crate::attestation::is_host;
 use crate::cbor::{self, map, Value};
 use crate::error::Error;
 use crate::keys::{IdentityKey, PublicKey};
@@ -23,9 +26,10 @@ use crate::signed::{self, Envelope, VERSION};
 
 pub const DOMAIN: &str = "hl-identity/envelope/v1";
 pub const PUT_DOMAIN: &str = "hl-identity/envelope-put/v1";
-const SALT_DOMAIN: &str = "hl-identity/envelope-salt/v1";
+const DECOY_DOMAIN: &str = "hl-identity/envelope-decoy/v1";
 pub const MAX_BYTES: usize = 1024;
 pub const PUT_MAX_BYTES: usize = 2048;
+pub const KDF_MAX_BYTES: usize = 128;
 
 /// What a secret is, and which envelope of an identity's two it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,9 +64,9 @@ impl Secret<'_> {
     }
 
     /// NFC, so a passphrase typed on two keyboards that compose an accent
-    /// differently is one passphrase.
-    /// Reserved up front, at NFC's most, so no reallocation leaves a
-    /// piece of the passphrase behind.
+    /// differently is one passphrase. Reserved up front, at NFC's most, so
+    /// no reallocation leaves a piece of it behind; the normalizer's own
+    /// buffer for a long run of combining marks is beyond reach.
     fn bytes(&self) -> Zeroizing<String> {
         match self {
             Secret::Passphrase(p) => {
@@ -75,7 +79,9 @@ impl Secret<'_> {
     }
 }
 
-/// Argon2id's parameters and salt. `m` is in KiB.
+/// Argon2id's parameters and salt. `m` is in KiB. v1 has one set of
+/// parameters, so a reader is never asked to spend what a registrar
+/// chose, and only the salt varies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kdf {
     pub m: u32,
@@ -85,43 +91,34 @@ pub struct Kdf {
 }
 
 impl Kdf {
-    /// What a registrar accepts at the least (§9.1), and v1's parameters.
-    pub const FLOOR: (u32, u32, u32) = (64 * 1024, 3, 1);
-    /// What a reader will spend at the most: a registrar serving more
-    /// could exhaust a phone's memory, or its patience, before the
-    /// envelope fails to open.
-    pub const CEILING: (u32, u32, u32) = (1024 * 1024, 16, 8);
+    /// v1's parameters: §9.1's floor, which a phone can afford.
+    pub const V1: (u32, u32, u32) = (64 * 1024, 3, 1);
 
-    /// v1's parameters, with the salt for this handle at this registrar.
-    /// `registrar` is its §3 `host` — a hostname, no scheme, no port — and
-    /// `handle` the name as registered; anything else is another salt, and
-    /// an envelope nobody can fetch.
-    pub fn for_handle(registrar: &str, handle: &str, kind: Kind) -> Kdf {
-        let mut h = Sha256::new();
-        for part in [
-            SALT_DOMAIN,
-            &registrar.to_ascii_lowercase(),
-            &handle.to_ascii_lowercase(),
-        ] {
-            h.update(part.as_bytes());
-            h.update([0]);
-        }
-        h.update([kind as u8]);
+    /// v1's parameters under a fresh salt, for a seal.
+    pub fn fresh() -> Kdf {
         let mut salt = [0u8; 16];
-        salt.copy_from_slice(&h.finalize()[..16]);
-        let (m, t, p) = Kdf::FLOOR;
+        getrandom::getrandom(&mut salt).expect("OS CSPRNG unavailable");
+        Kdf::with_salt(salt)
+    }
+
+    fn with_salt(salt: [u8; 16]) -> Kdf {
+        let (m, t, p) = Kdf::V1;
         Kdf { m, t, p, salt }
     }
 
-    fn check(&self) -> Result<(), Error> {
-        let ((m0, t0, p0), (m1, t1, p1)) = (Kdf::FLOOR, Kdf::CEILING);
-        if !(m0..=m1).contains(&self.m)
-            || !(t0..=t1).contains(&self.t)
-            || !(p0..=p1).contains(&self.p)
-        {
-            return Err(Error::BadField("kdf"));
-        }
-        Ok(())
+    /// What a registrar answers a salt lookup with for a handle that has
+    /// no envelope of this kind: the same every time, so asking twice
+    /// tells nothing, and unpredictable without `secret`, the registrar's
+    /// own. `handle` is folded as the registrar folds it for uniqueness.
+    pub fn decoy(secret: &[u8; 32], handle: &str, kind: Kind) -> Kdf {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).expect("any key length");
+        mac.update(DECOY_DOMAIN.as_bytes());
+        mac.update(&[0]);
+        mac.update(handle.to_ascii_lowercase().as_bytes());
+        mac.update(&[0, kind as u8]);
+        let mut salt = [0u8; 16];
+        salt.copy_from_slice(&mac.finalize().into_bytes()[..16]);
+        Kdf::with_salt(salt)
     }
 
     fn value(&self) -> Value {
@@ -134,9 +131,35 @@ impl Kdf {
         ])
     }
 
+    /// The salt lookup's answer, as CBOR.
+    pub fn encode(&self) -> Vec<u8> {
+        cbor::encode(&self.value())
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Kdf, Error> {
+        if bytes.len() > KDF_MAX_BYTES {
+            return Err(Error::TooLarge);
+        }
+        Kdf::from_value(&cbor::decode_canonical(bytes)?)
+    }
+
+    /// Closed: the map is unsigned, so a key this version does not define
+    /// is refused rather than left for another reader to give a meaning.
     fn from_value(v: &Value) -> Result<Kdf, Error> {
+        let bad = Error::BadField("kdf");
+        let Value::Map(entries) = v else {
+            return Err(bad);
+        };
+        let known = ["alg", "m", "p", "salt", "t"];
+        if entries.len() != known.len()
+            || entries
+                .iter()
+                .any(|(k, _)| !matches!(k, Value::Text(k) if known.contains(&k.as_str())))
+        {
+            return Err(bad);
+        }
         if signed::text(v, "alg")? != "argon2id" {
-            return Err(Error::BadField("kdf"));
+            return Err(bad);
         }
         let small = |k| u32::try_from(signed::uint(v, k)?).map_err(|_| Error::BadField("kdf"));
         let kdf = Kdf {
@@ -147,14 +170,17 @@ impl Kdf {
                 .try_into()
                 .map_err(|_| Error::BadField("kdf"))?,
         };
-        kdf.check()?;
+        if (kdf.m, kdf.t, kdf.p) != Kdf::V1 {
+            return Err(bad);
+        }
         Ok(kdf)
     }
 }
 
 /// The two keys one derivation makes: `enc` seals and never leaves the
 /// device; `auth` is what a fetch presents. A device derives them once,
-/// before the fetch, and opens what comes back with the same keys.
+/// from the salt the lookup gave, and opens what the fetch returns with
+/// the same keys.
 pub struct Keys {
     kind: Kind,
     kdf: Kdf,
@@ -163,6 +189,36 @@ pub struct Keys {
 }
 
 impl Keys {
+    /// Argon2id over the secret, 64 bytes, split into `enc` and `auth`.
+    pub fn derive(secret: &Secret, kdf: Kdf) -> Result<Keys, Error> {
+        if (kdf.m, kdf.t, kdf.p) != Kdf::V1 {
+            return Err(Error::BadField("kdf"));
+        }
+        let params =
+            Params::new(kdf.m, kdf.t, kdf.p, Some(64)).map_err(|_| Error::BadField("kdf"))?;
+        let mut okm = Zeroizing::new([0u8; 64]);
+        // argon2 leaves the memory it allocates itself as it was, and its
+        // last block is enough to recompute the keys.
+        let mut blocks = Zeroizing::new(vec![Block::default(); params.block_count()]);
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password_into_with_memory(
+                secret.bytes().as_bytes(),
+                &kdf.salt,
+                &mut *okm,
+                &mut *blocks,
+            )
+            .map_err(|_| Error::BadField("kdf"))?;
+        let (mut enc, mut auth) = (Zeroizing::new([0u8; 32]), Zeroizing::new([0u8; 32]));
+        enc.copy_from_slice(&okm[..32]);
+        auth.copy_from_slice(&okm[32..]);
+        Ok(Keys {
+            kind: secret.kind(),
+            kdf,
+            enc,
+            auth,
+        })
+    }
+
     pub fn auth(&self) -> &[u8; 32] {
         &self.auth
     }
@@ -171,39 +227,6 @@ impl Keys {
     pub fn auth_hash(&self) -> [u8; 32] {
         Sha256::digest(&self.auth[..]).into()
     }
-}
-
-/// The keys for `handle`'s envelope of `secret`'s kind at `registrar`
-/// ([`Kdf::for_handle`]): Argon2id over the secret, 64 bytes, split
-/// into `enc` and `auth`.
-pub fn keys(registrar: &str, handle: &str, secret: &Secret) -> Result<Keys, Error> {
-    derive(secret, Kdf::for_handle(registrar, handle, secret.kind()))
-}
-
-fn derive(secret: &Secret, kdf: Kdf) -> Result<Keys, Error> {
-    kdf.check()?;
-    let params = Params::new(kdf.m, kdf.t, kdf.p, Some(64)).map_err(|_| Error::BadField("kdf"))?;
-    let mut okm = Zeroizing::new([0u8; 64]);
-    // argon2 leaves the memory it allocates itself as it was, and its last
-    // block is enough to recompute the keys.
-    let mut blocks = Zeroizing::new(vec![Block::default(); params.block_count()]);
-    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-        .hash_password_into_with_memory(
-            secret.bytes().as_bytes(),
-            &kdf.salt,
-            &mut *okm,
-            &mut *blocks,
-        )
-        .map_err(|_| Error::BadField("kdf"))?;
-    let (mut enc, mut auth) = (Zeroizing::new([0u8; 32]), Zeroizing::new([0u8; 32]));
-    enc.copy_from_slice(&okm[..32]);
-    auth.copy_from_slice(&okm[32..]);
-    Ok(Keys {
-        kind: secret.kind(),
-        kdf,
-        enc,
-        auth,
-    })
 }
 
 fn aad(identity: &PublicKey) -> Vec<u8> {
@@ -224,32 +247,39 @@ pub struct KeyEnvelope {
 }
 
 impl KeyEnvelope {
-    /// Seal `identity`'s seed under `secret` for `handle` at `registrar`,
-    /// with a fresh nonce. The salt and parameters are v1's for them, so
-    /// what is stored is what a device with only the handle and the
-    /// secret can fetch. The keys come back for the put's `auth_hash`.
-    pub fn seal(
-        identity: &IdentityKey,
-        registrar: &str,
-        handle: &str,
-        secret: &Secret,
-    ) -> Result<(KeyEnvelope, Keys), Error> {
+    /// Seal `identity`'s seed under `secret`, with a fresh salt and nonce.
+    /// The keys come back for the put ([`EnvelopePut::store`]).
+    pub fn seal(identity: &IdentityKey, secret: &Secret) -> Result<(KeyEnvelope, Keys), Error> {
         let mut nonce = [0u8; 24];
         getrandom::getrandom(&mut nonce).expect("OS CSPRNG unavailable");
-        Self::seal_with_nonce(identity, registrar, handle, secret, nonce)
+        Self::seal_under(identity, secret, Kdf::fresh(), nonce)
     }
 
-    /// [`KeyEnvelope::seal`] with a chosen nonce, for test vectors. A
-    /// nonce used twice under one key gives the seed away.
-    #[doc(hidden)]
-    pub fn seal_with_nonce(
+    /// [`KeyEnvelope::seal`] with a chosen salt and nonce, for test
+    /// vectors: one salt and one secret make one key, so a nonce used
+    /// twice under it gives the seed away.
+    #[cfg(any(test, feature = "test-vectors"))]
+    pub fn seal_with(
         identity: &IdentityKey,
-        registrar: &str,
-        handle: &str,
         secret: &Secret,
+        salt: [u8; 16],
         nonce: [u8; 24],
     ) -> Result<(KeyEnvelope, Keys), Error> {
-        let keys = keys(registrar, handle, secret)?;
+        Self::seal_under(identity, secret, Kdf::with_salt(salt), nonce)
+    }
+
+    fn seal_under(
+        identity: &IdentityKey,
+        secret: &Secret,
+        kdf: Kdf,
+        nonce: [u8; 24],
+    ) -> Result<(KeyEnvelope, Keys), Error> {
+        // With the salt published, an empty passphrase is one anybody can
+        // fetch for.
+        if matches!(secret, Secret::Passphrase(p) if p.trim().is_empty()) {
+            return Err(Error::BadField("passphrase"));
+        }
+        let keys = Keys::derive(secret, kdf)?;
         let ct = XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&*keys.enc))
             .encrypt(
                 XNonce::from_slice(&nonce),
@@ -261,7 +291,7 @@ impl KeyEnvelope {
             .expect("sealing 32 bytes cannot fail");
         let env = KeyEnvelope {
             kind: keys.kind,
-            kdf: keys.kdf,
+            kdf,
             nonce,
             ct: ct.try_into().expect("32 bytes and a tag"),
         };
@@ -270,12 +300,14 @@ impl KeyEnvelope {
 
     /// The identity key, if `keys` are this envelope's and it was sealed
     /// for `identity`. The keys are the ones the fetch was made with, so
-    /// an envelope whose salt or parameters are not what they were
-    /// derived for is refused rather than derived for again: a registrar
-    /// cannot make a device spend more than the fetch already did.
+    /// an envelope under another salt than the lookup gave is refused
+    /// rather than derived for again.
     pub fn open(&self, identity: &PublicKey, keys: &Keys) -> Result<IdentityKey, Error> {
         if keys.kdf != self.kdf {
             return Err(Error::BadField("kdf"));
+        }
+        if keys.kind != self.kind {
+            return Err(Error::OpenFailed);
         }
         let seed = Zeroizing::new(
             XChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&*keys.enc))
@@ -296,16 +328,6 @@ impl KeyEnvelope {
         Ok(key)
     }
 
-    /// For a registrar at a put: an envelope that is not v1's for this
-    /// handle is one no fetch could ever be made for.
-    pub fn check_for(&self, registrar: &str, handle: &str) -> Result<(), Error> {
-        if self.kdf == Kdf::for_handle(registrar, handle, self.kind) {
-            Ok(())
-        } else {
-            Err(Error::BadField("kdf"))
-        }
-    }
-
     pub fn encode(&self) -> Vec<u8> {
         cbor::encode(&map(vec![
             ("v", Some(Value::Uint(VERSION))),
@@ -316,8 +338,7 @@ impl KeyEnvelope {
         ]))
     }
 
-    /// Decode and bound, the parameters within [`Kdf::FLOOR`] and
-    /// [`Kdf::CEILING`] before anything is derived.
+    /// Decode and bound, the parameters v1's, before anything is derived.
     pub fn parse(bytes: &[u8]) -> Result<KeyEnvelope, Error> {
         if bytes.len() > MAX_BYTES {
             return Err(Error::TooLarge);
@@ -339,12 +360,14 @@ impl KeyEnvelope {
     }
 }
 
-/// `PUT <envelopes>` (§9.2): store, replace or, with no `envelope`,
-/// delete one kind of an identity's envelopes. Signed by the identity
-/// key alone.
+/// `PUT <envelopes>` (§9.2): store, replace or delete one kind of an
+/// identity's envelopes at one registrar. Signed by the identity key
+/// alone, and naming the registrar so that a put made for one cannot be
+/// replayed at another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvelopePut {
     pub identity: PublicKey,
+    pub registrar: String,
     pub kind: Kind,
     pub time: u64,
     /// Present exactly when `envelope` is.
@@ -353,17 +376,51 @@ pub struct EnvelopePut {
 }
 
 impl EnvelopePut {
+    /// Store `envelope`, opened with `keys` first so that what is stored
+    /// is what those keys will fetch and open again.
+    pub fn store(
+        identity: &IdentityKey,
+        registrar: &str,
+        time: u64,
+        envelope: &KeyEnvelope,
+        keys: &Keys,
+    ) -> Result<Vec<u8>, Error> {
+        envelope.open(&identity.public(), keys)?;
+        EnvelopePut {
+            identity: identity.public(),
+            registrar: registrar.into(),
+            kind: envelope.kind,
+            time,
+            auth_hash: Some(keys.auth_hash()),
+            envelope: Some(envelope.encode()),
+        }
+        .sign(identity)
+    }
+
+    pub fn delete(
+        identity: &IdentityKey,
+        registrar: &str,
+        kind: Kind,
+        time: u64,
+    ) -> Result<Vec<u8>, Error> {
+        EnvelopePut {
+            identity: identity.public(),
+            registrar: registrar.into(),
+            kind,
+            time,
+            auth_hash: None,
+            envelope: None,
+        }
+        .sign(identity)
+    }
+
     /// Parses back what it signs, so a request no registrar would read is
     /// an error here.
-    pub fn sign(&self, identity: &IdentityKey) -> Result<Vec<u8>, Error> {
-        assert_eq!(
-            identity.public(),
-            self.identity,
-            "signing an envelope put with a key that is not its identity"
-        );
+    fn sign(&self, identity: &IdentityKey) -> Result<Vec<u8>, Error> {
         let unsigned = map(vec![
             ("v", Some(Value::Uint(VERSION))),
             ("identity", Some(Value::Bytes(self.identity.to_vec()))),
+            ("registrar", Some(Value::Text(self.registrar.clone()))),
             ("kind", Some(Value::Uint(self.kind as u64))),
             ("time", Some(Value::Uint(self.time))),
             (
@@ -377,8 +434,8 @@ impl EnvelopePut {
         Ok(bytes)
     }
 
-    /// Decode, bound and verify. The registrar's checks — attested,
-    /// unfrozen, the clock, replay — are its own.
+    /// Decode, bound and verify. The registrar's checks — its own host,
+    /// attested, unfrozen, the clock, replay — are its own.
     pub fn parse(bytes: &[u8]) -> Result<EnvelopePut, Error> {
         if bytes.len() > PUT_MAX_BYTES {
             return Err(Error::TooLarge);
@@ -387,11 +444,15 @@ impl EnvelopePut {
         let v = &env.value;
         let put = EnvelopePut {
             identity: signed::bytes32(v, "identity")?,
+            registrar: signed::text(v, "registrar")?,
             kind: Kind::from_u64(signed::uint(v, "kind")?)?,
             time: signed::uint(v, "time")?,
             auth_hash: signed::opt_bytes32(v, "auth_hash")?,
             envelope: signed::opt_bytes(v, "envelope")?,
         };
+        if !is_host(&put.registrar) {
+            return Err(Error::BadField("registrar"));
+        }
         if put.auth_hash.is_some() != put.envelope.is_some() {
             return Err(Error::BadField("auth_hash"));
         }
@@ -467,115 +528,82 @@ mod tests {
         IdentityKey::from_seed(&[7; 32])
     }
 
-    fn kdf() -> Kdf {
-        Kdf::for_handle("hl.example", "alice", Kind::Passphrase)
-    }
-
-    fn seal(id: &IdentityKey, secret: &Secret) -> KeyEnvelope {
-        KeyEnvelope::seal(id, "hl.example", "alice", secret)
-            .unwrap()
-            .0
-    }
-
+    /// As a device does it: the salt from the lookup, then the keys.
     fn open(env: &KeyEnvelope, id: &IdentityKey, secret: &Secret) -> Result<IdentityKey, Error> {
-        env.open(&id.public(), &keys("hl.example", "alice", secret).unwrap())
+        env.open(&id.public(), &Keys::derive(secret, env.kdf)?)
     }
 
     #[test]
-    fn a_passphrase_opens_what_it_sealed_and_nothing_else_does() {
+    fn a_secret_opens_what_it_sealed_and_nothing_else_does() {
         let id = identity();
-        let env = seal(&id, &Secret::Passphrase("correct horse"));
-        let env = KeyEnvelope::parse(&env.encode()).unwrap();
-        let opened = open(&env, &id, &Secret::Passphrase("correct horse")).unwrap();
-        assert_eq!(opened.public(), id.public());
+        let code = RecoveryCode::generate();
         let stranger = IdentityKey::from_seed(&[8; 32]);
-        for (who, secret) in [
-            (&id, Secret::Passphrase("wrong horse")),
-            (&stranger, Secret::Passphrase("correct horse")),
+        for (secret, wrong) in [
+            (
+                Secret::Passphrase("correct horse"),
+                Secret::Passphrase("wrong horse"),
+            ),
+            (Secret::RecoveryCode(&code), Secret::Passphrase(&code.0)),
         ] {
-            assert_eq!(open(&env, who, &secret).err(), Some(Error::OpenFailed));
+            let (env, _) = KeyEnvelope::seal(&id, &secret).unwrap();
+            let env = KeyEnvelope::parse(&env.encode()).unwrap();
+            assert_eq!(open(&env, &id, &secret).unwrap().public(), id.public());
+            assert_eq!(open(&env, &id, &wrong).err(), Some(Error::OpenFailed));
+            assert_eq!(
+                open(&env, &stranger, &secret).err(),
+                Some(Error::OpenFailed)
+            );
         }
     }
 
     #[test]
     fn a_passphrase_is_one_however_its_accents_were_typed() {
         let id = identity();
-        let env = seal(&id, &Secret::Passphrase("caf\u{e9}"));
+        let (env, _) = KeyEnvelope::seal(&id, &Secret::Passphrase("caf\u{e9}")).unwrap();
         assert!(open(&env, &id, &Secret::Passphrase("cafe\u{301}")).is_ok());
     }
 
     #[test]
-    fn the_salt_is_the_handles_whatever_its_case() {
-        assert_eq!(
-            Kdf::for_handle("HL.example", "Alice", Kind::Passphrase),
-            kdf()
-        );
-        for other in [
-            Kdf::for_handle("hl.example", "bob", Kind::Passphrase),
-            Kdf::for_handle("other.example", "alice", Kind::Passphrase),
-            Kdf::for_handle("hl.example", "alice", Kind::RecoveryCode),
-        ] {
-            assert_ne!(other.salt, kdf().salt);
-        }
-    }
-
-    #[test]
-    fn an_envelope_not_v1s_for_the_handle_is_refused_without_deriving_again() {
+    fn a_reseal_under_the_same_secret_is_fetched_by_another_key() {
         let id = identity();
-        let secret = Secret::Passphrase("p");
-        let env = seal(&id, &secret);
-        assert_eq!(env.check_for("hl.example", "alice"), Ok(()));
+        let secret = Secret::Passphrase("same");
+        let (a, ka) = KeyEnvelope::seal(&id, &secret).unwrap();
+        let (b, kb) = KeyEnvelope::seal(&id, &secret).unwrap();
+        assert_ne!(ka.auth_hash(), kb.auth_hash());
         assert_eq!(
-            env.check_for("hl.example", "bob"),
-            Err(Error::BadField("kdf"))
-        );
-        let bobs = keys("hl.example", "bob", &secret).unwrap();
-        assert_eq!(
-            env.open(&id.public(), &bobs).err(),
+            b.open(&id.public(), &ka).err(),
             Some(Error::BadField("kdf"))
         );
-        let stronger = KeyEnvelope {
-            kdf: Kdf { t: 4, ..env.kdf },
-            ..env.clone()
-        };
-        assert_eq!(
-            stronger.check_for("hl.example", "alice"),
-            Err(Error::BadField("kdf"))
-        );
-        assert_eq!(
-            open(&stronger, &id, &secret).err(),
-            Some(Error::BadField("kdf"))
-        );
+        assert!(a.open(&id.public(), &ka).is_ok());
     }
 
     #[test]
-    fn parameters_outside_the_floor_and_ceiling_are_refused_before_deriving() {
-        let env = seal(&identity(), &Secret::Passphrase("p"));
-        for (m, t, p) in [
-            (Kdf::FLOOR.0 - 1, 3, 1),
-            (Kdf::CEILING.0 + 1, 3, 1),
-            (Kdf::FLOOR.0, 2, 1),
-            (Kdf::FLOOR.0, Kdf::CEILING.1 + 1, 1),
-            (Kdf::FLOOR.0, 3, Kdf::CEILING.2 + 1),
-        ] {
-            let bad = KeyEnvelope {
-                kdf: Kdf { m, t, p, ..env.kdf },
-                ..env.clone()
-            };
+    fn an_empty_passphrase_is_refused() {
+        for p in ["", "   "] {
             assert_eq!(
-                KeyEnvelope::parse(&bad.encode()),
-                Err(Error::BadField("kdf")),
-                "{m} {t} {p}"
+                KeyEnvelope::seal(&identity(), &Secret::Passphrase(p)).err(),
+                Some(Error::BadField("passphrase"))
             );
         }
     }
 
     #[test]
-    fn an_envelope_is_bounded_before_it_is_decoded() {
-        assert_eq!(
-            KeyEnvelope::parse(&[0; MAX_BYTES + 1]),
-            Err(Error::TooLarge)
-        );
+    fn a_decoy_is_the_same_each_time_and_its_registrars_alone() {
+        let ours = [1; 32];
+        let decoy = Kdf::decoy(&ours, "alice", Kind::Passphrase);
+        assert_eq!(Kdf::decoy(&ours, "Alice", Kind::Passphrase), decoy);
+        assert_eq!((decoy.m, decoy.t, decoy.p), Kdf::V1);
+        for other in [
+            Kdf::decoy(&[2; 32], "alice", Kind::Passphrase),
+            Kdf::decoy(&ours, "bob", Kind::Passphrase),
+            Kdf::decoy(&ours, "alice", Kind::RecoveryCode),
+        ] {
+            assert_ne!(other.salt, decoy.salt);
+        }
+    }
+
+    #[test]
+    fn a_put_is_bounded_before_it_is_decoded() {
         assert_eq!(
             EnvelopePut::parse(&[0; PUT_MAX_BYTES + 1]),
             Err(Error::TooLarge)
@@ -583,34 +611,26 @@ mod tests {
     }
 
     #[test]
-    fn a_put_carries_a_hash_exactly_when_it_carries_an_envelope() {
+    fn a_store_holds_only_what_its_keys_open() {
         let id = identity();
-        let (env, keys) =
-            KeyEnvelope::seal(&id, "hl.example", "alice", &Secret::Passphrase("p")).unwrap();
-        let put = EnvelopePut {
-            identity: id.public(),
-            kind: Kind::Passphrase,
-            time: 1_700_000_000,
-            auth_hash: Some(keys.auth_hash()),
-            envelope: Some(env.encode()),
-        };
-        assert_eq!(EnvelopePut::parse(&put.sign(&id).unwrap()).unwrap(), put);
-        let delete = EnvelopePut {
-            auth_hash: None,
-            envelope: None,
-            ..put.clone()
-        };
-        assert!(delete.sign(&id).is_ok());
-        let unhashed = EnvelopePut {
-            auth_hash: None,
-            ..put.clone()
-        };
-        assert_eq!(unhashed.sign(&id), Err(Error::BadField("auth_hash")));
-        let mislabeled = EnvelopePut {
-            kind: Kind::RecoveryCode,
-            ..put
-        };
-        assert_eq!(mislabeled.sign(&id), Err(Error::BadField("kind")));
+        let (env, keys) = KeyEnvelope::seal(&id, &Secret::Passphrase("p")).unwrap();
+        let (_, other) = KeyEnvelope::seal(&id, &Secret::Passphrase("p")).unwrap();
+        let put = EnvelopePut::store(&id, "hl.example", 1_700_000_000, &env, &keys).unwrap();
+        let put = EnvelopePut::parse(&put).unwrap();
+        assert_eq!(put.auth_hash, Some(keys.auth_hash()));
+        assert_eq!(
+            EnvelopePut::store(&id, "hl.example", 1_700_000_000, &env, &other).err(),
+            Some(Error::BadField("kdf"))
+        );
+        let stranger = IdentityKey::from_seed(&[8; 32]);
+        assert_eq!(
+            EnvelopePut::store(&stranger, "hl.example", 1_700_000_000, &env, &keys).err(),
+            Some(Error::OpenFailed)
+        );
+        assert_eq!(
+            EnvelopePut::store(&id, "hl.example:443", 1_700_000_000, &env, &keys).err(),
+            Some(Error::BadField("registrar"))
+        );
     }
 
     #[test]
@@ -622,17 +642,6 @@ mod tests {
         assert_eq!(RecoveryCode::parse(&typed).unwrap().display(), shown);
         assert!(RecoveryCode::parse("ABCDE-FGHJK-MNPQR-STVW").is_none());
         assert!(RecoveryCode::parse("ABCDE-FGHJK-MNPQR-STVWU").is_none());
-    }
-
-    #[test]
-    fn a_recovery_code_opens_only_its_own_kind() {
-        let id = identity();
-        let code = RecoveryCode::generate();
-        let env = seal(&id, &Secret::RecoveryCode(&code));
-        assert!(open(&env, &id, &Secret::RecoveryCode(&code)).is_ok());
-        assert_eq!(
-            open(&env, &id, &Secret::Passphrase(&code.0)).err(),
-            Some(Error::BadField("kdf"))
-        );
+        assert!(RecoveryCode::parse("ABCDE-FGHJK-MNPQR-STVWX-Y").is_none());
     }
 }
