@@ -31,16 +31,16 @@ mod with {
 
 #[cfg(not(feature = "hope"))]
 mod with {
-    use std::convert::Infallible;
-
     pub enum Transport {}
     pub enum Pending {}
 
     impl Transport {
-        pub fn encode(&mut self, _: &[u8]) -> Result<Vec<u8>, Infallible> {
+        // An inhabited error, though none is ever made: a call on an
+        // uninhabited one is linted as unreachable code.
+        pub fn encode(&mut self, _: &[u8]) -> Result<Vec<u8>, String> {
             match *self {}
         }
-        pub fn decode(&mut self, _: &[u8], _: &mut Vec<u8>) -> Result<(), Infallible> {
+        pub fn decode(&mut self, _: &[u8], _: &mut Vec<u8>) -> Result<(), String> {
             match *self {}
         }
         pub fn idle(&self) -> bool {
