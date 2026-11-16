@@ -40,7 +40,7 @@ pub mod friendship;
 pub mod handover;
 pub mod keys;
 pub mod message;
-mod names;
+pub mod names;
 pub mod proof;
 pub mod registrar;
 pub mod sealed;

@@ -14,6 +14,16 @@
 //! that matter here, and this crate has no dependency that carries the
 //! character database.
 
+/// Whether `name` may be shown as a name beside a fingerprint, a handle
+/// or a login: something is there, nothing surrounds it but itself, and
+/// nothing in it renders as nothing or as something else
+/// ([`is_deceptive`]). The rule a card's display name and a device's name
+/// are held to, for a caller that shows a name of its own in the same
+/// place. Length is the caller's: each field has its own bound.
+pub fn is_shown_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.trim() == name && !name.chars().any(is_deceptive)
+}
+
 /// A character that renders as nothing, or as something else: controls,
 /// every whitespace character but the plain space, and everything
 /// invisible.
@@ -69,7 +79,25 @@ pub(crate) fn is_deceptive(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_deceptive;
+    use super::{is_deceptive, is_shown_name};
+
+    #[test]
+    fn a_shown_name_has_something_in_it_and_nothing_around_or_hidden_in_it() {
+        for (name, shown) in [
+            ("Alice Anderson", true),
+            ("\u{65e5}\u{672c}\u{8a9e}", true),
+            ("", false),
+            ("   ", false),
+            (" Alice", false),
+            ("Alice ", false),
+            ("Ali\u{200b}ce", false),
+            ("Alice\u{202e}", false),
+            ("Alice\n", false),
+            ("Alice\u{fe0f}", false),
+        ] {
+            assert_eq!(is_shown_name(name), shown, "{name:?}");
+        }
+    }
 
     #[test]
     fn the_table_covers_what_renders_as_nothing() {

@@ -163,11 +163,7 @@ impl EnrollRequest {
         // request whose name a certificate could not carry is refused
         // here rather than silently rewritten there.
         if let Some(n) = &self.name {
-            if n.chars().count() > cert::NAME_MAX_CHARS
-                || n.trim() != n
-                || n.trim().is_empty()
-                || n.chars().any(crate::names::is_deceptive)
-            {
+            if n.chars().count() > cert::NAME_MAX_CHARS || !crate::names::is_shown_name(n) {
                 return Err(Error::BadField("name"));
             }
         }

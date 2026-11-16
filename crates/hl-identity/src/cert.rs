@@ -169,12 +169,7 @@ impl DeviceCert {
             // that makes two device names look alike. Absent is fine;
             // present and empty is not, because that is a name saying
             // nothing rather than no name.
-            Some(n)
-                if n.chars().count() > NAME_MAX_CHARS
-                    || n.trim() != n
-                    || n.trim().is_empty()
-                    || n.chars().any(crate::names::is_deceptive) =>
-            {
+            Some(n) if n.chars().count() > NAME_MAX_CHARS || !crate::names::is_shown_name(n) => {
                 Err(Error::BadField("name"))
             }
             _ => Ok(()),
