@@ -159,13 +159,11 @@ impl Card {
         // name on a server with `new_accounts = create`. Leading and
         // trailing space go for the same reason `admin ` beside `admin`
         // is a spoof.
-        if self.name.trim() != self.name || self.name.trim().is_empty() {
-            return Err(Error::BadField("name"));
-        }
+        //
         // A display name sits next to handles and logins in every
         // client; the same invisible characters that spoof a handle
         // spoof it (§3.4).
-        if self.name.chars().any(crate::names::is_deceptive) {
+        if !crate::names::is_shown_name(&self.name) {
             return Err(Error::BadField("name"));
         }
         if self
