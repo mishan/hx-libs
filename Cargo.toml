@@ -21,3 +21,7 @@ rust-version = "1.85"
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+# A successor code mended against its commitment derives a public key for
+# each symbol it tries, some sixteen hundred: unoptimized, half a minute.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
