@@ -140,11 +140,13 @@ fn symbols(typed: &str) -> Option<Zeroizing<Vec<u8>>> {
             'I' | 'L' => '1',
             c => c,
         };
-        let v = CROCKFORD.iter().position(|&x| c.is_ascii() && x == c as u8);
-        all.push(v.map_or(UNKNOWN, |v| v as u8));
-        if all.len() > PREFIX.len() + SYMBOLS {
+        // Refused before a push past its capacity would move the symbols
+        // and leave them, unwiped, where they were.
+        if all.len() == all.capacity() {
             return None;
         }
+        let v = CROCKFORD.iter().position(|&x| c.is_ascii() && x == c as u8);
+        all.push(v.map_or(UNKNOWN, |v| v as u8));
     }
     let prefix = PREFIX.map(|p| CROCKFORD.iter().position(|&x| x == p).unwrap() as u8);
     if all.len() != PREFIX.len() + SYMBOLS || all[..2] != prefix {

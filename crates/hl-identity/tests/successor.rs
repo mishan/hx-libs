@@ -7,6 +7,36 @@
 
 mod common;
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+/// Counts, on this thread, the allocations a buffer growing moved:
+/// a move leaves the old allocation's bytes behind, where nothing wipes
+/// them.
+struct CountingMoves;
+
+thread_local! {
+    static MOVES: Cell<usize> = const { Cell::new(0) };
+}
+
+unsafe impl GlobalAlloc for CountingMoves {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let _ = MOVES.try_with(|m| m.set(m.get() + 1));
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingMoves = CountingMoves;
+
 use hl_identity::{Fingerprint, IdentityKey, SuccessorCode};
 use serde_json::{json, Value as Json};
 
@@ -207,6 +237,17 @@ fn a_reader_holding_the_commitment_mends_one_misread_symbol_and_no_more() {
         SuccessorCode::parse_for(&code_of(&seed), &other).is_none(),
         "another card's"
     );
+}
+
+#[test]
+fn a_code_typed_too_long_is_refused_without_its_symbols_moved() {
+    let code = code_of(&SEEDS[3]);
+    for extra in ["0", "00000", &"0".repeat(500)] {
+        let typed = format!("{code}{extra}");
+        let before = MOVES.with(Cell::get);
+        assert!(SuccessorCode::parse(&typed).is_none());
+        assert_eq!(MOVES.with(Cell::get), before, "{} more", extra.len());
+    }
 }
 
 #[test]
