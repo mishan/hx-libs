@@ -2908,5 +2908,139 @@
    }
   ],
   "time": 1757117000
+ },
+ "successor_code": {
+  "cases": [
+   {
+    "code": "S1-00000-00000-00000-00000-00000-00000-00000-00000-00000-00000-00YR",
+    "commitment_hex": "139e3940e64b5491722088d9a0d741628fc826e09475d341a780acde3c4b8070",
+    "seed_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "typed": [
+     "s1-00000-00000-00000-00000-00000-00000-00000-00000-00000-00000-00yr",
+     "S1 00000 00000 00000 00000 00000 00000 00000 00000 00000 00000 00YR",
+     "SlOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOYR",
+     "SI-00000-00000-00000-00000-00000-00000-00000-00000-00000-00000-00YR"
+    ]
+   },
+   {
+    "code": "S1-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZGHG",
+    "commitment_hex": "af822958f2d75afb91f8a8f4da253230d63bebf8c3ce8fa9a2e275c2cd35456e",
+    "seed_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "typed": [
+     "s1-zzzzz-zzzzz-zzzzz-zzzzz-zzzzz-zzzzz-zzzzz-zzzzz-zzzzz-zzzzz-zghg",
+     "S1 ZZZZZ ZZZZZ ZZZZZ ZZZZZ ZZZZZ ZZZZZ ZZZZZ ZZZZZ ZZZZZ ZZZZZ ZGHG",
+     "SlZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZGHG",
+     "SI-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZZZZZ-ZGHG"
+    ]
+   },
+   {
+    "code": "S1-B9D5M-PJTB9-D5MPJ-TB9D5-MPJTB-9D5MP-JTB9D-5MPJT-B9D5M-PJTB9-D0EZ",
+    "commitment_hex": "790901b82a89fe505b5f98e2b7bf28e3a74f9a40f1a561c9d353f85f61cc36a2",
+    "seed_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+    "typed": [
+     "s1-b9d5m-pjtb9-d5mpj-tb9d5-mpjtb-9d5mp-jtb9d-5mpjt-b9d5m-pjtb9-d0ez",
+     "S1 B9D5M PJTB9 D5MPJ TB9D5 MPJTB 9D5MP JTB9D 5MPJT B9D5M PJTB9 D0EZ",
+     "SlB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9DOEZ",
+     "SI-B9D5M-PJTB9-D5MPJ-TB9D5-MPJTB-9D5MP-JTB9D-5MPJT-B9D5M-PJTB9-D0EZ"
+    ]
+   },
+   {
+    "code": "S1-000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FGJ6",
+    "commitment_hex": "56475aa75463474c0285df5dbf2bcab73da651358839e9b77481b2eab107708c",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "typed": [
+     "s1-000g4-0r40m-30e20-9185g-r38e1-w8124-gk2ga-hc5rr-34d1p-70x3r-fgj6",
+     "S1 000G4 0R40M 30E20 9185G R38E1 W8124 GK2GA HC5RR 34D1P 70X3R FGJ6",
+     "SlOOOG4OR4OM3OE2O9l85GR38ElW8l24GK2GAHC5RR34DlP7OX3RFGJ6",
+     "SI-000G4-0R40M-30E20-9I85G-R38EI-W8I24-GK2GA-HC5RR-34DIP-70X3R-FGJ6"
+    ]
+   }
+  ],
+  "domain": "hl-identity/successor-code/v1",
+  "mended": [
+   {
+    "name": "a seed symbol misread",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "typed": "S1000G40R40MA0E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFGJ6"
+   },
+   {
+    "name": "a check symbol misread",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "typed": "S1000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFGJ9"
+   },
+   {
+    "name": "a symbol off the alphabet",
+    "seed_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "typed": "S1000G40R40M30E209185GR38E1W8124UK2GAHC5RR34D1P70X3RFGJ6"
+   },
+   {
+    "name": "two symbols misread",
+    "seed_hex": null,
+    "typed": "S1000G40R40MA0E209185GX38E1W8124GK2GAHC5RR34D1P70X3RFGJ6"
+   }
+  ],
+  "notes": [
+   "A successor code is the 32-byte seed of the successor identity key a card commits to, written down: S1, then 54 symbols of Crockford base32 (0123456789ABCDEFGHJKMNPQRSTVWXYZ). The first 52 are the seed's 256 bits, most significant bit first, the last of them with its four low bits zero; the last 2 are the first 10 bits of SHA-256(\"hl-identity/successor-code/v1\" || seed). It is shown as S1- and the 54 in groups of five joined by hyphens.",
+   "A reader forgives case, spaces, hyphens and O for 0, I and L for 1, as for a recovery code. Anything else off the alphabet, no S1 at its start, a number of symbols other than 56 with it, a last seed symbol with any of its four low bits set, or check symbols other than the seed's read as no code.",
+   "commitment = SHA-256(the successor key's public key), what a card's successor and a registration's successor hold. A reader that has the commitment reads a code whose seed does not match it again with each seed symbol in turn taken for each other symbol, or with its one symbol off the alphabet taken for each, and takes the reading that matches; a misread check symbol leaves the seed as typed."
+  ],
+  "rejects": [
+   {
+    "name": "short",
+    "typed": "S1B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0E"
+   },
+   {
+    "name": "long",
+    "typed": "S1B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0EZ0"
+   },
+   {
+    "name": "off the alphabet",
+    "typed": "S1U9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0EZ"
+   },
+   {
+    "name": "padding bit 1 set",
+    "typed": "S1B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D1EZ"
+   },
+   {
+    "name": "padding bit 2 set",
+    "typed": "S1B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D2EZ"
+   },
+   {
+    "name": "padding bit 4 set",
+    "typed": "S1B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D4EZ"
+   },
+   {
+    "name": "padding bit 8 set",
+    "typed": "S1B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D8EZ"
+   },
+   {
+    "name": "check symbols not the seed's",
+    "typed": "S1B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0FZ"
+   },
+   {
+    "name": "no S1",
+    "typed": "B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0EZ"
+   },
+   {
+    "name": "another version",
+    "typed": "S2B9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0EZ"
+   },
+   {
+    "name": "a fingerprint",
+    "typed": "f44g3e1ah7z50ptzk3hbffs8wekmz6j0y6jp3jekafw5yrec6th0"
+   },
+   {
+    "name": "non-ASCII",
+    "typed": "S1\u00e99D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0EZ"
+   },
+   {
+    "name": "an asterisk",
+    "typed": "S1*9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D5MPJTB9D0EZ"
+   },
+   {
+    "name": "empty",
+    "typed": ""
+   }
+  ]
  }
 }

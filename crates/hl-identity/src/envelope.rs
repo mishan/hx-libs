@@ -467,7 +467,7 @@ impl EnvelopePut {
     }
 }
 
-const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(crate) const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// 20 Crockford base32 characters (100 bits) from the OS CSPRNG, shown
 /// once as four groups of five and never stored (§9.3).

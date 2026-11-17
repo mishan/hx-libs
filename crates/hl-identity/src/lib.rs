@@ -25,8 +25,9 @@
 //!
 //! Test vectors live in `vectors/identity-test-vectors.json` and
 //! `vectors/server-handover-vectors.json`, checked by `tests/vectors.rs`,
-//! `tests/friendship.rs` and `tests/server_handover.rs`; other
-//! implementations should check against the same files.
+//! `tests/friendship.rs`, `tests/successor.rs` and
+//! `tests/server_handover.rs`; other implementations should check against
+//! the same files.
 
 pub mod attestation;
 pub mod bundle;
@@ -45,6 +46,7 @@ pub mod proof;
 pub mod registrar;
 pub mod sealed;
 mod signed;
+pub mod successor;
 
 pub use attestation::Attestation;
 pub use bundle::Bundle;
@@ -63,6 +65,7 @@ pub use registrar::{
     RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
 };
 pub use signed::VERSION;
+pub use successor::SuccessorCode;
 
 /// What a server needs to know to check a login (§5.2, steps 1–3).
 #[derive(Debug, Clone, Copy)]
