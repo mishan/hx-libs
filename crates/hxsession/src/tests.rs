@@ -3717,28 +3717,33 @@ fn a_late_agreement_too_long_to_answer_leaves_a_ready_session_open() {
 /// without the bit.
 #[test]
 fn a_client_older_than_1_5_proves_nothing() {
-    let run = |caps: u64| {
-        let mut s = logging_in(Config {
-            caps,
-            version: 149,
-            ..Config::guest("me")
-        });
-        s.feed(&login_reply(Some(190), Some(PROVES)), T0);
-        let proving = s.proving();
-        s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
-        s.tick(T0 + 2_000);
-        let mut ev = events(&mut s);
-        if let Some(Event::LoggedIn(i)) = ev.iter_mut().find(|e| matches!(e, Event::LoggedIn(_))) {
-            i.caps &= !hxproto::messaging::CAP_DEVICE_PROOF;
-        }
-        (proving, s.take_outgoing(), ev)
-    };
-    let (proving, out, ev) = run(PROVES);
-    assert!(!proving);
-    assert_eq!((out, ev), {
-        let (_, out, ev) = run(cap::TEXT_ENCODING);
-        (out, ev)
-    });
+    // With an agreement that says there is none, and with none at all.
+    for says in [true, false] {
+        let run = |caps: u64| {
+            let mut s = logging_in(Config {
+                caps,
+                version: 149,
+                ..Config::guest("me")
+            });
+            s.feed(&login_reply(Some(190), Some(PROVES)), T0);
+            let proving = s.proving();
+            if says {
+                s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+            }
+            s.tick(T0 + 2_000);
+            let mut ev = events(&mut s);
+            if let Some(Event::LoggedIn(i)) =
+                ev.iter_mut().find(|e| matches!(e, Event::LoggedIn(_)))
+            {
+                i.caps &= !hxproto::messaging::CAP_DEVICE_PROOF;
+            }
+            (proving, s.take_outgoing(), ev)
+        };
+        let (proving, out, ev) = run(PROVES);
+        assert!(!proving, "says {says}");
+        let (_, plain_out, plain_ev) = run(cap::TEXT_ENCODING);
+        assert_eq!((out, ev), (plain_out, plain_ev), "says {says}");
+    }
 }
 
 #[test]
@@ -4089,9 +4094,22 @@ mod hope {
             let echoed = if agreed { PROVES } else { cap::TEXT_ENCODING };
             srv.log_in_agreeing(&mut s, &policy(), Some(echoed));
             s.tick(T0 + 2_000);
+            // Only a proof holds the join at the end of the wait.
+            let waited: Vec<u32> = srv.hear(&mut s).iter().map(|t| t.type_).collect();
+            let ready = events(&mut s).contains(&Event::Ready);
+            assert_eq!(waited.is_empty(), agreed, "agreed {agreed}: {waited:?}");
+            assert_eq!(ready, !agreed, "agreed {agreed}");
             s.device_settled();
-            let heard = srv.hear(&mut s);
-            let types: Vec<u32> = heard.iter().map(|t| t.type_).collect();
+            let heard: Vec<_> = if agreed {
+                srv.hear(&mut s)
+            } else {
+                assert!(srv.hear(&mut s).is_empty(), "nothing more");
+                Vec::new()
+            };
+            let types: Vec<u32> = waited
+                .into_iter()
+                .chain(heard.iter().map(|t| t.type_))
+                .collect();
             assert_eq!(types, joined, "agreed {agreed}");
             if agreed {
                 let name: Vec<Vec<u8>> =
