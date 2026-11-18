@@ -25,9 +25,9 @@
 //! gone.
 //!
 //! The behavior follows GtkHx's, which is what the servers still running
-//! are tested against: the login carries no nickname, which goes with the
-//! agreement instead (or, to a 1.2 server that has no agreement, in a user
-//! change); a 1.5+ server gets nothing else until the agreement is
+//! are tested against: the plain login carries no nickname, which goes with
+//! the agreement instead (or, to a 1.2 server that has no agreement, in a
+//! user change), where HOPE's step 2 carries it as well; a 1.5+ server gets nothing else until the agreement is
 //! answered, or two seconds have passed without one; an agreement with no
 //! text is answered at once, and one with text waits for [`Session::agree`].
 //! A caller that offers device proof (`hxproto::messaging::CAP_DEVICE_PROOF`)
@@ -957,9 +957,8 @@ pub struct Session {
     held_agree: Option<Request>,
     /// The wait for an agreement ended while a device was proved.
     ready_held: bool,
-    /// The login named nobody where the server joins on a name: a server
-    /// that proves devices, or HOPE's step 2 sent with the name empty. The
-    /// name goes in an agree even where no agreement comes.
+    /// The server proves devices, and takes the name from the agree: it
+    /// goes in one even where no agreement comes.
     agree_owed: bool,
     /// The trans of the user list sent once the login settled.
     roster_trans: Option<u32>,
@@ -1295,9 +1294,9 @@ impl Session {
         self.send_agree()
     }
 
-    /// Whether a device is being proved: the server agreed to
-    /// `hxproto::messaging::CAP_DEVICE_PROOF`, which the caller offered,
-    /// and the session holds the agree, and with it the join and
+    /// Whether a device is being proved: a 1.5+ server agreed to
+    /// `hxproto::messaging::CAP_DEVICE_PROOF`, which a caller claiming 1.5
+    /// or later offered, and the session holds the agree, and with it the join and
     /// [`Event::Ready`], until [`Session::device_settled`]. The caller
     /// proves with [`Session::device_challenge`] and
     /// [`Session::prove_device`] meanwhile.
@@ -2759,8 +2758,11 @@ impl Session {
             },
         };
         let version = server.version;
-        // A 1.2 server has no agreement to prove before.
-        self.proving = version != 0 && caps & hxproto::messaging::CAP_DEVICE_PROOF != 0;
+        // A 1.2 server has no agreement to prove before, and a server joins
+        // a client older than 1.5 at its login.
+        self.proving = version != 0
+            && self.cfg.version >= 150
+            && caps & hxproto::messaging::CAP_DEVICE_PROOF != 0;
         if self.proving {
             self.proof_deadline = self.now.checked_add(self.cfg.proof_timeout_ms);
             self.agree_owed = true;
@@ -2808,19 +2810,10 @@ impl Session {
             return;
         }
         let pending = self.hope.take().expect("step 1 went with an offer");
-        // A session that may prove a device before it joins names nobody
-        // yet: a server joins a step 2 that carries a name, and an empty
-        // one, which mhxd needs present, waits for the agree.
-        let proves = self.cfg.caps & hxproto::messaging::CAP_DEVICE_PROOF != 0;
-        self.agree_owed = proves;
         let who = hope::Login {
             login: self.cfg.login.as_bytes(),
             password: self.cfg.password.as_bytes(),
-            name: if proves {
-                b""
-            } else {
-                self.cfg.nick.as_bytes()
-            },
+            name: self.cfg.nick.as_bytes(),
             icon: self.cfg.icon,
             version: self.cfg.version,
             caps: self.cfg.caps,
