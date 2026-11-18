@@ -8,6 +8,7 @@
 use hxproto::build::{self, HxChunk, PackChunk};
 use hxproto::inline_media;
 use hxproto::messages::{tag, ClientHdr};
+use hxproto::messaging;
 use hxproto::video::{self, VideoKind};
 use hxproto::voice;
 
@@ -683,6 +684,21 @@ pub fn video_subscribe(cid: u32, streams: &[video::Stream]) -> Option<Request> {
     let mut scratch = vec![0u8; video::video_subscribe_scratch_len(streams.len())];
     let hc = video::build_video_subscribe_chunks(cid, streams, &mut chunks, &mut scratch);
     Request::from_built(ClientHdr::VideoSubscribe, &chunks, hc)
+}
+
+/// GET_DEVICE_CHALLENGE (1020): the host dialed, port included.
+pub fn device_challenge(host: &[u8]) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY; 1];
+    let hc = messaging::build_get_device_challenge_chunks(host, &mut chunks, &mut []);
+    Request::from_built(ClientHdr::GetDeviceChallenge, &chunks, hc)
+}
+
+/// PROVE_DEVICE (1021): the proof, the device's certificate, and the
+/// identity's card where it goes too.
+pub fn prove_device(proof: &[u8], cert: &[u8], card: Option<&[u8]>) -> Option<Request> {
+    let mut chunks = [HxChunk::EMPTY; 3];
+    let hc = messaging::build_prove_device_chunks(proof, cert, card, &mut chunks, &mut []);
+    Request::from_built(ClientHdr::ProveDevice, &chunks, hc)
 }
 
 #[cfg(test)]

@@ -30,6 +30,9 @@
 //! change); a 1.5+ server gets nothing else until the agreement is
 //! answered, or two seconds have passed without one; an agreement with no
 //! text is answered at once, and one with text waits for [`Session::agree`].
+//! A caller that offers device proof (`hxproto::messaging::CAP_DEVICE_PROOF`)
+//! to a server that agrees to it proves its device before it joins: the
+//! agree waits for [`Session::device_settled`].
 //!
 //! Text crosses this API as UTF-8. On the wire it is Mac Roman, or UTF-8
 //! when the server agreed to the Text-Encoding capability, and line breaks
@@ -157,6 +160,10 @@ pub struct Config {
     /// agreement before the session stops waiting for one. `u64::MAX`
     /// waits for ever.
     pub agreement_wait_ms: u64,
+    /// How long a device proof may hold the join, from the login reply,
+    /// before the session settles it itself
+    /// ([`Event::DeviceProofTimedOut`]). `u64::MAX` never does.
+    pub proof_timeout_ms: u64,
     /// Ping a 1.5+ server after this long without sending anything.
     /// `u64::MAX` never does.
     pub keepalive_ms: u64,
@@ -225,6 +232,7 @@ impl Config {
             caps: cap::TEXT_ENCODING,
             handshake_timeout_ms: 30_000,
             agreement_wait_ms: 2_000,
+            proof_timeout_ms: 10_000,
             keepalive_ms: 60_000,
             raw: false,
             handled: Handled::NONE,
@@ -575,6 +583,10 @@ pub enum Expect {
     /// answer, muting, and video's start, stop, state and subscriptions:
     /// an [`Event::VoiceDone`].
     Voice,
+    /// Get Device Challenge: an [`Event::DeviceChallenge`].
+    DeviceChallenge,
+    /// Prove Device: an [`Event::DeviceProved`].
+    DeviceProof,
 }
 
 /// Why the session ended. The caller closes the socket.
@@ -822,6 +834,22 @@ pub enum Event {
     VoiceDone {
         trans: u32,
     },
+    /// The reply to [`Session::device_challenge`]: the server challenge,
+    /// as signed, for the caller to check and answer. A reply without one
+    /// fails with no reason.
+    DeviceChallenge {
+        trans: u32,
+        challenge: Vec<u8>,
+    },
+    /// [`Session::prove_device`] went through: the session is proved with
+    /// that certificate for its life.
+    DeviceProved {
+        trans: u32,
+    },
+    /// The caller did not settle a device proof within
+    /// [`Config::proof_timeout_ms`]: the session settled it, and what
+    /// waited on it follows.
+    DeviceProofTimedOut,
     /// A request that went wrong: the Structured Chat family's reason
     /// code, where the server agreed to [`cap::STRUCTURED_CHAT`] or
     /// [`cap::SERVER_EMOJI`] and sent a UInt16 (codes in
@@ -919,6 +947,20 @@ pub struct Session {
     awaiting_agree: bool,
     agreed: bool,
     ready: bool,
+    /// A device is being proved (bit 14 agreed with a 1.5+ server): what
+    /// would join waits for [`Session::device_settled`].
+    proving: bool,
+    /// When the session settles a proof the caller has not; `None` when
+    /// the configured timeout is too long to say.
+    proof_deadline: Option<u64>,
+    /// The agree, built, held while a device is proved.
+    held_agree: Option<Request>,
+    /// The wait for an agreement ended while a device was proved.
+    ready_held: bool,
+    /// The login named nobody where the server joins on a name: a server
+    /// that proves devices, or HOPE's step 2 sent with the name empty. The
+    /// name goes in an agree even where no agreement comes.
+    agree_owed: bool,
     /// The trans of the user list sent once the login settled.
     roster_trans: Option<u32>,
     last_sent: u64,
@@ -964,6 +1006,11 @@ impl Session {
             awaiting_agree: false,
             agreed: false,
             ready: false,
+            proving: false,
+            proof_deadline: None,
+            held_agree: None,
+            ready_held: false,
+            agree_owed: false,
             roster_trans: None,
             last_sent: now_ms,
             unstamped: false,
@@ -1066,13 +1113,11 @@ impl Session {
         match self.state {
             State::Closed => None,
             State::Magic | State::HopeStep1 | State::Login => self.handshake_deadline,
-            State::LoggedIn => {
-                let keepalive = self.keepalive_due();
-                match (self.agreement_deadline, keepalive) {
-                    (Some(a), Some(k)) => Some(a.min(k)),
-                    (a, k) => a.or(k),
-                }
-            }
+            State::LoggedIn => [self.agreement_deadline, self.keepalive_due()]
+                .into_iter()
+                .chain(self.proving.then_some(self.proof_deadline))
+                .flatten()
+                .min(),
         }
     }
 
@@ -1195,11 +1240,20 @@ impl Session {
                 }
             }
             State::LoggedIn => {
+                if self.proving && self.proof_deadline.is_some_and(|d| now_ms >= d) {
+                    self.events.push_back(Event::DeviceProofTimedOut);
+                    self.device_settled();
+                }
                 if self.agreement_deadline.is_some_and(|d| now_ms >= d) {
                     // Neither an agreement nor anything else that settles
-                    // it: carry on as if there were none, as GtkHx does.
+                    // it: carry on as if there were none, as GtkHx does,
+                    // with the name in an agree where nothing else gave it.
                     self.agreement_deadline = None;
-                    self.after_agreement();
+                    if self.agree_owed && !self.proving {
+                        self.agree_unasked();
+                    } else {
+                        self.after_agreement();
+                    }
                 }
                 if self.keepalive_due().is_some_and(|d| now_ms >= d) {
                     self.send(
@@ -1239,6 +1293,82 @@ impl Session {
             return Err(Error::NoAgreement);
         }
         self.send_agree()
+    }
+
+    /// Whether a device is being proved: the server agreed to
+    /// `hxproto::messaging::CAP_DEVICE_PROOF`, which the caller offered,
+    /// and the session holds the agree, and with it the join and
+    /// [`Event::Ready`], until [`Session::device_settled`]. The caller
+    /// proves with [`Session::device_challenge`] and
+    /// [`Session::prove_device`] meanwhile.
+    pub fn proving(&self) -> bool {
+        self.proving
+    }
+
+    /// The proof is done, or given up: whatever waited on it goes, the
+    /// agree first if it was answered. Should the caller not say so within
+    /// [`Config::proof_timeout_ms`] of the login reply, the session settles
+    /// it itself, says so with [`Event::DeviceProofTimedOut`], and joins
+    /// unproved; a proof answered after that still holds, as one made
+    /// after the join does.
+    pub fn device_settled(&mut self) {
+        if !self.proving {
+            return;
+        }
+        self.proving = false;
+        self.proof_deadline = None;
+        if let Some(r) = self.held_agree.take() {
+            self.ready_held = false;
+            self.send(&r, Some(Pending::Quiet));
+            self.agreed = true;
+            self.after_agreement();
+        } else if std::mem::take(&mut self.ready_held) {
+            // No agreement came: the name still goes, in an agree, since a
+            // server that proves devices joins on it.
+            self.agree_unasked();
+        }
+    }
+
+    /// Get Device Challenge for `host`, the address dialed in the identity
+    /// spec's form, port included: an [`Event::DeviceChallenge`]. Raw or
+    /// not, before the join or after it.
+    pub fn device_challenge(&mut self, host: &str) -> Result<u32, Error> {
+        self.ensure_proving_allowed()?;
+        let r = request::device_challenge(host.as_bytes()).ok_or(if host.is_empty() {
+            Error::Malformed
+        } else {
+            Error::TooLong
+        })?;
+        Ok(self.send(&r, Some(Pending::Expected(Expect::DeviceChallenge))))
+    }
+
+    /// Prove Device: the device proof answering the challenge, the
+    /// device's certificate, and the identity's card where the server is
+    /// to be shown it: an [`Event::DeviceProved`].
+    pub fn prove_device(
+        &mut self,
+        proof: &[u8],
+        cert: &[u8],
+        card: Option<&[u8]>,
+    ) -> Result<u32, Error> {
+        self.ensure_proving_allowed()?;
+        let empty = proof.is_empty() || cert.is_empty() || card.is_some_and(<[u8]>::is_empty);
+        let r = request::prove_device(proof, cert, card).ok_or(if empty {
+            Error::Malformed
+        } else {
+            Error::TooLong
+        })?;
+        Ok(self.send(&r, Some(Pending::Expected(Expect::DeviceProof))))
+    }
+
+    fn ensure_proving_allowed(&self) -> Result<(), Error> {
+        if self.state != State::LoggedIn {
+            return Err(Error::NotReady);
+        }
+        if !self.agreed(hxproto::messaging::CAP_DEVICE_PROOF) {
+            return Err(Error::NotAgreed);
+        }
+        Ok(())
     }
 
     /// Public chat. Chat is not answered, but a server that refuses it
@@ -2095,13 +2225,16 @@ impl Session {
     fn agreement(&mut self, t: &Transaction) {
         // It settles the wait whatever it says.
         self.agreement_deadline = None;
-        if self.agreed {
+        if self.agreed || self.held_agree.is_some() {
             return;
         }
         let (kind, body) = parse::parse_agreement(&t.buf, t.buf.len(), MAX_NEWS);
         match kind {
             parse::AgreementResult::Ok if !body.is_empty() => {
                 self.awaiting_agree = true;
+                // Shown, it is the user's answer that settles the login,
+                // whatever a proof does meanwhile.
+                self.ready_held = false;
                 let text = self.decode(&body);
                 self.events.push_back(Event::Agreement(text));
             }
@@ -2112,7 +2245,7 @@ impl Session {
             parse::AgreementResult::Missing if self.version() == 0 => {}
             // Nothing to show: answer it at once, as GtkHx does.
             _ => {
-                let _ = self.send_agree();
+                self.agree_unasked();
             }
         }
     }
@@ -2505,6 +2638,26 @@ impl Session {
                     has_more,
                 });
             }
+            Some(Pending::Expected(Expect::DeviceChallenge)) => {
+                let challenge = chunks()
+                    .find(|c| c.tag == tag::SERVER_CHALLENGE && !c.data.is_empty())
+                    .map(|c| c.data.to_vec());
+                self.events.push_back(match challenge {
+                    Some(challenge) => Event::DeviceChallenge {
+                        trans: t.trans,
+                        challenge,
+                    },
+                    None => Event::Failed {
+                        trans: t.trans,
+                        chat_reason: None,
+                        reason: None,
+                    },
+                });
+            }
+            Some(Pending::Expected(Expect::DeviceProof)) => {
+                self.events
+                    .push_back(Event::DeviceProved { trans: t.trans });
+            }
             // Answered, and nothing in the answer to read.
             Some(Pending::Quiet)
             | Some(Pending::Keepalive)
@@ -2606,6 +2759,12 @@ impl Session {
             },
         };
         let version = server.version;
+        // A 1.2 server has no agreement to prove before.
+        self.proving = version != 0 && caps & hxproto::messaging::CAP_DEVICE_PROOF != 0;
+        if self.proving {
+            self.proof_deadline = self.now.checked_add(self.cfg.proof_timeout_ms);
+            self.agree_owed = true;
+        }
         self.server = Some(server.clone());
         self.state = State::LoggedIn;
         if self.login_whole() {
@@ -2649,10 +2808,19 @@ impl Session {
             return;
         }
         let pending = self.hope.take().expect("step 1 went with an offer");
+        // A session that may prove a device before it joins names nobody
+        // yet: a server joins a step 2 that carries a name, and an empty
+        // one, which mhxd needs present, waits for the agree.
+        let proves = self.cfg.caps & hxproto::messaging::CAP_DEVICE_PROOF != 0;
+        self.agree_owed = proves;
         let who = hope::Login {
             login: self.cfg.login.as_bytes(),
             password: self.cfg.password.as_bytes(),
-            name: self.cfg.nick.as_bytes(),
+            name: if proves {
+                b""
+            } else {
+                self.cfg.nick.as_bytes()
+            },
             icon: self.cfg.icon,
             version: self.cfg.version,
             caps: self.cfg.caps,
@@ -2672,16 +2840,33 @@ impl Session {
         }
     }
 
+    /// An agree the session sends of its own accord. One it cannot build,
+    /// for a name too long for its field, ends a session not yet Ready
+    /// saying so: the login cannot finish without it, and nobody is there
+    /// to be told otherwise. A Ready session, answering an agreement that
+    /// came late, carries on as it was without it.
+    fn agree_unasked(&mut self) {
+        if self.send_agree().is_err() && !self.ready {
+            self.close(Closed::Protocol(
+                "the name is too long to send with the agree".into(),
+            ));
+        }
+    }
+
     fn send_agree(&mut self) -> Result<(), Error> {
-        if self.agreed {
+        if self.agreed || self.held_agree.is_some() {
             return Ok(());
         }
         let name = text_out(&self.cfg.nick, self.utf8);
         let r = request::agree(&name, self.cfg.icon).ok_or(Error::TooLong)?;
-        self.send(&r, Some(Pending::Quiet));
-        self.agreed = true;
         self.awaiting_agree = false;
         self.agreement_deadline = None;
+        if self.proving {
+            self.held_agree = Some(r);
+            return Ok(());
+        }
+        self.send(&r, Some(Pending::Quiet));
+        self.agreed = true;
         self.after_agreement();
         Ok(())
     }
@@ -2689,6 +2874,10 @@ impl Session {
     /// What a server expects once the login is settled: the user list.
     fn after_agreement(&mut self) {
         if self.ready {
+            return;
+        }
+        if self.proving {
+            self.ready_held = true;
             return;
         }
         self.ready = true;
@@ -2879,6 +3068,10 @@ impl Session {
     fn close(&mut self, why: Closed) {
         self.state = State::Closed;
         self.pending.clear();
+        self.proving = false;
+        self.proof_deadline = None;
+        self.held_agree = None;
+        self.ready_held = false;
         self.events.push_back(Event::Closed(why));
     }
 }

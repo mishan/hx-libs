@@ -3452,6 +3452,397 @@ fn chat_requests_go_as_gtkhx_sends_them() {
 
 // ---- HOPE ----------------------------------------------------------------
 
+/// Device proof's capability, as a caller that proves offers it.
+const PROVES: u64 = cap::TEXT_ENCODING | hxproto::messaging::CAP_DEVICE_PROOF;
+
+/// How the agreement settles, for the proof tests.
+#[derive(Debug, Clone, Copy)]
+enum Settles {
+    /// An empty agreement, answered at once.
+    Empty,
+    /// One with text, answered by the user.
+    Text,
+    /// None at all, and the wait for it ends.
+    Never,
+}
+
+impl Settles {
+    /// Bring `s` to where the agreement would have gone, and return what
+    /// it sent on the way.
+    fn reach(self, s: &mut Session) -> Vec<Sent> {
+        match self {
+            Settles::Empty => s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0),
+            Settles::Text => {
+                s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
+                s.agree().unwrap();
+            }
+            Settles::Never => s.tick(T0 + 2_000),
+        }
+        sent(s)
+    }
+}
+
+/// A 1.5 session that offered device proof to a server that agreed to it.
+fn proving(cfg: Config) -> Session {
+    let mut s = logging_in(Config {
+        caps: PROVES,
+        ..cfg
+    });
+    s.feed(&login_reply(Some(190), Some(PROVES)), T0);
+    assert!(s.proving());
+    events(&mut s);
+    s
+}
+
+#[test]
+fn a_device_is_proved_before_the_session_joins() {
+    for (raw_mode, settles) in [
+        (false, Settles::Empty),
+        (false, Settles::Text),
+        (false, Settles::Never),
+        (true, Settles::Empty),
+        (true, Settles::Text),
+        (true, Settles::Never),
+    ] {
+        let what = format!("raw {raw_mode}, {settles:?}");
+        let mut s = proving(if raw_mode { raw() } else { Config::guest("me") });
+        assert!(settles.reach(&mut s).is_empty(), "{what}: nothing joins");
+        assert!(!events(&mut s).contains(&Event::Ready), "{what}");
+
+        let challenge = s.device_challenge("hl.example:5500").unwrap();
+        let out = sent(&mut s);
+        assert_eq!(
+            out,
+            [(
+                1020,
+                challenge,
+                vec![(tag::PROOF_HOST, b"hl.example:5500".to_vec())]
+            )],
+            "{what}"
+        );
+        s.feed(
+            &server(TASK, challenge, 0, &[(tag::SERVER_CHALLENGE, b"signed")]),
+            T0,
+        );
+        assert_eq!(
+            events(&mut s),
+            [Event::DeviceChallenge {
+                trans: challenge,
+                challenge: b"signed".to_vec()
+            }],
+            "{what}"
+        );
+
+        let proof = s.prove_device(b"proof", b"cert", Some(b"card")).unwrap();
+        let out = sent(&mut s);
+        assert_eq!(
+            out,
+            [(
+                1021,
+                proof,
+                vec![
+                    (tag::DEVICE_PROOF, b"proof".to_vec()),
+                    (tag::DEVICE_CERT, b"cert".to_vec()),
+                    (tag::USER_CARD, b"card".to_vec()),
+                ]
+            )],
+            "{what}"
+        );
+        s.feed(&server(TASK, proof, 0, &[]), T0);
+        assert_eq!(
+            events(&mut s),
+            [Event::DeviceProved { trans: proof }],
+            "{what}"
+        );
+        assert!(s.take_outgoing().is_empty(), "{what}: still nothing joins");
+
+        s.device_settled();
+        assert!(!s.proving(), "{what}");
+        let out = sent(&mut s);
+        let ops: Vec<u32> = out.iter().map(|o| o.0).collect();
+        let joined: &[u32] = match (settles, raw_mode) {
+            // The name goes with an agree whether or not there was an
+            // agreement: a server that proves devices joins on it.
+            (_, false) => &[121, 300],
+            (_, true) => &[121],
+        };
+        assert_eq!(ops, joined, "{what}: what waited, in order");
+        assert!(out[0].2.contains(&(tag::NAME, b"me".to_vec())), "{what}");
+        assert!(events(&mut s).contains(&Event::Ready), "{what}");
+        // Settled once: a second settle sends nothing.
+        s.device_settled();
+        assert!(s.take_outgoing().is_empty(), "{what}");
+    }
+}
+
+#[test]
+fn the_name_the_agree_goes_with_is_the_one_set_before_it_was_answered() {
+    let mut s = proving(raw());
+    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
+    s.set_identity("renamed", 9);
+    s.agree().unwrap();
+    s.set_identity("later", 1);
+    s.device_settled();
+    let out = sent(&mut s);
+    assert_eq!(out[0].0, 121);
+    assert!(out[0].2.contains(&(tag::NAME, b"renamed".to_vec())));
+    assert!(out[0].2.contains(&(tag::ICON, 9u16.to_be_bytes().to_vec())));
+}
+
+#[test]
+fn a_proof_nobody_settles_is_settled_by_its_timeout_and_still_holds_if_answered_after() {
+    let mut s = proving(Config {
+        proof_timeout_ms: 5_000,
+        ..Config::guest("me")
+    });
+    assert!(Settles::Empty.reach(&mut s).is_empty());
+    let proof = s.prove_device(b"proof", b"cert", None).unwrap();
+    sent(&mut s);
+    assert_eq!(s.next_deadline(), Some(T0 + 5_000));
+    s.tick(T0 + 4_999);
+    assert!(s.take_outgoing().is_empty());
+    s.tick(T0 + 5_000);
+    assert!(!s.proving());
+    assert_eq!(opcodes(&mut s), [121, 300], "joined unproved");
+    let ev = events(&mut s);
+    let at = |e: &Event| ev.iter().position(|x| x == e).unwrap();
+    assert!(
+        at(&Event::DeviceProofTimedOut) < at(&Event::Ready),
+        "{ev:?}"
+    );
+
+    // The server's answer, late, is still the proof's.
+    s.feed(&server(TASK, proof, 0, &[]), T0 + 6_000);
+    assert_eq!(events(&mut s), [Event::DeviceProved { trans: proof }]);
+    assert!(s.take_outgoing().is_empty());
+}
+
+#[test]
+fn an_agreement_after_the_wait_for_one_ended_still_waits_for_the_proof() {
+    let mut s = proving(Config::guest("me"));
+    s.tick(T0 + 2_000);
+    assert!(s.take_outgoing().is_empty());
+    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0 + 3_000);
+    assert_eq!(events(&mut s), [Event::Agreement("Be nice.".into())]);
+    s.agree().unwrap();
+    assert!(s.take_outgoing().is_empty());
+    s.device_settled();
+    let out = sent(&mut s);
+    assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [121, 300]);
+    assert!(out[0].2.contains(&(tag::NAME, b"me".to_vec())));
+    assert_eq!(events(&mut s), [Event::Ready]);
+}
+
+#[test]
+fn an_agreement_after_the_wait_ended_is_the_users_to_answer_even_once_settled() {
+    let mut s = proving(Config::guest("me"));
+    s.tick(T0 + 2_000);
+    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0 + 3_000);
+    assert_eq!(events(&mut s), [Event::Agreement("Be nice.".into())]);
+    s.device_settled();
+    assert!(
+        s.take_outgoing().is_empty(),
+        "nothing joins before the user answers"
+    );
+    assert!(events(&mut s).is_empty());
+    s.agree().unwrap();
+    let out = sent(&mut s);
+    assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [121, 300]);
+    assert!(out[0].2.contains(&(tag::NAME, b"me".to_vec())));
+    assert_eq!(events(&mut s), [Event::Ready]);
+}
+
+/// An agree the session sends itself, with a name too long for its
+/// field, cannot go: the session closes saying so rather than waiting
+/// for ever on a login that cannot finish.
+#[test]
+fn an_agree_too_long_to_send_closes_the_session_wherever_it_would_go() {
+    let long = "n".repeat(70_000);
+    // An empty agreement, answered at once.
+    let mut s = logging_in(Config::guest(&long));
+    s.feed(&login_reply(Some(190), Some(cap::TEXT_ENCODING)), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    // A proof settled with no agreement.
+    let mut p = proving(Config::guest(&long));
+    p.tick(T0 + 2_000);
+    p.device_settled();
+    // And one the session settles itself, with no agreement.
+    let mut t = proving(Config::guest(&long));
+    t.tick(T0 + 10_000);
+    for (what, s) in [
+        ("empty agreement", &mut s),
+        ("settled proof", &mut p),
+        ("timed-out proof", &mut t),
+    ] {
+        assert!(
+            s.take_outgoing().is_empty(),
+            "{what}: nothing after the close"
+        );
+        assert!(s.is_closed(), "{what}");
+        let ev = events(s);
+        assert!(
+            matches!(ev.last(), Some(Event::Closed(Closed::Protocol(_)))),
+            "{what}: {ev:?}"
+        );
+        assert!(!ev.contains(&Event::Ready), "{what}");
+    }
+}
+
+/// Once the session is Ready, a late agreement whose agree cannot be
+/// built leaves it as it was: open, and its user list still answered.
+#[test]
+fn a_late_agreement_too_long_to_answer_leaves_a_ready_session_open() {
+    let mut s = logging_in(Config::guest(&"n".repeat(70_000)));
+    s.feed(&login_reply(Some(190), Some(cap::TEXT_ENCODING)), T0);
+    s.tick(T0 + 2_000);
+    let out = sent(&mut s);
+    assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [300]);
+    assert!(events(&mut s).contains(&Event::Ready));
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0 + 3_000);
+    assert!(!s.is_closed());
+    assert!(s.take_outgoing().is_empty());
+    s.feed(&server(TASK, out[0].1, 0, &[]), T0 + 3_000);
+    assert_eq!(
+        events(&mut s),
+        [Event::UserList {
+            trans: out[0].1,
+            users: vec![],
+            subject: None
+        }]
+    );
+}
+
+#[test]
+fn a_session_closed_while_proving_proves_nothing() {
+    let mut s = proving(Config::guest("me"));
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    s.disconnected();
+    assert!(!s.proving());
+    s.device_settled();
+    assert!(s.take_outgoing().is_empty(), "the held agree never goes");
+    assert_eq!(s.next_deadline(), None);
+    assert_eq!(s.device_challenge("hl.example:5500"), Err(Error::NotReady));
+}
+
+#[test]
+fn a_refused_proof_says_why_and_a_challenge_reply_without_one_fails() {
+    let mut s = proving(Config::guest("me"));
+    let challenge = s.device_challenge("hl.example:5500").unwrap();
+    s.feed(&server(TASK, challenge, 0, &[]), T0);
+    let proof = s.prove_device(b"proof", b"cert", None).unwrap();
+    let out = sent(&mut s);
+    assert_eq!(out[1].2.len(), 2, "no card unless asked");
+    s.feed(
+        &server(
+            TASK,
+            proof,
+            1,
+            &[(tag::TASK_ERROR, b"The device could not be proved.")],
+        ),
+        T0,
+    );
+    assert_eq!(
+        events(&mut s),
+        [
+            Event::Failed {
+                trans: challenge,
+                chat_reason: None,
+                reason: None
+            },
+            Event::Failed {
+                trans: proof,
+                chat_reason: None,
+                reason: Some("The device could not be proved.".into())
+            },
+        ]
+    );
+    assert!(s.proving(), "a refusal settles nothing: the caller does");
+}
+
+#[test]
+fn device_requests_need_the_bit_and_something_to_send() {
+    // Offered, and the server never agreed.
+    let mut s = logging_in(Config {
+        caps: PROVES,
+        ..Config::guest("me")
+    });
+    assert_eq!(s.device_challenge("hl.example:5500"), Err(Error::NotReady));
+    s.feed(&login_reply(Some(190), Some(cap::TEXT_ENCODING)), T0);
+    assert_eq!(s.device_challenge("hl.example:5500"), Err(Error::NotAgreed));
+    assert_eq!(s.prove_device(b"p", b"c", None), Err(Error::NotAgreed));
+
+    let mut s = proving(Config::guest("me"));
+    assert_eq!(s.device_challenge(""), Err(Error::Malformed));
+    assert_eq!(s.prove_device(b"", b"c", None), Err(Error::Malformed));
+    assert_eq!(s.prove_device(b"p", b"c", Some(b"")), Err(Error::Malformed));
+    let long = vec![b'a'; hxproto::messaging::MAX_PROOF_HOST_LEN + 1];
+    assert_eq!(
+        s.device_challenge(std::str::from_utf8(&long).unwrap()),
+        Err(Error::TooLong)
+    );
+    assert!(s.take_outgoing().is_empty());
+}
+
+/// Everything sent and said from the login reply on, for `caps` offered
+/// and `echoed` agreed, through `settles`.
+fn after_login(
+    raw_mode: bool,
+    caps: u64,
+    version: Option<u16>,
+    echoed: u64,
+    settles: Settles,
+) -> (Vec<u8>, Vec<Event>) {
+    let cfg = if raw_mode { raw() } else { Config::guest("me") };
+    let mut s = logging_in(Config { caps, ..cfg });
+    s.feed(&login_reply(version, Some(echoed)), T0);
+    assert!(!s.proving());
+    let mut out = s.take_outgoing();
+    match settles {
+        Settles::Empty => s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0),
+        Settles::Text => {
+            s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0);
+            let _ = s.agree();
+        }
+        Settles::Never => s.tick(T0 + 2_000),
+    }
+    out.extend(s.take_outgoing());
+    // The login reply, and what the session read of it, carry the caps
+    // agreed; the rest must not differ.
+    let mut ev = events(&mut s);
+    ev.retain(|e| !matches!(e, Event::Reply { trans: 1, .. }));
+    if let Some(Event::LoggedIn(i)) = ev.iter_mut().find(|e| matches!(e, Event::LoggedIn(_))) {
+        i.caps &= !hxproto::messaging::CAP_DEVICE_PROOF;
+    }
+    (out, ev)
+}
+
+#[test]
+fn without_device_proof_agreed_nothing_waits() {
+    let bit = hxproto::messaging::CAP_DEVICE_PROOF;
+    let text = cap::TEXT_ENCODING;
+    for raw_mode in [false, true] {
+        for settles in [Settles::Empty, Settles::Text, Settles::Never] {
+            for (version, offered, echoed, why) in [
+                (Some(190), text | bit, text, "offered, never agreed"),
+                (Some(190), text, text | bit, "agreed, never offered"),
+                (
+                    None,
+                    text | bit,
+                    text | bit,
+                    "a 1.2 server, with no agreement to prove before",
+                ),
+            ] {
+                let what = format!("raw {raw_mode}, {settles:?}: {why}");
+                assert_eq!(
+                    after_login(raw_mode, offered, version, echoed, settles),
+                    after_login(raw_mode, text, version, text, settles),
+                    "{what}: byte for byte as without the bit"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "hope")]
 mod hope {
     use super::*;
@@ -3529,6 +3920,16 @@ mod hope {
         /// Answer the magic and step 1, take step 2 and accept it, and answer
         /// it as the login. Returns step 1's and step 2's trans.
         fn log_in(&mut self, s: &mut Session, policy: &Policy) -> (u32, u32) {
+            self.log_in_agreeing(s, policy, None)
+        }
+
+        /// As [`HopeServer::log_in`], its reply agreeing to `caps`.
+        fn log_in_agreeing(
+            &mut self,
+            s: &mut Session,
+            policy: &Policy,
+            caps: Option<u64>,
+        ) -> (u32, u32) {
             s.feed(SERVER_MAGIC, T0);
             let step1 = self.hear(s).remove(0);
             let (hs, reply) =
@@ -3539,7 +3940,7 @@ mod hope {
             assert!(fields.names(&hs, b""), "the guest's login");
             let (t, _) = hs.accept(&fields, b"", random()).unwrap();
             self.transport = Some(t);
-            self.say(s, &login_reply(Some(190), None));
+            self.say(s, &login_reply(Some(190), caps));
             (step1.trans, step2.trans)
         }
     }
@@ -3583,6 +3984,126 @@ mod hope {
                 assert!(!s.mid_transaction() && !s.is_closed(), "{what}");
             }
         }
+    }
+
+    /// Under HOPE as on the plain path: the agree waits for a proof the
+    /// server agreed to, and goes through the transport once it is settled;
+    /// a server that agreed to none is answered as ever.
+    #[test]
+    fn hope_holds_the_agree_for_a_proof_alone() {
+        for agreed in [true, false] {
+            let cfg = Config {
+                caps: PROVES,
+                ..Config::guest("me")
+            };
+            let mut s = Session::with_hope(cfg, offer(Some(Cipher::Blowfish), None), random(), T0);
+            let mut srv = HopeServer::new();
+            let echoed = if agreed { PROVES } else { cap::TEXT_ENCODING };
+            srv.log_in_agreeing(&mut s, &policy(), Some(echoed));
+            assert_eq!(s.proving(), agreed);
+            srv.say(&mut s, &server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]));
+            let mut heard: Vec<u32> = srv.hear(&mut s).iter().map(|t| t.type_).collect();
+            if agreed {
+                assert!(heard.is_empty(), "nothing joins");
+                let c = s.device_challenge("hl.example:5500").unwrap();
+                assert_eq!(
+                    srv.hear(&mut s)
+                        .iter()
+                        .map(|t| (t.type_, t.trans))
+                        .collect::<Vec<_>>(),
+                    [(1020, c)]
+                );
+                s.device_settled();
+                heard = srv.hear(&mut s).iter().map(|t| t.type_).collect();
+            }
+            assert_eq!(heard, [121, 300], "agreed {agreed}");
+        }
+    }
+
+    /// The name a step 2 carries: present always, as mhxd needs, and empty
+    /// from a session that may prove a device before it joins, whose name
+    /// goes with the agree instead.
+    #[test]
+    fn a_session_that_may_prove_names_nobody_in_step_2() {
+        for (caps, step2_name) in [(cap::TEXT_ENCODING, &b"me"[..]), (PROVES, &b""[..])] {
+            let cfg = Config {
+                caps,
+                ..Config::guest("me")
+            };
+            let mut s = Session::with_hope(cfg, offer(None, None), random(), T0);
+            s.take_outgoing();
+            s.feed(SERVER_MAGIC, T0);
+            let step1 = s.take_outgoing();
+            let (_, reply) = hxhope::server::answer(&policy(), &step1, [7; 64], 1).unwrap();
+            s.feed(&reply, T0);
+            let step2 = s.take_outgoing();
+            let names: Vec<Vec<u8>> = hxproto::wire::ChunkIter::over_message(&step2, step2.len())
+                .filter(|c| c.tag == tag::NAME)
+                .map(|c| c.data.to_vec())
+                .collect();
+            assert_eq!(names, [step2_name], "caps {caps:#x}");
+            // Answered, the agree carries the name, whatever the server
+            // agreed to.
+            s.feed(&login_reply(Some(190), Some(cap::TEXT_ENCODING)), T0);
+            s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+            let agree = sent(&mut s);
+            assert_eq!(agree[0].0, 121, "caps {caps:#x}");
+            assert!(
+                agree[0].2.contains(&(tag::NAME, b"me".to_vec())),
+                "caps {caps:#x}"
+            );
+        }
+    }
+
+    /// A step 2 that named nobody owes the server the name: with no
+    /// agreement to answer, the end of the wait for one sends it in an
+    /// agree, proving or not.
+    #[test]
+    fn a_name_left_out_of_step_2_goes_in_an_agree_when_no_agreement_comes() {
+        for agreed in [true, false] {
+            let cfg = Config {
+                caps: PROVES,
+                ..Config::guest("me")
+            };
+            let mut s = Session::with_hope(cfg, offer(None, None), random(), T0);
+            let mut srv = HopeServer::new();
+            let echoed = if agreed { PROVES } else { cap::TEXT_ENCODING };
+            srv.log_in_agreeing(&mut s, &policy(), Some(echoed));
+            s.tick(T0 + 2_000);
+            s.device_settled();
+            let heard = srv.hear(&mut s);
+            assert_eq!(
+                heard.iter().map(|t| t.type_).collect::<Vec<_>>(),
+                [121, 300],
+                "agreed {agreed}"
+            );
+            let name: Vec<Vec<u8>> =
+                hxproto::wire::ChunkIter::over_message(&heard[0].buf, heard[0].buf.len())
+                    .filter(|c| c.tag == tag::NAME)
+                    .map(|c| c.data.to_vec())
+                    .collect();
+            assert_eq!(name, [b"me".to_vec()], "agreed {agreed}");
+        }
+    }
+
+    /// The name a step 2 left out, too long to go in the agree at the end
+    /// of the wait, closes the session saying so.
+    #[test]
+    fn a_name_too_long_for_the_owed_agree_closes_the_session() {
+        let cfg = Config {
+            caps: PROVES,
+            ..Config::guest(&"n".repeat(70_000))
+        };
+        let mut s = Session::with_hope(cfg, offer(None, None), random(), T0);
+        let mut srv = HopeServer::new();
+        srv.log_in_agreeing(&mut s, &policy(), Some(cap::TEXT_ENCODING));
+        events(&mut s);
+        s.tick(T0 + 2_000);
+        assert!(s.is_closed());
+        assert!(matches!(
+            &events(&mut s)[..],
+            [Event::Closed(Closed::Protocol(_))]
+        ));
     }
 
     /// Step 2 goes out as it is, ahead of the transport; a trace of what is
