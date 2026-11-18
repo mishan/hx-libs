@@ -3561,15 +3561,13 @@ fn a_device_is_proved_before_the_session_joins() {
         let out = sent(&mut s);
         let ops: Vec<u32> = out.iter().map(|o| o.0).collect();
         let joined: &[u32] = match (settles, raw_mode) {
-            (Settles::Never, false) => &[300],
-            (Settles::Never, true) => &[],
+            // The name goes with an agree whether or not there was an
+            // agreement: a server that proves devices joins on it.
             (_, false) => &[121, 300],
             (_, true) => &[121],
         };
         assert_eq!(ops, joined, "{what}: what waited, in order");
-        if !matches!(settles, Settles::Never) {
-            assert!(out[0].2.contains(&(tag::NAME, b"me".to_vec())), "{what}");
-        }
+        assert!(out[0].2.contains(&(tag::NAME, b"me".to_vec())), "{what}");
         assert!(events(&mut s).contains(&Event::Ready), "{what}");
         // Settled once: a second settle sends nothing.
         s.device_settled();
@@ -3629,6 +3627,25 @@ fn an_agreement_after_the_wait_for_one_ended_still_waits_for_the_proof() {
     s.agree().unwrap();
     assert!(s.take_outgoing().is_empty());
     s.device_settled();
+    let out = sent(&mut s);
+    assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [121, 300]);
+    assert!(out[0].2.contains(&(tag::NAME, b"me".to_vec())));
+    assert_eq!(events(&mut s), [Event::Ready]);
+}
+
+#[test]
+fn an_agreement_after_the_wait_ended_is_the_users_to_answer_even_once_settled() {
+    let mut s = proving(Config::guest("me"));
+    s.tick(T0 + 2_000);
+    s.feed(&server(0x6d, 0, 0, &[(tag::BODY, b"Be nice.")]), T0 + 3_000);
+    assert_eq!(events(&mut s), [Event::Agreement("Be nice.".into())]);
+    s.device_settled();
+    assert!(
+        s.take_outgoing().is_empty(),
+        "nothing joins before the user answers"
+    );
+    assert!(events(&mut s).is_empty());
+    s.agree().unwrap();
     let out = sent(&mut s);
     assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [121, 300]);
     assert!(out[0].2.contains(&(tag::NAME, b"me".to_vec())));
@@ -3975,6 +3992,37 @@ mod hope {
                 agree[0].2.contains(&(tag::NAME, b"me".to_vec())),
                 "caps {caps:#x}"
             );
+        }
+    }
+
+    /// A step 2 that named nobody owes the server the name: with no
+    /// agreement to answer, the end of the wait for one sends it in an
+    /// agree, proving or not.
+    #[test]
+    fn a_name_left_out_of_step_2_goes_in_an_agree_when_no_agreement_comes() {
+        for agreed in [true, false] {
+            let cfg = Config {
+                caps: PROVES,
+                ..Config::guest("me")
+            };
+            let mut s = Session::with_hope(cfg, offer(None, None), random(), T0);
+            let mut srv = HopeServer::new();
+            let echoed = if agreed { PROVES } else { cap::TEXT_ENCODING };
+            srv.log_in_agreeing(&mut s, &policy(), Some(echoed));
+            s.tick(T0 + 2_000);
+            s.device_settled();
+            let heard = srv.hear(&mut s);
+            assert_eq!(
+                heard.iter().map(|t| t.type_).collect::<Vec<_>>(),
+                [121, 300],
+                "agreed {agreed}"
+            );
+            let name: Vec<Vec<u8>> =
+                hxproto::wire::ChunkIter::over_message(&heard[0].buf, heard[0].buf.len())
+                    .filter(|c| c.tag == tag::NAME)
+                    .map(|c| c.data.to_vec())
+                    .collect();
+            assert_eq!(name, [b"me".to_vec()], "agreed {agreed}");
         }
     }
 

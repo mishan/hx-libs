@@ -957,6 +957,10 @@ pub struct Session {
     held_agree: Option<Request>,
     /// The wait for an agreement ended while a device was proved.
     ready_held: bool,
+    /// The login named nobody where the server joins on a name: a server
+    /// that proves devices, or HOPE's step 2 sent with the name empty. The
+    /// name goes in an agree even where no agreement comes.
+    agree_owed: bool,
     /// The trans of the user list sent once the login settled.
     roster_trans: Option<u32>,
     last_sent: u64,
@@ -1006,6 +1010,7 @@ impl Session {
             proof_deadline: None,
             held_agree: None,
             ready_held: false,
+            agree_owed: false,
             roster_trans: None,
             last_sent: now_ms,
             unstamped: false,
@@ -1241,9 +1246,14 @@ impl Session {
                 }
                 if self.agreement_deadline.is_some_and(|d| now_ms >= d) {
                     // Neither an agreement nor anything else that settles
-                    // it: carry on as if there were none, as GtkHx does.
+                    // it: carry on as if there were none, as GtkHx does,
+                    // with the name in an agree where nothing else gave it.
                     self.agreement_deadline = None;
-                    self.after_agreement();
+                    if self.agree_owed && !self.proving {
+                        let _ = self.send_agree();
+                    } else {
+                        self.after_agreement();
+                    }
                 }
                 if self.keepalive_due().is_some_and(|d| now_ms >= d) {
                     self.send(
@@ -1313,7 +1323,9 @@ impl Session {
             self.agreed = true;
             self.after_agreement();
         } else if std::mem::take(&mut self.ready_held) {
-            self.after_agreement();
+            // No agreement came: the name still goes, in an agree, since a
+            // server that proves devices joins on it.
+            let _ = self.send_agree();
         }
     }
 
@@ -2220,6 +2232,9 @@ impl Session {
         match kind {
             parse::AgreementResult::Ok if !body.is_empty() => {
                 self.awaiting_agree = true;
+                // Shown, it is the user's answer that settles the login,
+                // whatever a proof does meanwhile.
+                self.ready_held = false;
                 let text = self.decode(&body);
                 self.events.push_back(Event::Agreement(text));
             }
@@ -2748,6 +2763,7 @@ impl Session {
         self.proving = version != 0 && caps & hxproto::messaging::CAP_DEVICE_PROOF != 0;
         if self.proving {
             self.proof_deadline = self.now.checked_add(self.cfg.proof_timeout_ms);
+            self.agree_owed = true;
         }
         self.server = Some(server.clone());
         self.state = State::LoggedIn;
@@ -2796,6 +2812,7 @@ impl Session {
         // yet: a server joins a step 2 that carries a name, and an empty
         // one, which mhxd needs present, waits for the agree.
         let proves = self.cfg.caps & hxproto::messaging::CAP_DEVICE_PROOF != 0;
+        self.agree_owed = proves;
         let who = hope::Login {
             login: self.cfg.login.as_bytes(),
             password: self.cfg.password.as_bytes(),
