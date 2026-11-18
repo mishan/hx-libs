@@ -2841,11 +2841,12 @@ impl Session {
     }
 
     /// An agree the session sends of its own accord. One it cannot build,
-    /// for a name too long for its field, ends the session saying so: the
-    /// login cannot finish without it, and nobody is there to be told
-    /// otherwise.
+    /// for a name too long for its field, ends a session not yet Ready
+    /// saying so: the login cannot finish without it, and nobody is there
+    /// to be told otherwise. A Ready session, answering an agreement that
+    /// came late, carries on as it was without it.
     fn agree_unasked(&mut self) {
-        if self.send_agree().is_err() {
+        if self.send_agree().is_err() && !self.ready {
             self.close(Closed::Protocol(
                 "the name is too long to send with the agree".into(),
             ));

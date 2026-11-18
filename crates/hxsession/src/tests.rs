@@ -3688,6 +3688,30 @@ fn an_agree_too_long_to_send_closes_the_session_wherever_it_would_go() {
     }
 }
 
+/// Once the session is Ready, a late agreement whose agree cannot be
+/// built leaves it as it was: open, and its user list still answered.
+#[test]
+fn a_late_agreement_too_long_to_answer_leaves_a_ready_session_open() {
+    let mut s = logging_in(Config::guest(&"n".repeat(70_000)));
+    s.feed(&login_reply(Some(190), Some(cap::TEXT_ENCODING)), T0);
+    s.tick(T0 + 2_000);
+    let out = sent(&mut s);
+    assert_eq!(out.iter().map(|o| o.0).collect::<Vec<_>>(), [300]);
+    assert!(events(&mut s).contains(&Event::Ready));
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0 + 3_000);
+    assert!(!s.is_closed());
+    assert!(s.take_outgoing().is_empty());
+    s.feed(&server(TASK, out[0].1, 0, &[]), T0 + 3_000);
+    assert_eq!(
+        events(&mut s),
+        [Event::UserList {
+            trans: out[0].1,
+            users: vec![],
+            subject: None
+        }]
+    );
+}
+
 #[test]
 fn a_session_closed_while_proving_proves_nothing() {
     let mut s = proving(Config::guest("me"));
