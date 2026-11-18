@@ -3652,6 +3652,42 @@ fn an_agreement_after_the_wait_ended_is_the_users_to_answer_even_once_settled() 
     assert_eq!(events(&mut s), [Event::Ready]);
 }
 
+/// An agree the session sends itself, with a name too long for its
+/// field, cannot go: the session closes saying so rather than waiting
+/// for ever on a login that cannot finish.
+#[test]
+fn an_agree_too_long_to_send_closes_the_session_wherever_it_would_go() {
+    let long = "n".repeat(70_000);
+    // An empty agreement, answered at once.
+    let mut s = logging_in(Config::guest(&long));
+    s.feed(&login_reply(Some(190), Some(cap::TEXT_ENCODING)), T0);
+    s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+    // A proof settled with no agreement.
+    let mut p = proving(Config::guest(&long));
+    p.tick(T0 + 2_000);
+    p.device_settled();
+    // And one the session settles itself, with no agreement.
+    let mut t = proving(Config::guest(&long));
+    t.tick(T0 + 10_000);
+    for (what, s) in [
+        ("empty agreement", &mut s),
+        ("settled proof", &mut p),
+        ("timed-out proof", &mut t),
+    ] {
+        assert!(
+            s.take_outgoing().is_empty(),
+            "{what}: nothing after the close"
+        );
+        assert!(s.is_closed(), "{what}");
+        let ev = events(s);
+        assert!(
+            matches!(ev.last(), Some(Event::Closed(Closed::Protocol(_)))),
+            "{what}: {ev:?}"
+        );
+        assert!(!ev.contains(&Event::Ready), "{what}");
+    }
+}
+
 #[test]
 fn a_session_closed_while_proving_proves_nothing() {
     let mut s = proving(Config::guest("me"));
@@ -4024,6 +4060,26 @@ mod hope {
                     .collect();
             assert_eq!(name, [b"me".to_vec()], "agreed {agreed}");
         }
+    }
+
+    /// The name a step 2 left out, too long to go in the agree at the end
+    /// of the wait, closes the session saying so.
+    #[test]
+    fn a_name_too_long_for_the_owed_agree_closes_the_session() {
+        let cfg = Config {
+            caps: PROVES,
+            ..Config::guest(&"n".repeat(70_000))
+        };
+        let mut s = Session::with_hope(cfg, offer(None, None), random(), T0);
+        let mut srv = HopeServer::new();
+        srv.log_in_agreeing(&mut s, &policy(), Some(cap::TEXT_ENCODING));
+        events(&mut s);
+        s.tick(T0 + 2_000);
+        assert!(s.is_closed());
+        assert!(matches!(
+            &events(&mut s)[..],
+            [Event::Closed(Closed::Protocol(_))]
+        ));
     }
 
     /// Step 2 goes out as it is, ahead of the transport; a trace of what is

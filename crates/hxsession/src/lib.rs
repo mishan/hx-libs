@@ -1250,7 +1250,7 @@ impl Session {
                     // with the name in an agree where nothing else gave it.
                     self.agreement_deadline = None;
                     if self.agree_owed && !self.proving {
-                        let _ = self.send_agree();
+                        self.agree_unasked();
                     } else {
                         self.after_agreement();
                     }
@@ -1325,7 +1325,7 @@ impl Session {
         } else if std::mem::take(&mut self.ready_held) {
             // No agreement came: the name still goes, in an agree, since a
             // server that proves devices joins on it.
-            let _ = self.send_agree();
+            self.agree_unasked();
         }
     }
 
@@ -2245,7 +2245,7 @@ impl Session {
             parse::AgreementResult::Missing if self.version() == 0 => {}
             // Nothing to show: answer it at once, as GtkHx does.
             _ => {
-                let _ = self.send_agree();
+                self.agree_unasked();
             }
         }
     }
@@ -2837,6 +2837,18 @@ impl Session {
                 self.state = State::Login;
             }
             Err(e) => self.close(Closed::Protocol(e)),
+        }
+    }
+
+    /// An agree the session sends of its own accord. One it cannot build,
+    /// for a name too long for its field, ends the session saying so: the
+    /// login cannot finish without it, and nobody is there to be told
+    /// otherwise.
+    fn agree_unasked(&mut self) {
+        if self.send_agree().is_err() {
+            self.close(Closed::Protocol(
+                "the name is too long to send with the agree".into(),
+            ));
         }
     }
 
