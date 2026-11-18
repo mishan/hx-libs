@@ -3712,6 +3712,35 @@ fn a_late_agreement_too_long_to_answer_leaves_a_ready_session_open() {
     );
 }
 
+/// A client that calls itself older than 1.5 has no agreement to prove
+/// before, whatever it offers: it is sent and told what it would be
+/// without the bit.
+#[test]
+fn a_client_older_than_1_5_proves_nothing() {
+    let run = |caps: u64| {
+        let mut s = logging_in(Config {
+            caps,
+            version: 149,
+            ..Config::guest("me")
+        });
+        s.feed(&login_reply(Some(190), Some(PROVES)), T0);
+        let proving = s.proving();
+        s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
+        s.tick(T0 + 2_000);
+        let mut ev = events(&mut s);
+        if let Some(Event::LoggedIn(i)) = ev.iter_mut().find(|e| matches!(e, Event::LoggedIn(_))) {
+            i.caps &= !hxproto::messaging::CAP_DEVICE_PROOF;
+        }
+        (proving, s.take_outgoing(), ev)
+    };
+    let (proving, out, ev) = run(PROVES);
+    assert!(!proving);
+    assert_eq!((out, ev), {
+        let (_, out, ev) = run(cap::TEXT_ENCODING);
+        (out, ev)
+    });
+}
+
 #[test]
 fn a_session_closed_while_proving_proves_nothing() {
     let mut s = proving(Config::guest("me"));
@@ -4020,12 +4049,12 @@ mod hope {
         }
     }
 
-    /// The name a step 2 carries: present always, as mhxd needs, and empty
-    /// from a session that may prove a device before it joins, whose name
-    /// goes with the agree instead.
+    /// Step 2 names the user whatever the session offers: a server joins a
+    /// step 2 that names someone, and mhxd keeps the name it gave there,
+    /// leaving the agree's to an account that may use any name.
     #[test]
-    fn a_session_that_may_prove_names_nobody_in_step_2() {
-        for (caps, step2_name) in [(cap::TEXT_ENCODING, &b"me"[..]), (PROVES, &b""[..])] {
+    fn step_2_names_the_user_whatever_the_session_offers() {
+        for caps in [cap::TEXT_ENCODING, PROVES] {
             let cfg = Config {
                 caps,
                 ..Config::guest("me")
@@ -4041,26 +4070,16 @@ mod hope {
                 .filter(|c| c.tag == tag::NAME)
                 .map(|c| c.data.to_vec())
                 .collect();
-            assert_eq!(names, [step2_name], "caps {caps:#x}");
-            // Answered, the agree carries the name, whatever the server
-            // agreed to.
-            s.feed(&login_reply(Some(190), Some(cap::TEXT_ENCODING)), T0);
-            s.feed(&server(0x6d, 0, 0, &[(tag::NOAGREEMENT, &[1])]), T0);
-            let agree = sent(&mut s);
-            assert_eq!(agree[0].0, 121, "caps {caps:#x}");
-            assert!(
-                agree[0].2.contains(&(tag::NAME, b"me".to_vec())),
-                "caps {caps:#x}"
-            );
+            assert_eq!(names, [b"me".to_vec()], "caps {caps:#x}");
         }
     }
 
-    /// A step 2 that named nobody owes the server the name: with no
-    /// agreement to answer, the end of the wait for one sends it in an
-    /// agree, proving or not.
+    /// With no agreement, a server that proves devices is sent the name in
+    /// an agree once the proof is settled; one that does not has had it in
+    /// step 2, and is sent the user list alone, as ever.
     #[test]
-    fn a_name_left_out_of_step_2_goes_in_an_agree_when_no_agreement_comes() {
-        for agreed in [true, false] {
+    fn an_agree_goes_without_an_agreement_only_to_a_server_that_proves() {
+        for (agreed, joined) in [(true, &[121, 300][..]), (false, &[300][..])] {
             let cfg = Config {
                 caps: PROVES,
                 ..Config::guest("me")
@@ -4072,38 +4091,17 @@ mod hope {
             s.tick(T0 + 2_000);
             s.device_settled();
             let heard = srv.hear(&mut s);
-            assert_eq!(
-                heard.iter().map(|t| t.type_).collect::<Vec<_>>(),
-                [121, 300],
-                "agreed {agreed}"
-            );
-            let name: Vec<Vec<u8>> =
-                hxproto::wire::ChunkIter::over_message(&heard[0].buf, heard[0].buf.len())
-                    .filter(|c| c.tag == tag::NAME)
-                    .map(|c| c.data.to_vec())
-                    .collect();
-            assert_eq!(name, [b"me".to_vec()], "agreed {agreed}");
+            let types: Vec<u32> = heard.iter().map(|t| t.type_).collect();
+            assert_eq!(types, joined, "agreed {agreed}");
+            if agreed {
+                let name: Vec<Vec<u8>> =
+                    hxproto::wire::ChunkIter::over_message(&heard[0].buf, heard[0].buf.len())
+                        .filter(|c| c.tag == tag::NAME)
+                        .map(|c| c.data.to_vec())
+                        .collect();
+                assert_eq!(name, [b"me".to_vec()]);
+            }
         }
-    }
-
-    /// The name a step 2 left out, too long to go in the agree at the end
-    /// of the wait, closes the session saying so.
-    #[test]
-    fn a_name_too_long_for_the_owed_agree_closes_the_session() {
-        let cfg = Config {
-            caps: PROVES,
-            ..Config::guest(&"n".repeat(70_000))
-        };
-        let mut s = Session::with_hope(cfg, offer(None, None), random(), T0);
-        let mut srv = HopeServer::new();
-        srv.log_in_agreeing(&mut s, &policy(), Some(cap::TEXT_ENCODING));
-        events(&mut s);
-        s.tick(T0 + 2_000);
-        assert!(s.is_closed());
-        assert!(matches!(
-            &events(&mut s)[..],
-            [Event::Closed(Closed::Protocol(_))]
-        ));
     }
 
     /// Step 2 goes out as it is, ahead of the transport; a trace of what is
