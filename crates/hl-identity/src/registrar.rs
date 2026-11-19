@@ -350,6 +350,8 @@ pub struct Rotation {
     /// first commitment, signed by the predecessor as well so that a thief
     /// holding only the successor key cannot choose it. Not
     /// [`Rotation::commitment`], which names the successor itself.
+    /// Absent is `None`; a CBOR null is no absence, and the decoder
+    /// refuses it as malformed, as it refuses null anywhere.
     pub next: Option<[u8; 32]>,
 }
 
@@ -1066,6 +1068,26 @@ mod tests {
             None
         );
         assert_eq!(Rotation::parse(&old_bytes).unwrap().next, None);
+        assert_eq!(
+            Record::parse(&old_bytes, None).unwrap(),
+            Record::Rotate(bare.clone())
+        );
+
+        // The same map with `next: null` in its canonical place, before
+        // `time`.
+        let time_key = [0x64, b't', b'i', b'm', b'e'];
+        let at = old_bytes.windows(5).position(|w| w == time_key).unwrap();
+        assert_eq!(old_bytes[0], 0xa6);
+        let null = [
+            &[0xa7][..],
+            &old_bytes[1..at],
+            &[0x64, b'n', b'e', b'x', b't', 0xf6],
+            &old_bytes[at..],
+        ]
+        .concat();
+        let malformed = Error::Cbor(cbor::CborError::Unsupported(0xf6));
+        assert_eq!(Rotation::parse(&null), Err(malformed.clone()));
+        assert_eq!(Record::parse(&null, None), Err(malformed));
 
         let r = Rotation {
             next: Some(next),
