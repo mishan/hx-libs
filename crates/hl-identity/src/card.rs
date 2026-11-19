@@ -59,6 +59,12 @@ pub struct Card {
     /// against their embedded registrar key. Confirming the registrar key
     /// is the caller's job ([`Attestation::verify_registrar`]).
     pub attestations: Vec<Attestation>,
+    /// Every attestation the card embeds, as signed and in order,
+    /// including those of a `v` this version does not read: the array
+    /// to hand [`Card::sign`] again, filtered as the caller means, so
+    /// signing a card again keeps what a newer registrar issued. Only
+    /// [`Card::attestations`] were verified; never count these.
+    pub embedded_attestations: Vec<Value>,
     /// Vouch objects, unparsed — the federation spec defines them. Kept
     /// as values so a server that doesn't implement vouches can still
     /// re-serve the card byte-exactly (it already does; this is for
@@ -94,6 +100,7 @@ impl Card {
             icon: None,
             profile: None,
             attestations: Vec::new(),
+            embedded_attestations: Vec::new(),
             vouches: Vec::new(),
             links: Vec::new(),
             successor: None,
@@ -161,7 +168,8 @@ impl Card {
     /// Sign with the identity key. `attestations` are the signed
     /// attestation objects to embed (the `attestations` field on `self`
     /// is ignored here, since parsed attestations have lost their
-    /// signatures). Returns [`Error::TooLarge`] rather than a card no
+    /// signatures; so is `embedded_attestations`, which is what to pass
+    /// to keep them all). Returns [`Error::TooLarge`] rather than a card no
     /// server will accept.
     pub fn sign(&self, identity: &IdentityKey, attestations: Vec<Value>) -> Result<Vec<u8>, Error> {
         // `assert!`, not `debug_assert!` (AGENTS.md): a wire invariant a
@@ -231,8 +239,9 @@ impl Card {
     /// whether the rest is worth looking at, and the free checks come
     /// before the paid ones.
     ///
-    /// An attestation this version can't read is discarded rather than
-    /// failing the card (§5.2 step 5): a registrar that starts issuing v2
+    /// An attestation this version can't read is left out of
+    /// `attestations`, unverified, rather than failing the card
+    /// (§5.2 step 5): a registrar that starts issuing v2
     /// attestations would otherwise lock its users out of every v1
     /// server. One that parses but doesn't verify, or that is about a
     /// different identity, still fails the card — the signer embedded it;
@@ -272,6 +281,7 @@ impl Card {
             icon: signed::opt_uint(v, "icon")?,
             profile: signed::opt_text(v, "profile")?,
             attestations: Vec::new(),
+            embedded_attestations: embedded.clone(),
             vouches: signed::opt_array(v, "vouches")?,
             links,
             successor: signed::opt_bytes32(v, "successor")?,
@@ -334,6 +344,7 @@ mod tests {
         card.successor = Some([0x5a; 32]);
         card.extra.insert("future".into(), Value::Uint(42));
         let bytes = card.sign(&id, vec![att.signed_value(&reg)]).unwrap();
+        card.embedded_attestations = vec![att.signed_value(&reg)];
         card.attestations = vec![att];
         assert_eq!(Card::parse(&bytes).unwrap(), card);
     }
@@ -367,11 +378,9 @@ mod tests {
         assert_eq!(Card::parse(&bytes), Err(Error::KeyMismatch));
     }
 
-    #[test]
-    fn an_attestation_this_version_cannot_read_is_discarded_not_fatal() {
-        // §5.2 step 5. A registrar that starts issuing v2 attestations
-        // would otherwise lock its users out of every v1 server.
-        let id = IdentityKey::from_seed(&[1u8; 32]);
+    /// Alice's attestation, as signed and as a newer registrar might
+    /// issue it.
+    fn known_and_newer(id: &IdentityKey) -> (Attestation, Value, Value) {
         let reg = ServerKey::from_seed(&[3u8; 32]);
         let att = Attestation {
             identity: id.public(),
@@ -394,12 +403,100 @@ mod tests {
             }
         }
         let future = crate::cbor::Value::Map(entries);
-        let card = Card::new(&id, "Alice", 10);
-        let bytes = card
-            .sign(&id, vec![future, att.signed_value(&reg)])
+        let known = att.signed_value(&reg);
+        (att, known, future)
+    }
+
+    #[test]
+    fn an_attestation_this_version_cannot_read_is_kept_not_counted() {
+        // §5.2 step 5. A registrar that starts issuing v2 attestations
+        // would otherwise lock its users out of every v1 server, and a
+        // client signing the card again would strip them.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let (att, known, newer) = known_and_newer(&id);
+        for embedded in [
+            vec![known.clone(), newer.clone()],
+            vec![newer.clone(), known.clone()],
+        ] {
+            let bytes = Card::new(&id, "Alice", 10)
+                .sign(&id, embedded.clone())
+                .unwrap();
+            let back = Card::parse(&bytes).unwrap();
+            assert_eq!(
+                back.attestations,
+                vec![att.clone()],
+                "the v1 one alone counts"
+            );
+            assert_eq!(back.embedded_attestations, embedded);
+            let again = back.sign(&id, back.embedded_attestations.clone());
+            assert_eq!(again.unwrap(), bytes);
+        }
+    }
+
+    /// `newer` with its entries in reverse order: another `Value`, the
+    /// same encoding.
+    fn reversed(newer: &Value) -> Value {
+        let Value::Map(entries) = newer else {
+            unreachable!("attestations are maps")
+        };
+        Value::Map(entries.iter().rev().cloned().collect())
+    }
+
+    #[test]
+    fn an_unread_attestation_passed_again_is_embedded_once() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let (_, known, newer) = known_and_newer(&id);
+        let bytes = Card::new(&id, "Alice", 10)
+            .sign(&id, vec![known.clone(), newer.clone()])
             .unwrap();
-        let back = Card::parse(&bytes).unwrap();
-        assert_eq!(back.attestations, vec![att], "the v1 one still counts");
+        let again = Card::parse(&bytes)
+            .unwrap()
+            .sign(&id, vec![known, reversed(&newer)])
+            .unwrap();
+        assert_eq!(again, bytes);
+    }
+
+    /// Alice's attestation for `handle`, as a v1 registrar signs it.
+    fn issued(id: &IdentityKey, handle: &str, issued: u64) -> Value {
+        let reg = ServerKey::from_seed(&[3u8; 32]);
+        Attestation {
+            identity: id.public(),
+            registrar: "hl.example".into(),
+            registrar_key: reg.public(),
+            handle: handle.into(),
+            registered: 1_600_000_000,
+            issued,
+            expires: 1_800_000_000,
+            level: None,
+        }
+        .signed_value(&reg)
+    }
+
+    #[test]
+    fn a_renewed_handle_leaves_no_unread_attestation_behind() {
+        // As a client renews one: every embedded attestation as signed,
+        // less any for the handle, then the fresh one, up to the cap.
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let (_, _, newer) = known_and_newer(&id);
+        let fresh = issued(&id, "alice", 1_750_000_000);
+        let others: Vec<Value> = (1..MAX_ATTESTATIONS)
+            .map(|n| issued(&id, &format!("alt{n}"), 1_700_000_000))
+            .collect();
+        for others in [vec![], others] {
+            let embedded = [vec![newer.clone()], others.clone()].concat();
+            let card = Card::new(&id, "Alice", 10).sign(&id, embedded).unwrap();
+            let card = Card::parse(&card).unwrap();
+            let mut renewed = card.embedded_attestations.clone();
+            renewed.retain(|v| v.get("handle") != Some(&Value::Text("alice".into())));
+            renewed.push(fresh.clone());
+            let again = Card::parse(&card.sign(&id, renewed.clone()).unwrap()).unwrap();
+            assert_eq!(
+                again.embedded_attestations,
+                renewed,
+                "{} others",
+                others.len()
+            );
+        }
     }
 
     #[test]

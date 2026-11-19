@@ -277,6 +277,45 @@ fn card_unknown_key_vector() {
 }
 
 #[test]
+fn card_unknown_attestation_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["card_unknown_attestation"];
+    let f = &e["fields"];
+    assert_eq!(str_of(e, "domain"), card::DOMAIN);
+
+    let att_bytes = unhex(str_of(&v["attestation"], "signed_hex"));
+    let known = cbor::decode_canonical(&att_bytes).unwrap();
+    let cbor::Value::Map(mut entries) = known.clone() else {
+        panic!("attestations are maps")
+    };
+    for (key, value) in &mut entries {
+        if *key == cbor::Value::Text("v".into()) {
+            *value = cbor::Value::Uint(2);
+        }
+    }
+    let newer = cbor::Value::Map(entries);
+    let mut c = Card::new(&k.id, str_of(f, "name"), u64_of(f, "updated"));
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(
+        c.sign(&k.id, vec![known.clone(), newer.clone()]).unwrap(),
+        signed
+    );
+
+    c.attestations = vec![Attestation::parse(&att_bytes).unwrap()];
+    c.embedded_attestations = vec![known, newer];
+    let back = Card::parse(&signed).unwrap();
+    assert_eq!(back, c);
+    assert_eq!(back.identity, unhex32(str_of(f, "identity")));
+    assert_eq!(
+        back.sign(&k.id, back.embedded_attestations.clone())
+            .unwrap(),
+        signed
+    );
+    check_signed(e, card::DOMAIN, &k.id.public(), &signed);
+}
+
+#[test]
 fn login_proof_vector_and_composed_login() {
     let v = vectors();
     let k = keys(&v);
