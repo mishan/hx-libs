@@ -25,9 +25,9 @@
 //!
 //! Test vectors live in `vectors/identity-test-vectors.json` and
 //! `vectors/server-handover-vectors.json`, checked by `tests/vectors.rs`,
-//! `tests/friendship.rs`, `tests/rotation.rs`, `tests/successor.rs` and
-//! `tests/server_handover.rs`; other implementations should check against
-//! the same files.
+//! `tests/friendship.rs`, `tests/rotation.rs`, `tests/successor.rs`,
+//! `tests/device_epoch.rs` and `tests/server_handover.rs`; other
+//! implementations should check against the same files.
 
 pub mod attestation;
 pub mod bundle;
@@ -61,8 +61,8 @@ pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 pub use message::{Article, ChatLine, PrivateMessage, Signed};
 pub use proof::{DeviceProof, LoginProof, ServerChallenge};
 pub use registrar::{
-    AttestationRevocation, DeviceRevocation, Freeze, IdentityRevocation, ListKind, Record,
-    RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
+    AttestationRevocation, DeviceEpoch, DeviceRevocation, Freeze, IdentityRevocation, ListKind,
+    Record, RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
 };
 pub use signed::VERSION;
 pub use successor::SuccessorCode;

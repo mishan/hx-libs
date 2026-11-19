@@ -1224,6 +1224,7 @@ fn friend_objects() {
                     expires: u64_of(f, "expires"),
                     caps: f["caps"].as_u64(),
                     name: None,
+                    epoch: 0,
                 };
                 let id = IdentityKey::from_seed(&seed_of(&v, str_of(e, "signer")));
                 assert_eq!(c.sign(&id), bytes, "{name}");
@@ -1240,7 +1241,7 @@ fn friend_objects() {
                     cert: unhex(str_of(f, "cert")),
                 };
                 assert_eq!(o.sign(&device()).unwrap(), bytes, "{name}");
-                assert_eq!(Offer::check(&bytes, now, &[]).unwrap(), o, "{name}");
+                assert_eq!(Offer::check(&bytes, now, &[], |_| 0).unwrap(), o, "{name}");
             }
             "acceptance" => {
                 assert_eq!(str_of(e, "domain"), friendship::ACCEPT_DOMAIN);
@@ -1264,7 +1265,7 @@ fn friend_objects() {
                 };
                 assert_eq!(w.sign(&device()).unwrap(), bytes, "{name}");
                 assert_eq!(
-                    Withdrawal::parse(&bytes, now).unwrap().withdrawal(),
+                    Withdrawal::parse(&bytes, now, |_| 0).unwrap().withdrawal(),
                     &w,
                     "{name}"
                 );
@@ -1275,9 +1276,12 @@ fn friend_objects() {
                 assert_eq!(Friendship::encode(&offer, &acceptance), bytes, "{name}");
                 let hash = unhex32(str_of(e, "hash_hex"));
                 assert_eq!(sha(&bytes), hash, "{name}");
-                let checked = Friendship::check(&bytes, now, &[]).unwrap();
+                let checked = Friendship::check(&bytes, now, &[], |_| 0).unwrap();
                 assert_eq!(checked.hash, hash, "{name}");
-                assert_eq!(checked.offer, Offer::check(&offer, now, &[]).unwrap());
+                assert_eq!(
+                    checked.offer,
+                    Offer::check(&offer, now, &[], |_| 0).unwrap()
+                );
             }
             other => panic!("unknown object kind {other}"),
         }
@@ -1350,9 +1354,9 @@ fn friend_rejects() {
     for r in v["friend_rejects"].as_array().unwrap() {
         let bytes = unhex(str_of(r, "hex"));
         let got = match str_of(r, "object") {
-            "offer" => outcome(Offer::check(&bytes, now, &[])),
-            "friendship" => outcome(Friendship::check(&bytes, now, &[])),
-            "withdrawal" => outcome(Withdrawal::parse(&bytes, now)),
+            "offer" => outcome(Offer::check(&bytes, now, &[], |_| 0)),
+            "friendship" => outcome(Friendship::check(&bytes, now, &[], |_| 0)),
+            "withdrawal" => outcome(Withdrawal::parse(&bytes, now, |_| 0)),
             other => panic!("unknown object kind {other}"),
         };
         let want = (r["step"].clone(), r["error"].as_str().map(str::to_owned));
@@ -1380,13 +1384,13 @@ fn friend_reads() {
             .collect();
         let held: Vec<Held> = names("withdrawals")
             .iter()
-            .map(|n| Withdrawal::check(&object_bytes(&v, n), now, &pair, &[]).unwrap())
+            .map(|n| Withdrawal::check(&object_bytes(&v, n), now, &pair, &[], |_| 0).unwrap())
             .collect();
         let bytes = object_bytes(&v, str_of(c, "vector"));
         let got = match str_of(c, "object") {
-            "offer" => outcome(Offer::check(&bytes, now, &held)),
-            "friendship" => outcome(Friendship::check(&bytes, now, &held)),
-            "withdrawal" => outcome(Withdrawal::check(&bytes, now, &pair, &rotations)),
+            "offer" => outcome(Offer::check(&bytes, now, &held, |_| 0)),
+            "friendship" => outcome(Friendship::check(&bytes, now, &held, |_| 0)),
+            "withdrawal" => outcome(Withdrawal::check(&bytes, now, &pair, &rotations, |_| 0)),
             other => panic!("unknown object kind {other}"),
         };
         assert_eq!(got, expected(c), "{}", str_of(c, "name"));
@@ -1399,7 +1403,7 @@ fn friend_cert_window() {
     let now = now_of(&v);
     for c in v["friend_cert_window"].as_array().unwrap() {
         let bytes = unhex(str_of(c, "signed_hex"));
-        let checked = Offer::check(&bytes, now, &[]);
+        let checked = Offer::check(&bytes, now, &[], |_| 0);
         if let Ok(offer) = &checked {
             let cert = DeviceCert::parse(&offer.cert).unwrap();
             assert_eq!(

@@ -15,9 +15,10 @@ use hl_identity::registrar::{
 use hl_identity::sealed::{self, Opened, Opening, Replay};
 use hl_identity::{
     attestation, card, cbor, cert, enroll, message, proof, Attestation, AttestationRevocation,
-    Bundle, Card, DeviceCert, DeviceKey, DeviceProof, DeviceRevocation, EnrollRequest, Fingerprint,
-    Freeze, IdentityKey, IdentityRevocation, ListKind, LoginContext, LoginProof, Record,
-    RegisterRequest, RegistrarKeys, Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
+    Bundle, Card, DeviceCert, DeviceEpoch, DeviceKey, DeviceProof, DeviceRevocation, EnrollRequest,
+    Fingerprint, Freeze, IdentityKey, IdentityRevocation, ListKind, LoginContext, LoginProof,
+    Record, RegisterRequest, RegistrarKeys, Rotation, ServerChallenge, ServerKey, SessionClaim,
+    SignedList,
 };
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
@@ -149,6 +150,7 @@ fn device_cert_vector() {
         expires: u64_of(f, "expires"),
         caps: f["caps"].as_u64(),
         name: f["name"].as_str().map(str::to_owned),
+        epoch: 0,
     };
     let signed = unhex(str_of(e, "signed_hex"));
     assert_eq!(
@@ -508,6 +510,7 @@ fn rejects() {
             "server_challenge" => ServerChallenge::parse(&bytes).unwrap_err(),
             "revoke_device" => DeviceRevocation::parse(&bytes).unwrap_err(),
             "rotate" => Rotation::parse(&bytes).unwrap_err(),
+            "device_epoch" => DeviceEpoch::parse(&bytes).unwrap_err(),
             other => panic!("unknown object kind {other}"),
         };
         assert_eq!(
@@ -987,6 +990,7 @@ fn message_cert_vector() {
         expires: u64_of(f, "expires"),
         caps: f["caps"].as_u64(),
         name: None,
+        epoch: 0,
     };
     let signed = unhex(str_of(e, "signed_hex"));
     assert_eq!(dc.sign(&k.id), signed);

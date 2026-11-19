@@ -2,9 +2,9 @@
 //!
 //! Three kinds of thing, by who signs them:
 //!
-//! - **user-signed**: the registration request (§4.2), and the three
-//!   records a user posts — device revocation (§4.4), identity
-//!   revocation (§4.5) and rotation (§4.6). Each verifies from its own
+//! - **user-signed**: the registration request (§4.2), and the records a
+//!   user posts: device revocation (§4.4), identity revocation (§4.5),
+//!   rotation (§4.6) and device epoch. Each verifies from its own
 //!   bytes, with no outside state: the key that signs is in the object,
 //!   and a device that signs brings its certificate along.
 //! - **registrar-signed records**: freeze (§4.7) and attestation
@@ -21,7 +21,7 @@
 
 use crate::attestation::is_host;
 use crate::cbor::{self, map, Value};
-use crate::cert::{caps, DeviceCert};
+use crate::cert::{caps, DeviceCert, EPOCH_MAX};
 use crate::error::Error;
 use crate::keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 use crate::signed::{self, AckedEnvelope, Envelope, VERSION};
@@ -32,6 +32,7 @@ pub const REVOKE_IDENTITY_DOMAIN: &str = "hl-identity/revoke-identity/v1";
 pub const ROTATE_DOMAIN: &str = "hl-identity/rotate/v1";
 pub const FREEZE_DOMAIN: &str = "hl-identity/freeze/v1";
 pub const REVOKE_ATTESTATION_DOMAIN: &str = "hl-identity/revoke-attestation/v1";
+pub const DEVICE_EPOCH_DOMAIN: &str = "hl-identity/device-epoch/v1";
 pub const RECORDS_DOMAIN: &str = "hl-identity/records/v1";
 pub const LOG_DOMAIN: &str = "hl-identity/log/v1";
 pub const STATS_DOMAIN: &str = "hl-identity/stats/v1";
@@ -284,6 +285,27 @@ impl DeviceRevocation {
             (None, Some(_)) => return Err(Error::MissingField("signer")),
         }
         Ok(r)
+    }
+
+    /// The epoch of the device that signed, `None` when the identity did.
+    /// Also `None` for a `signer_cert` that does not read, which a
+    /// revocation [`DeviceRevocation::parse`] returned never has.
+    pub fn signer_epoch(&self) -> Option<u64> {
+        let (cert, _) = DeviceCert::open(self.signer_cert.as_ref()?).ok()?;
+        Some(cert.epoch)
+    }
+
+    /// Refuses a revocation its device signed below `floor`, the highest
+    /// device epoch its reader holds for the identity, whatever its
+    /// `time` says: the epoch has no time in it, and a device that was
+    /// reset could otherwise sign one dated inside its old certificate's
+    /// window and revoke the devices enrolled after the reset. One the
+    /// identity signed always passes.
+    pub fn check_signer_floor(&self, floor: u64) -> Result<(), Error> {
+        match &self.signer_cert {
+            None => Ok(()),
+            Some(cert) => DeviceCert::parse(cert)?.check_floor(floor),
+        }
     }
 }
 
@@ -542,9 +564,80 @@ fn verify_any(env: &Envelope, keys: &[PublicKey], domain: &str) -> Result<(), Er
     Err(last)
 }
 
+// --- Device epoch -------------------------------------------------------
+
+/// Every device certificate of `identity` whose `epoch` is below this
+/// record's is revoked. Signed by the identity key alone, never a device:
+/// it ends what only the identity key can certify again, so a stolen
+/// `manage` device must not be able to sign every other device out.
+///
+/// It carries no reason, because it is published and "compromise
+/// suspected" is worth not publishing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEpoch {
+    pub identity: PublicKey,
+    /// The floor: at least 1 and at most [`EPOCH_MAX`].
+    pub epoch: u64,
+    /// When it was signed. For display and ordering only; it is never
+    /// compared with a certificate's window.
+    pub time: u64,
+}
+
+impl DeviceEpoch {
+    fn unsigned(&self) -> Value {
+        map(vec![
+            ("v", Some(Value::Uint(VERSION))),
+            ("identity", Some(Value::Bytes(self.identity.to_vec()))),
+            ("epoch", Some(Value::Uint(self.epoch))),
+            ("time", Some(Value::Uint(self.time))),
+        ])
+    }
+
+    pub fn sign(&self, identity: &IdentityKey) -> Result<Vec<u8>, Error> {
+        assert_eq!(identity.public(), self.identity);
+        let bytes = signed::seal(self.unsigned(), |body| {
+            identity.sign(DEVICE_EPOCH_DOMAIN, body)
+        });
+        Self::parse(&bytes)?;
+        Ok(bytes)
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<DeviceEpoch, Error> {
+        check_size(bytes, SMALL_RECORD_MAX_BYTES)?;
+        Self::from_envelope(Envelope::open(bytes)?)
+    }
+
+    /// The keys that name the other records are refused rather than
+    /// ignored, so that no record reads as this one and as another.
+    fn from_envelope(env: Envelope) -> Result<DeviceEpoch, Error> {
+        let v = &env.value;
+        for k in ["ack", "successor", "device", "frozen", "handle"] {
+            if v.get(k).is_some() {
+                return Err(Error::BadField(k));
+            }
+        }
+        let r = DeviceEpoch {
+            identity: signed::bytes32(v, "identity")?,
+            epoch: signed::uint(v, "epoch")?,
+            time: signed::uint(v, "time")?,
+        };
+        if !(1..=EPOCH_MAX).contains(&r.epoch) {
+            return Err(Error::BadField("epoch"));
+        }
+        env.verify(&r.identity, DEVICE_EPOCH_DOMAIN)?;
+        Ok(r)
+    }
+
+    /// Whether this revokes `cert`. Another identity's certificate is
+    /// never revoked by it.
+    pub fn revokes(&self, cert: &DeviceCert) -> bool {
+        cert.identity == self.identity && cert.epoch < self.epoch
+    }
+}
+
 // --- The records, as one type --------------------------------------------
 
-/// Any of the five records a record list carries.
+/// Any of the records a record list carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     RevokeDevice(DeviceRevocation),
@@ -552,6 +645,7 @@ pub enum Record {
     Rotate(Rotation),
     Freeze(Freeze),
     RevokeAttestation(AttestationRevocation),
+    DeviceEpoch(DeviceEpoch),
 }
 
 /// Who a registrar-signed record must come from: the host it names and
@@ -564,12 +658,18 @@ pub struct RegistrarKeys<'a> {
 
 impl Record {
     /// Parse and verify any record. The objects carry no type tag, so the
-    /// kind is read from the keys each one alone has — `ack` or
+    /// kind is read from the keys each one alone has (`ack` or
     /// `successor` a rotation, `device` a device revocation, `frozen` a
-    /// freeze, `handle` an attestation revocation, and none of them an
-    /// identity revocation — and the signature is then checked under
-    /// that kind's domain. A misreading can only fail: domains are what
-    /// keep one kind's signature from verifying as another's.
+    /// freeze, `handle` an attestation revocation, `epoch` a device epoch
+    /// (or, failing that, an identity revocation with a key it ignores),
+    /// and none of them an identity revocation) and the
+    /// signature is then checked under that kind's domain. A misreading
+    /// can only fail: domains are what keep one kind's signature from
+    /// verifying as another's.
+    ///
+    /// That is what a reader from before a kind existed relies on: it
+    /// reads a device epoch as an identity revocation, which fails its
+    /// signature, and skips the entry rather than refusing the identity.
     ///
     /// `registrar` is needed for the two registrar-signed kinds and
     /// refused-by-absence without it (`KeyMismatch`); a registrar-signed
@@ -601,6 +701,18 @@ impl Record {
             }
             return Ok(r);
         }
+        if has("epoch") {
+            // An identity revocation that carries an `epoch` key verified
+            // as one before device epochs existed, and still does: the
+            // two domains differ, so at most one of them verifies.
+            return DeviceEpoch::from_envelope(Envelope::from_value(value.clone())?)
+                .map(Record::DeviceEpoch)
+                .or_else(|e| {
+                    IdentityRevocation::from_envelope(Envelope::from_value(value)?)
+                        .map(Record::RevokeIdentity)
+                        .map_err(|_| e)
+                });
+        }
         IdentityRevocation::from_envelope(Envelope::from_value(value)?).map(Record::RevokeIdentity)
     }
 
@@ -613,6 +725,7 @@ impl Record {
             Record::Rotate(r) => &r.identity,
             Record::Freeze(r) => &r.identity,
             Record::RevokeAttestation(r) => &r.identity,
+            Record::DeviceEpoch(r) => &r.identity,
         }
     }
 
@@ -623,11 +736,12 @@ impl Record {
             Record::Rotate(r) => r.time,
             Record::Freeze(r) => r.time,
             Record::RevokeAttestation(r) => r.time,
+            Record::DeviceEpoch(r) => r.time,
         }
     }
 
-    /// The host a registrar-signed record names; `None` for the three a
-    /// user signs.
+    /// The host a registrar-signed record names; `None` for those a user
+    /// signs.
     pub fn registrar(&self) -> Option<&str> {
         match self {
             Record::Freeze(r) => Some(&r.registrar),
@@ -649,6 +763,7 @@ impl Record {
             Record::Rotate(_) => "rotate",
             Record::Freeze(_) => "freeze",
             Record::RevokeAttestation(_) => "revoke_attestation",
+            Record::DeviceEpoch(_) => "device_epoch",
         }
     }
 }
@@ -993,6 +1108,112 @@ mod tests {
             r.sign_as_device(&laptop, stale).unwrap_err(),
             Error::Expired
         );
+    }
+
+    #[test]
+    fn a_record_carrying_epoch_beside_its_own_keys_reads_as_before() {
+        let alice = id(1);
+        let with_epoch = |unsigned: Value, epoch: u64| {
+            let Value::Map(mut entries) = unsigned else {
+                unreachable!()
+            };
+            entries.push((Value::Text("epoch".into()), Value::Uint(epoch)));
+            Value::Map(entries)
+        };
+        let revocation = IdentityRevocation {
+            identity: alice.public(),
+            time: T,
+            reason: None,
+        };
+        let freeze = Freeze {
+            identity: alice.public(),
+            registrar: "hl.example".into(),
+            frozen: true,
+            time: T,
+        };
+        let k = [reg().public()];
+        for epoch in [0, 5] {
+            let bytes = signed::seal(with_epoch(revocation.unsigned(), epoch), |b| {
+                alice.sign(REVOKE_IDENTITY_DOMAIN, b)
+            });
+            assert_eq!(IdentityRevocation::parse(&bytes), Ok(revocation.clone()));
+            assert_eq!(
+                Record::parse(&bytes, None),
+                Ok(Record::RevokeIdentity(revocation.clone())),
+                "epoch {epoch}"
+            );
+            let bytes = signed::seal(with_epoch(freeze.unsigned(), epoch), |b| {
+                reg().sign(FREEZE_DOMAIN, b)
+            });
+            assert_eq!(
+                Record::parse(&bytes, Some(keys(&k))),
+                Ok(Record::Freeze(freeze.clone())),
+                "epoch {epoch}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_epoch_is_the_identity_keys_alone() {
+        let alice = id(1);
+        let r = DeviceEpoch {
+            identity: alice.public(),
+            epoch: 4,
+            time: T,
+        };
+        let bytes = r.sign(&alice).unwrap();
+        assert_eq!(DeviceEpoch::parse(&bytes).unwrap(), r);
+        let rec = Record::parse(&bytes, None).unwrap();
+        assert_eq!(rec, Record::DeviceEpoch(r.clone()));
+        assert_eq!(rec.kind(), "device_epoch");
+        assert!(rec.user_signed());
+        // What a reader from before device epochs does with it: read as
+        // an identity revocation, it fails its signature and is skipped,
+        // never taken as the identity revoked.
+        assert_eq!(IdentityRevocation::parse(&bytes), Err(Error::BadSignature));
+
+        let by_alice = |b: &[u8]| alice.sign(DEVICE_EPOCH_DOMAIN, b);
+        let device = DeviceKey::from_seed(&[2u8; 32]);
+        let by_device = signed::seal(r.unsigned(), |b| device.sign(DEVICE_EPOCH_DOMAIN, b));
+        assert_eq!(DeviceEpoch::parse(&by_device), Err(Error::BadSignature));
+        for epoch in [0, EPOCH_MAX + 1] {
+            let bad = DeviceEpoch { epoch, ..r.clone() };
+            assert_eq!(
+                DeviceEpoch::parse(&signed::seal(bad.unsigned(), by_alice)),
+                Err(Error::BadField("epoch"))
+            );
+            assert_eq!(bad.sign(&alice), Err(Error::BadField("epoch")));
+        }
+        for key in ["ack", "successor", "device", "frozen", "handle"] {
+            let Value::Map(mut entries) = r.unsigned() else {
+                unreachable!()
+            };
+            entries.push((Value::Text(key.into()), Value::Bool(true)));
+            assert_eq!(
+                DeviceEpoch::parse(&signed::seal(Value::Map(entries), by_alice)),
+                Err(Error::BadField(key)),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_device_epoch_revokes_its_identitys_earlier_certificates() {
+        let alice = id(1);
+        let r = DeviceEpoch {
+            identity: alice.public(),
+            epoch: 4,
+            time: T,
+        };
+        let dev = DeviceKey::from_seed(&[2u8; 32]);
+        let mut cert = DeviceCert::for_device(&alice, &dev, T, 86400).unwrap();
+        for (epoch, revoked) in [(0, true), (3, true), (4, false), (5, false)] {
+            cert.epoch = epoch;
+            assert_eq!(r.revokes(&cert), revoked, "epoch {epoch}");
+        }
+        let mallory = id(7);
+        let theirs = DeviceCert::for_device(&mallory, &dev, T, 86400).unwrap();
+        assert!(!r.revokes(&theirs));
     }
 
     #[test]

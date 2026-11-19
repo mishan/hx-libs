@@ -39,6 +39,11 @@ pub const MAX_BYTES: usize = 4 * 1024;
 /// phone", shown next to the fingerprint.
 pub const NAME_MAX_CHARS: usize = 64;
 
+/// The largest `epoch` a certificate or a device epoch record may carry,
+/// so that it fits the signed 64-bit integer a store such as SQLite
+/// keeps.
+pub const EPOCH_MAX: u64 = i64::MAX as u64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceCert {
     pub identity: PublicKey,
@@ -49,6 +54,9 @@ pub struct DeviceCert {
     /// `None` on the wire means unrestricted.
     pub caps: Option<u64>,
     pub name: Option<String>,
+    /// The device epoch the certificate was issued in. Absent on the wire
+    /// is 0, and 0 is never written, so a certificate has one encoding.
+    pub epoch: u64,
 }
 
 impl DeviceCert {
@@ -103,6 +111,7 @@ impl DeviceCert {
             expires,
             caps: None,
             name: None,
+            epoch: 0,
         })
     }
 
@@ -116,6 +125,7 @@ impl DeviceCert {
             ("expires", Some(Value::Uint(self.expires))),
             ("caps", self.caps.map(Value::Uint)),
             ("name", self.name.clone().map(Value::Text)),
+            ("epoch", (self.epoch > 0).then_some(Value::Uint(self.epoch))),
         ])
     }
 
@@ -186,11 +196,29 @@ impl DeviceCert {
             expires: signed::uint(v, "expires")?,
             caps: signed::opt_uint(v, "caps")?,
             name: signed::opt_text(v, "name")?,
+            epoch: match signed::opt_uint(v, "epoch")? {
+                None => 0,
+                Some(e) if (1..=EPOCH_MAX).contains(&e) => e,
+                Some(_) => return Err(Error::BadField("epoch")),
+            },
         })
     }
 
     pub fn check_valid(&self, now: u64, skew: u64) -> Result<(), Error> {
         signed::check_window(self.issued, self.expires, now, skew)
+    }
+
+    /// Refuses a certificate issued before `floor`, the highest device
+    /// epoch its reader holds for the identity: a reset revoked it. This
+    /// crate applies it to the device revocations and friendship objects
+    /// a device signs; login, and anything else a device signed, are the
+    /// caller's to check with it.
+    pub fn check_floor(&self, floor: u64) -> Result<(), Error> {
+        if self.epoch < floor {
+            Err(Error::BelowFloor)
+        } else {
+            Ok(())
+        }
     }
 
     pub fn allows(&self, cap: u64) -> bool {
@@ -266,6 +294,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::cbor;
 
     fn fixture() -> (IdentityKey, DeviceKey, DeviceCert) {
         let id = IdentityKey::from_seed(&[1u8; 32]);
@@ -318,6 +347,46 @@ mod tests {
         assert!(back.allows(caps::LOGIN));
         assert!(!back.allows(caps::MANAGE));
         assert_eq!(back.require(caps::MANAGE), Err(Error::CapabilityMissing));
+    }
+
+    #[test]
+    fn epoch_zero_is_never_written_and_never_read() {
+        let (id, _, mut cert) = fixture();
+        let bare = cert.sign(&id);
+        assert_eq!(cbor::decode_canonical(&bare).unwrap().get("epoch"), None);
+
+        cert.epoch = 3;
+        let bytes = cert.sign(&id);
+        assert_eq!(
+            cbor::decode_canonical(&bytes).unwrap().get("epoch"),
+            Some(&Value::Uint(3))
+        );
+        assert_eq!(DeviceCert::parse(&bytes).unwrap(), cert);
+
+        // Written by hand, since `unsigned` leaves 0 out.
+        for bad in [0, EPOCH_MAX + 1, u64::MAX] {
+            let Value::Map(mut entries) = cert.unsigned().without("epoch") else {
+                unreachable!()
+            };
+            entries.push((Value::Text("epoch".into()), Value::Uint(bad)));
+            let bytes = signed::seal(Value::Map(entries), |b| id.sign(DOMAIN, b));
+            assert_eq!(
+                DeviceCert::parse(&bytes),
+                Err(Error::BadField("epoch")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_floor_refuses_only_earlier_epochs() {
+        let (_, _, mut cert) = fixture();
+        cert.epoch = 5;
+        let refused = Err(Error::BelowFloor);
+        for (floor, expect) in [(0, Ok(())), (4, Ok(())), (5, Ok(())), (6, refused.clone())] {
+            assert_eq!(cert.check_floor(floor), expect, "floor {floor}");
+        }
+        assert_eq!(cert.check_floor(u64::MAX), refused);
     }
 
     #[test]
