@@ -25,9 +25,9 @@
 //!
 //! Test vectors live in `vectors/identity-test-vectors.json` and
 //! `vectors/server-handover-vectors.json`, checked by `tests/vectors.rs`,
-//! `tests/friendship.rs`, `tests/rotation.rs`, `tests/successor.rs` and
-//! `tests/server_handover.rs`; other implementations should check against
-//! the same files.
+//! `tests/friendship.rs`, `tests/rotation.rs`, `tests/successor.rs`,
+//! `tests/device_epoch.rs` and `tests/server_handover.rs`; other
+//! implementations should check against the same files.
 
 pub mod attestation;
 pub mod bundle;

@@ -149,6 +149,7 @@ fn device_cert_vector() {
         expires: u64_of(f, "expires"),
         caps: f["caps"].as_u64(),
         name: f["name"].as_str().map(str::to_owned),
+        epoch: 0,
     };
     let signed = unhex(str_of(e, "signed_hex"));
     assert_eq!(
@@ -987,6 +988,7 @@ fn message_cert_vector() {
         expires: u64_of(f, "expires"),
         caps: f["caps"].as_u64(),
         name: None,
+        epoch: 0,
     };
     let signed = unhex(str_of(e, "signed_hex"));
     assert_eq!(dc.sign(&k.id), signed);

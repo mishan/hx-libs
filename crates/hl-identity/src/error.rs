@@ -53,6 +53,8 @@ pub enum Error {
     Replayed,
     /// A friendship or an offer that a withdrawal held ends.
     Withdrawn,
+    /// A device certificate whose epoch is below its identity's floor.
+    BelowFloor,
 }
 
 impl fmt::Display for Error {
@@ -79,6 +81,9 @@ impl fmt::Display for Error {
             Error::OpenFailed => write!(f, "sealed message does not open"),
             Error::Replayed => write!(f, "sealed message already accepted"),
             Error::Withdrawn => write!(f, "ended by a withdrawal"),
+            Error::BelowFloor => {
+                write!(f, "device certificate is below its identity's device epoch")
+            }
         }
     }
 }

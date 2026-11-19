@@ -1224,6 +1224,7 @@ fn friend_objects() {
                     expires: u64_of(f, "expires"),
                     caps: f["caps"].as_u64(),
                     name: None,
+                    epoch: 0,
                 };
                 let id = IdentityKey::from_seed(&seed_of(&v, str_of(e, "signer")));
                 assert_eq!(c.sign(&id), bytes, "{name}");
