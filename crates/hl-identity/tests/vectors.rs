@@ -685,6 +685,7 @@ fn record_vectors() {
         identity: k.id.public(),
         successor: succ.public(),
         time: u64_of(f, "time"),
+        next: None,
     };
     assert_eq!(r.sign(&k.id, &succ).unwrap(), signed);
     assert_eq!(rec, Record::Rotate(r));

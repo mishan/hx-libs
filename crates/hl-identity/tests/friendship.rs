@@ -1298,6 +1298,7 @@ fn rotation_vectors() {
             identity: unhex32(str_of(f, "identity")),
             successor: unhex32(str_of(f, "successor")),
             time: u64_of(f, "time"),
+            next: None,
         };
         let signed = unhex(str_of(e, "signed_hex"));
         let pred = IdentityKey::from_seed(&seed_of(&v, from));
