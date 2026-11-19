@@ -25,7 +25,7 @@
 //!
 //! Test vectors live in `vectors/identity-test-vectors.json` and
 //! `vectors/server-handover-vectors.json`, checked by `tests/vectors.rs`,
-//! `tests/friendship.rs`, `tests/successor.rs` and
+//! `tests/friendship.rs`, `tests/rotation.rs`, `tests/successor.rs` and
 //! `tests/server_handover.rs`; other implementations should check against
 //! the same files.
 

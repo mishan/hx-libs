@@ -23,7 +23,7 @@ use crate::attestation::is_host;
 use crate::cbor::{self, map, Value};
 use crate::cert::{caps, DeviceCert};
 use crate::error::Error;
-use crate::keys::{DeviceKey, IdentityKey, PublicKey, ServerKey};
+use crate::keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 use crate::signed::{self, AckedEnvelope, Envelope, VERSION};
 
 pub const REGISTER_DOMAIN: &str = "hl-identity/register/v1";
@@ -346,6 +346,11 @@ pub struct Rotation {
     pub identity: PublicKey,
     pub successor: PublicKey,
     pub time: u64,
+    /// `SHA-256` of the successor's own successor key: the successor's
+    /// first commitment, signed by the predecessor as well so that a thief
+    /// holding only the successor key cannot choose it. Not
+    /// [`Rotation::commitment`], which names the successor itself.
+    pub next: Option<[u8; 32]>,
 }
 
 impl Rotation {
@@ -355,6 +360,7 @@ impl Rotation {
             ("identity", Some(Value::Bytes(self.identity.to_vec()))),
             ("successor", Some(Value::Bytes(self.successor.to_vec()))),
             ("time", Some(Value::Uint(self.time))),
+            ("next", self.next.map(|n| Value::Bytes(n.to_vec()))),
         ])
     }
 
@@ -391,9 +397,15 @@ impl Rotation {
             identity: signed::bytes32(v, "identity")?,
             successor: signed::bytes32(v, "successor")?,
             time: signed::uint(v, "time")?,
+            next: signed::opt_bytes32(v, "next")?,
         };
         if r.identity == r.successor {
             return Err(Error::BadField("successor"));
+        }
+        if r.next
+            .is_some_and(|n| n == Fingerprint::of(&r.identity).0 || n == r.commitment())
+        {
+            return Err(Error::BadField("next"));
         }
         env.verify(&r.identity, &r.successor, ROTATE_DOMAIN)?;
         Ok(r)
@@ -989,6 +1001,7 @@ mod tests {
             identity: old.public(),
             successor: new.public(),
             time: T,
+            next: None,
         };
         let bytes = r.sign(&old, &new).unwrap();
         assert_eq!(
@@ -1034,6 +1047,61 @@ mod tests {
             |b| old.sign(&signed::ack_domain(ROTATE_DOMAIN), b),
         );
         assert_eq!(Rotation::parse(&bytes), Err(Error::BadField("successor")));
+    }
+
+    #[test]
+    fn rotation_next_is_signed_by_both() {
+        let old = id(1);
+        let new = id(2);
+        let next = id(3).fingerprint().0;
+        let bare = Rotation {
+            identity: old.public(),
+            successor: new.public(),
+            time: T,
+            next: None,
+        };
+        let old_bytes = bare.sign(&old, &new).unwrap();
+        assert_eq!(
+            cbor::decode_canonical(&old_bytes).unwrap().get("next"),
+            None
+        );
+        assert_eq!(Rotation::parse(&old_bytes).unwrap().next, None);
+
+        let r = Rotation {
+            next: Some(next),
+            ..bare
+        };
+        let bytes = r.sign(&old, &new).unwrap();
+        assert_eq!(
+            Record::parse(&bytes, None).unwrap(),
+            Record::Rotate(r.clone())
+        );
+
+        let mut v = cbor::decode_canonical(&bytes).unwrap();
+        if let Value::Map(entries) = &mut v {
+            for (k, val) in entries.iter_mut() {
+                if k == &Value::Text("next".into()) {
+                    *val = Value::Bytes(id(9).fingerprint().0.to_vec());
+                }
+            }
+        }
+        assert_eq!(Rotation::parse(&cbor::encode(&v)), Err(Error::BadSignature));
+
+        // Committing the successor's successor back to the old key, or to
+        // the successor itself, is no handover.
+        for to in [&old, &new] {
+            let looped = Rotation {
+                next: Some(to.fingerprint().0),
+                ..r.clone()
+            };
+            let bytes = signed::seal_acked(
+                looped.unsigned(),
+                |b| old.sign(ROTATE_DOMAIN, b),
+                |b| new.sign(&signed::ack_domain(ROTATE_DOMAIN), b),
+            );
+            assert_eq!(Rotation::parse(&bytes), Err(Error::BadField("next")));
+            assert_eq!(looped.sign(&old, &new), Err(Error::BadField("next")));
+        }
     }
 
     #[test]
