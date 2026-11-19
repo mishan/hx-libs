@@ -60,6 +60,24 @@
   "signed_hex": "a661760163736967584094eeac6adfa2b1518389d547a6a1ab974da8d67a34352d9f5ec6ed68b8e6ba58ef423849247e0624a5e544f8fd3d1d31bdcff4f66d2cecc1dba40d8770b0b70c646e616d6565416c69636567757064617465641a68bb79bc686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c69737563636573736f7258205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
   "note": "A card that pre-commits a successor identity (\u00a73.4). A server that has cached this card must refuse a later card for the same identity carrying a different successor, or none."
  },
+ "card_unknown_key": {
+  "domain": "hl-identity/card/v1",
+  "fields": {
+   "future": {
+    "n": 42,
+    "t": "kept"
+   },
+   "identity": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+   "name": "Alice",
+   "updated": 1757116860,
+   "v": 1
+  },
+  "unsigned_hex": "a5617601646e616d6565416c69636566667574757265a2616e182a6174646b65707467757064617465641a68bb79bc686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "signature_input_hex": "686c2d6964656e746974792f636172642f763100a5617601646e616d6565416c69636566667574757265a2616e182a6174646b65707467757064617465641a68bb79bc686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "signature_hex": "69cda502173dd9f76629049a77bf0fd616677535def6b48ccfd95cb076503add5400f19b041a49c08e2e423e0de1a0c2b185c60709c68698364dbbcda33bcb0f",
+  "signed_hex": "a661760163736967584069cda502173dd9f76629049a77bf0fd616677535def6b48ccfd95cb076503add5400f19b041a49c08e2e423e0de1a0c2b185c60709c68698364dbbcda33bcb0f646e616d6565416c69636566667574757265a2616e182a6174646b65707467757064617465641a68bb79bc686964656e7469747958208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+  "note": "A card carrying a text key this version does not define. A reader ignores it, and a client that reads this card and signs it again keeps it as it was (\u00a73.1). A top-level key that is not text is dropped when the card is signed again."
+ },
  "device_cert": {
   "domain": "hl-identity/device-cert/v1",
   "fields": {

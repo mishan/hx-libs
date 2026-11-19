@@ -14,10 +14,10 @@ use hl_identity::registrar::{
 };
 use hl_identity::sealed::{self, Opened, Opening, Replay};
 use hl_identity::{
-    attestation, card, cert, enroll, message, proof, Attestation, AttestationRevocation, Bundle,
-    Card, DeviceCert, DeviceKey, DeviceProof, DeviceRevocation, EnrollRequest, Fingerprint, Freeze,
-    IdentityKey, IdentityRevocation, ListKind, LoginContext, LoginProof, Record, RegisterRequest,
-    RegistrarKeys, Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
+    attestation, card, cbor, cert, enroll, message, proof, Attestation, AttestationRevocation,
+    Bundle, Card, DeviceCert, DeviceKey, DeviceProof, DeviceRevocation, EnrollRequest, Fingerprint,
+    Freeze, IdentityKey, IdentityRevocation, ListKind, LoginContext, LoginProof, Record,
+    RegisterRequest, RegistrarKeys, Rotation, ServerChallenge, ServerKey, SessionClaim, SignedList,
 };
 use hpke::aead::AesGcm256;
 use hpke::kdf::HkdfSha256;
@@ -242,6 +242,37 @@ fn card_successor_vector() {
     let back = Card::parse(&signed).unwrap();
     assert_eq!(back.successor, Some(unhex32(str_of(f, "successor"))));
     assert_eq!(back.identity, unhex32(str_of(f, "identity")));
+    check_signed(e, card::DOMAIN, &k.id.public(), &signed);
+}
+
+#[test]
+fn card_unknown_key_vector() {
+    let v = vectors();
+    let k = keys(&v);
+    let e = &v["card_unknown_key"];
+    let f = &e["fields"];
+    assert_eq!(str_of(e, "domain"), card::DOMAIN);
+
+    let future = cbor::map(vec![
+        ("n", Some(cbor::Value::Uint(u64_of(&f["future"], "n")))),
+        (
+            "t",
+            Some(cbor::Value::Text(str_of(&f["future"], "t").into())),
+        ),
+    ]);
+    let mut c = Card::new(&k.id, str_of(f, "name"), u64_of(f, "updated"));
+    c.extra.insert("future".into(), future);
+    let signed = unhex(str_of(e, "signed_hex"));
+    assert_eq!(c.sign(&k.id, vec![]).unwrap(), signed);
+
+    let back = Card::parse(&signed).unwrap();
+    assert_eq!(back, c);
+    assert_eq!(back.identity, unhex32(str_of(f, "identity")));
+    assert_eq!(
+        cbor::decode_canonical(&signed).unwrap().get("v"),
+        Some(&cbor::Value::Uint(u64_of(f, "v")))
+    );
+    assert_eq!(back.sign(&k.id, vec![]).unwrap(), signed);
     check_signed(e, card::DOMAIN, &k.id.public(), &signed);
 }
 
