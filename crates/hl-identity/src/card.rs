@@ -5,6 +5,8 @@
 //! re-serve them; the `updated` field is the only thing that lets a newer
 //! card replace an older one.
 
+use std::collections::BTreeMap;
+
 use crate::attestation::Attestation;
 use crate::cbor::{map, Value};
 use crate::error::Error;
@@ -23,6 +25,21 @@ pub const PROFILE_MAX_BYTES: usize = 2048;
 /// with several registrars, and a bound on what one card costs to
 /// verify — the size limit alone allowed dozens.
 pub const MAX_ATTESTATIONS: usize = 8;
+
+/// Every key this version reads. Any other text key is [`Card::extra`].
+const KNOWN: [&str; 11] = [
+    "v",
+    "identity",
+    "updated",
+    "name",
+    "icon",
+    "profile",
+    "attestations",
+    "vouches",
+    "links",
+    "successor",
+    "sig",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Card {
@@ -57,6 +74,13 @@ pub struct Card {
     /// with the identity key can sign a new commitment but cannot make
     /// caches forget the old one.
     pub successor: Option<[u8; 32]>,
+    /// Top-level text keys this version does not know, as signed
+    /// (§3.1), so a card parsed and signed again keeps what a newer
+    /// client added. A top-level key that is not text is not kept, so
+    /// signing again drops it. A key [`Card`] has a field for is never
+    /// written from here, and the card's size limit is the bound on what
+    /// this holds.
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl Card {
@@ -73,6 +97,7 @@ impl Card {
             vouches: Vec::new(),
             links: Vec::new(),
             successor: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -80,7 +105,7 @@ impl Card {
     /// values (see [`Attestation::signed_value`]) because the card's
     /// signer usually isn't the registrar.
     fn unsigned(&self, attestations: Vec<Value>) -> Value {
-        map(vec![
+        let fields = vec![
             ("v", Some(Value::Uint(VERSION))),
             ("identity", Some(Value::Bytes(self.identity.to_vec()))),
             ("updated", Some(Value::Uint(self.updated))),
@@ -117,7 +142,20 @@ impl Card {
                 "successor",
                 self.successor.map(|s| Value::Bytes(s.to_vec())),
             ),
-        ])
+        ];
+        // Every field's key, written or absent, so an empty field can't
+        // be filled from `extra` either.
+        let ours: Vec<&str> = fields.iter().map(|(k, _)| *k).chain(["sig"]).collect();
+        let Value::Map(mut entries) = map(fields) else {
+            unreachable!("map builds a map")
+        };
+        entries.extend(
+            self.extra
+                .iter()
+                .filter(|(k, _)| !ours.contains(&k.as_str()))
+                .map(|(k, v)| (Value::Text(k.clone()), v.clone())),
+        );
+        Value::Map(entries)
     }
 
     /// Sign with the identity key. `attestations` are the signed
@@ -144,6 +182,10 @@ impl Card {
         if bytes.len() > MAX_BYTES {
             return Err(Error::TooLarge);
         }
+        // `extra` and `vouches` are the caller's values, and one nested
+        // too deep or holding a duplicate key encodes to a card `parse`
+        // refuses.
+        crate::cbor::decode_canonical(&bytes)?;
         Ok(bytes)
     }
 
@@ -233,6 +275,7 @@ impl Card {
             vouches: signed::opt_array(v, "vouches")?,
             links,
             successor: signed::opt_bytes32(v, "successor")?,
+            extra: unknown(v),
         };
         card.check_fields()?;
         for value in embedded {
@@ -247,6 +290,21 @@ impl Card {
         }
         Ok(card)
     }
+}
+
+/// The text keys of `v` this version does not know. A key that is not
+/// text names nothing §3.4 could define, and is not kept.
+fn unknown(v: &Value) -> BTreeMap<String, Value> {
+    let Value::Map(entries) = v else {
+        return BTreeMap::new();
+    };
+    entries
+        .iter()
+        .filter_map(|(k, v)| match k {
+            Value::Text(k) if !KNOWN.contains(&k.as_str()) => Some((k.clone(), v.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -272,13 +330,12 @@ mod tests {
         card.icon = Some(128);
         card.profile = Some("hxd-ng".into());
         card.links = vec!["https://alice.example.com".into()];
+        card.vouches = vec![map(vec![("v", Some(Value::Uint(1)))])];
+        card.successor = Some([0x5a; 32]);
+        card.extra.insert("future".into(), Value::Uint(42));
         let bytes = card.sign(&id, vec![att.signed_value(&reg)]).unwrap();
-        let back = Card::parse(&bytes).unwrap();
-        assert_eq!(back.name, "Alice");
-        assert_eq!(back.icon, Some(128));
-        assert_eq!(back.links, card.links);
-        assert_eq!(back.attestations, vec![att]);
-        assert_eq!(back.successor, None);
+        card.attestations = vec![att];
+        assert_eq!(Card::parse(&bytes).unwrap(), card);
     }
 
     #[test]
@@ -480,6 +537,77 @@ mod tests {
             Err(Error::BadField("name")),
             "the free checks come before the paid ones"
         );
+    }
+
+    /// Alice's card as a newer client signed it, with a key this
+    /// version does not know.
+    fn with_future_key(id: &IdentityKey) -> Vec<u8> {
+        let Value::Map(mut entries) = Card::new(id, "Alice", 10).unsigned(vec![]) else {
+            unreachable!()
+        };
+        entries.push((
+            Value::Text("future".into()),
+            map(vec![("n", Some(Value::Uint(42)))]),
+        ));
+        signed::seal(Value::Map(entries), |b| id.sign(DOMAIN, b))
+    }
+
+    #[test]
+    fn an_unknown_key_survives_signing_again() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let bytes = with_future_key(&id);
+        let again = Card::parse(&bytes).unwrap().sign(&id, vec![]).unwrap();
+        assert_eq!(again, bytes);
+    }
+
+    #[test]
+    fn unknown_fields_are_kept_and_signed() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let mut bytes = with_future_key(&id);
+        let mut expect = Card::new(&id, "Alice", 10);
+        expect
+            .extra
+            .insert("future".into(), map(vec![("n", Some(Value::Uint(42)))]));
+        assert_eq!(Card::parse(&bytes).unwrap(), expect);
+        // The key, then `{"n": 42}`: a map head, "n", and 42's two bytes.
+        let at = bytes.windows(6).position(|w| w == b"future").unwrap() + 6 + 4;
+        assert_eq!(bytes[at], 42);
+        bytes[at] = 43;
+        assert_eq!(Card::parse(&bytes), Err(Error::BadSignature));
+    }
+
+    #[test]
+    fn a_known_key_cannot_ride_in_extra() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let mut card = Card::new(&id, "Alice", 10);
+        for (k, v) in [
+            ("name", Value::Text("Mallory".into())),
+            ("icon", Value::Uint(1)),
+            ("v", Value::Uint(2)),
+            ("sig", Value::Bytes(vec![0; 64])),
+        ] {
+            card.extra.insert(k.into(), v);
+        }
+        let back = Card::parse(&card.sign(&id, vec![]).unwrap()).unwrap();
+        assert_eq!(back, Card::new(&id, "Alice", 10));
+    }
+
+    #[test]
+    fn a_card_parse_would_refuse_is_not_signed() {
+        let id = IdentityKey::from_seed(&[1u8; 32]);
+        let twice = Value::Map(vec![
+            (Value::Text("a".into()), Value::Uint(1)),
+            (Value::Text("a".into()), Value::Uint(2)),
+        ]);
+        let deep = (0..9).fold(Value::Uint(0), |v, _| Value::Array(vec![v]));
+        for (value, error) in [
+            (twice, crate::cbor::CborError::NotCanonical),
+            (deep, crate::cbor::CborError::TooDeep),
+        ] {
+            let mut card = Card::new(&id, "Alice", 10);
+            card.extra.insert("future".into(), value);
+            assert_eq!(card.sign(&id, vec![]), Err(Error::Cbor(error)));
+        }
     }
 
     #[test]
