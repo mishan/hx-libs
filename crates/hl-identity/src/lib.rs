@@ -61,8 +61,8 @@ pub use keys::{DeviceKey, Fingerprint, IdentityKey, PublicKey, ServerKey};
 pub use message::{Article, ChatLine, PrivateMessage, Signed};
 pub use proof::{DeviceProof, LoginProof, ServerChallenge};
 pub use registrar::{
-    AttestationRevocation, DeviceRevocation, Freeze, IdentityRevocation, ListKind, Record,
-    RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
+    AttestationRevocation, DeviceEpoch, DeviceRevocation, Freeze, IdentityRevocation, ListKind,
+    Record, RegisterRequest, RegistrarKeys, Rotation, SignedList, Stats,
 };
 pub use signed::VERSION;
 pub use successor::SuccessorCode;
