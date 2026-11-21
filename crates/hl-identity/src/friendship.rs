@@ -510,7 +510,14 @@ impl Held {
 
     /// Whether its signer's certificate is still at or above the floor
     /// held for it: one held since before a reset ends nothing after it.
-    fn stands(&self, floor: impl Fn(&PublicKey) -> u64) -> bool {
+    /// [`Offer::check`] and [`Friendship::check`] test a half's floor
+    /// before the withdrawals. A checker that must find an object
+    /// withdrawn before it finds it below the floor, or that re-checks a
+    /// friendship it holds whose halves skip the floor, passes them a
+    /// floor of 0 (`|_| 0`) and only the withdrawals that stand at the
+    /// current floor, then tests the halves' certificates against that
+    /// floor itself, if it should ([`DeviceCert::check_floor`]).
+    pub fn stands(&self, floor: impl Fn(&PublicKey) -> u64) -> bool {
         let w = &self.0;
         DeviceCert::open(&w.cert).is_ok_and(|(c, _)| c.check_floor(floor(&w.from)).is_ok())
     }
