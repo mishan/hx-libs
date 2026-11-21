@@ -19,8 +19,8 @@ use hl_identity::cbor::{self, map, Value};
 use hl_identity::friendship::{self, Held, Refused};
 use hl_identity::registrar::ROTATE_DOMAIN;
 use hl_identity::{
-    cert, Acceptance, DeviceCert, DeviceKey, Fingerprint, Friendship, IdentityKey, Offer, Pair,
-    Rotation, Withdrawal,
+    cert, Acceptance, DeviceCert, DeviceKey, Error, Fingerprint, Friendship, IdentityKey, Offer,
+    Pair, PublicKey, Rotation, Withdrawal,
 };
 use serde_json::{json, Value as Json};
 use sha2::{Digest, Sha256};
@@ -1414,4 +1414,77 @@ fn friend_cert_window() {
         }
         assert_eq!(outcome(checked), expected(c), "{}", str_of(c, "name"));
     }
+}
+
+#[test]
+fn a_held_friendship_rechecked_after_a_reset_meets_only_standing_withdrawals() {
+    let t = ISSUED + 200;
+    let now = t + DAY;
+    let (a, a_dev) = (
+        IdentityKey::from_seed(&[1; 32]),
+        DeviceKey::from_seed(&[2; 32]),
+    );
+    let (b, b_dev) = (
+        IdentityKey::from_seed(&[3; 32]),
+        DeviceKey::from_seed(&[4; 32]),
+    );
+    let cert_in = |id: &IdentityKey, dev: &DeviceKey, epoch| {
+        let mut c = DeviceCert::for_device(id, dev, t - 200, 90 * DAY).unwrap();
+        c.epoch = epoch;
+        c.sign(id)
+    };
+    // The friendship was held from before `a`'s reset, under its epoch 0
+    // certificate; the floor for `a` is now 1.
+    let (old, new) = (cert_in(&a, &a_dev, 0), cert_in(&a, &a_dev, 1));
+    let offer = Offer {
+        from: a.public(),
+        to: b.fingerprint(),
+        time: t,
+        expires: t + DAY,
+        id: [0x11; 16],
+        cert: old.clone(),
+    };
+    let ob = offer.sign(&a_dev).unwrap();
+    let acceptance = Acceptance {
+        offer: Sha256::digest(&ob).into(),
+        from: b.public(),
+        time: t + 60,
+        cert: cert_in(&b, &b_dev, 0),
+    };
+    let fs = Friendship::encode(&ob, &acceptance.sign(&b_dev).unwrap());
+    let pair = offer.pair();
+    let withdrawal = |cert: &[u8]| {
+        let w = Withdrawal {
+            from: a.public(),
+            pair: pair.hash(),
+            party: None,
+            before: t + 3600,
+            time: t + 3600,
+            cert: cert.to_vec(),
+        };
+        Withdrawal::check(&w.sign(&a_dev).unwrap(), now, &pair, &[], |_| 0).unwrap()
+    };
+    let floor = |k: &PublicKey| u64::from(*k == a.public());
+    // The halves are held already and skip the floor; the withdrawals
+    // they meet are judged against it.
+    let recheck = |held: &[Held]| {
+        let standing: Vec<Held> = held.iter().filter(|w| w.stands(floor)).cloned().collect();
+        Friendship::check(&fs, now, &standing, |_| 0).map(drop)
+    };
+
+    assert_eq!(
+        Friendship::check(&fs, now, &[], floor).map(drop),
+        Err(Refused {
+            step: 5,
+            error: Error::BelowFloor
+        })
+    );
+    assert_eq!(recheck(&[withdrawal(&old)]), Ok(()));
+    assert_eq!(
+        recheck(&[withdrawal(&old), withdrawal(&new)]),
+        Err(Refused {
+            step: 6,
+            error: Error::Withdrawn
+        })
+    );
 }
