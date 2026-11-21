@@ -155,8 +155,9 @@ impl Offer {
     /// A lone offer, as a server takes it: §3's step 1 without the
     /// array, then steps 3 to 6, against `held`, the withdrawals the
     /// checker holds, and `floor`, the device epoch it holds for an
-    /// identity key (0 for none), which applies to the withdrawals too. None of them compares `expires` with
-    /// `now`: a lone offer's expiry is the caller's to enforce.
+    /// identity key (0 for none), which applies to the withdrawals too.
+    /// None of them compares `expires` with `now`: a lone offer's expiry
+    /// is the caller's to enforce.
     pub fn check(
         bytes: &[u8],
         now: u64,
@@ -165,9 +166,11 @@ impl Offer {
     ) -> Result<Offer, Refused> {
         let (offer, env) = open(bytes, Offer::from_value).at(1)?;
         not_ahead(offer.time, now).at(3)?;
-        let cert = cert_at(&offer.cert, &offer.from, offer.time, floor(&offer.from)).at(4)?;
-        verify(&cert, &env, OFFER_DOMAIN).at(5)?;
-        if held.iter().any(|w| w.stands(&floor) && offer.ended_by(w)) {
+        let cert = cert_at(&offer.cert, &offer.from, offer.time).at(4)?;
+        verify(&cert, &env, OFFER_DOMAIN)
+            .and_then(|()| above_floor(&cert, floor(&offer.from)))
+            .at(5)?;
+        if held.iter().any(|w| offer.ended_by(w) && w.stands(&floor)) {
             return Err(Error::Withdrawn).at(6);
         }
         Ok(offer)
@@ -286,17 +289,13 @@ impl Friendship {
             return Err(Error::BadField("time")).at(3);
         }
 
-        let offer_cert = cert_at(&offer.cert, &offer.from, offer.time, floor(&offer.from)).at(4)?;
-        let accept_cert = cert_at(
-            &acceptance.cert,
-            &acceptance.from,
-            acceptance.time,
-            floor(&acceptance.from),
-        )
-        .at(4)?;
+        let offer_cert = cert_at(&offer.cert, &offer.from, offer.time).at(4)?;
+        let accept_cert = cert_at(&acceptance.cert, &acceptance.from, acceptance.time).at(4)?;
 
         verify(&offer_cert, &offer_env, OFFER_DOMAIN)
             .and_then(|()| verify(&accept_cert, &accept_env, ACCEPT_DOMAIN))
+            .and_then(|()| above_floor(&offer_cert, floor(&offer.from)))
+            .and_then(|()| above_floor(&accept_cert, floor(&acceptance.from)))
             .at(5)?;
 
         let friendship = Friendship {
@@ -306,7 +305,7 @@ impl Friendship {
         };
         if held
             .iter()
-            .any(|w| w.stands(&floor) && friendship.ended_by(w))
+            .any(|w| friendship.ended_by(w) && w.stands(&floor))
         {
             return Err(Error::Withdrawn).at(6);
         }
@@ -416,7 +415,7 @@ impl Withdrawal {
         floor: impl Fn(&PublicKey) -> u64,
     ) -> Result<Kept, Refused> {
         let (w, env) = Self::open_timed(bytes, now)?;
-        w.verify(&env, floor(&w.from))?;
+        w.verify(&env, floor)?;
         Ok(Kept(w))
     }
 
@@ -430,7 +429,7 @@ impl Withdrawal {
     ) -> Result<Held, Refused> {
         let (w, env) = Self::open_timed(bytes, now)?;
         w.pair_rules(pair, rotations)?;
-        w.verify(&env, floor(&w.from))?;
+        w.verify(&env, floor)?;
         Ok(Held(w))
     }
 
@@ -470,9 +469,11 @@ impl Withdrawal {
         Ok((w, env))
     }
 
-    fn verify(&self, env: &Envelope, floor: u64) -> Result<(), Refused> {
-        let cert = cert_at(&self.cert, &self.from, self.time, floor).at(5)?;
-        verify(&cert, env, WITHDRAW_DOMAIN).at(6)
+    fn verify(&self, env: &Envelope, floor: impl Fn(&PublicKey) -> u64) -> Result<(), Refused> {
+        let cert = cert_at(&self.cert, &self.from, self.time).at(5)?;
+        verify(&cert, env, WITHDRAW_DOMAIN)
+            .and_then(|()| above_floor(&cert, floor(&self.from)))
+            .at(6)
     }
 
     /// `party`, or with it absent the SHA-256 of `from`.
@@ -587,16 +588,9 @@ fn not_ahead(time: u64, now: u64) -> Result<(), Error> {
 }
 
 /// §1's certificate: for `from`, allowing messages, at most
-/// [`CERT_MAX_BYTES`], valid at `time` and not below `floor`, which is
-/// checked now rather than as of `time`: the epoch has no time in it,
-/// and a `time` its signer chose proves nothing. Its signature is the
-/// next step's.
-fn cert_at(
-    bytes: &[u8],
-    from: &PublicKey,
-    time: u64,
-    floor: u64,
-) -> Result<(DeviceCert, Envelope), Error> {
+/// [`CERT_MAX_BYTES`] and valid at `time`. Its signature is the next
+/// step's, and its floor [`above_floor`]'s.
+fn cert_at(bytes: &[u8], from: &PublicKey, time: u64) -> Result<(DeviceCert, Envelope), Error> {
     if bytes.len() > CERT_MAX_BYTES {
         return Err(Error::BadField("cert"));
     }
@@ -606,8 +600,17 @@ fn cert_at(
     }
     cert.require(caps::MESSAGE)?;
     signed::check_window(cert.issued, cert.expires, time, SKEW)?;
-    cert.check_floor(floor)?;
     Ok((cert, env))
+}
+
+/// The certificate not below `floor`, checked now rather than as of the
+/// object's `time`: the epoch has no time in it, and a `time` its signer
+/// chose proves nothing. Each check asks for the floor and tests it only
+/// once every signature it verifies has verified, so that a forgery
+/// under an old certificate is refused for its signature and learns
+/// nothing of the floors a checker holds.
+fn above_floor((cert, _): &(DeviceCert, Envelope), floor: u64) -> Result<(), Error> {
+    cert.check_floor(floor)
 }
 
 /// The identity key's signature on the certificate, then its device
@@ -630,7 +633,7 @@ fn seal(
     domain: &str,
 ) -> Result<Vec<u8>, Error> {
     // A signer holds no floor; a checker applies its own.
-    let (cert, cert_env) = cert_at(cert, from, time, 0)?;
+    let (cert, cert_env) = cert_at(cert, from, time)?;
     cert_env.verify(&cert.identity, cert::DOMAIN)?;
     if cert.device != device.public() {
         return Err(Error::KeyMismatch);
@@ -765,20 +768,128 @@ mod tests {
         };
 
         assert!(Offer::check(&ob, NOW, &[], a_at(1)).is_ok());
-        assert_eq!(Offer::check(&ob, NOW, &[], a_at(2)), Err(below(4)));
+        assert_eq!(Offer::check(&ob, NOW, &[], a_at(2)), Err(below(5)));
         assert!(Friendship::check(&fs, NOW, &[], a_at(1)).is_ok());
-        assert_eq!(Friendship::check(&fs, NOW, &[], a_at(2)), Err(below(4)));
+        assert_eq!(Friendship::check(&fs, NOW, &[], a_at(2)), Err(below(5)));
         // `b`'s certificate is epoch 0: a floor for `b` refuses the
         // friendship by its acceptance alone.
         let b_at_1 = |k: &PublicKey| u64::from(*k == b.id.public());
-        assert_eq!(Friendship::check(&fs, NOW, &[], b_at_1), Err(below(4)));
+        assert_eq!(Friendship::check(&fs, NOW, &[], b_at_1), Err(below(5)));
         assert!(Withdrawal::parse(&wb, NOW, a_at(1)).is_ok());
-        assert_eq!(Withdrawal::parse(&wb, NOW, a_at(2)), Err(below(5)));
+        assert_eq!(Withdrawal::parse(&wb, NOW, a_at(2)), Err(below(6)));
         let pair = offer(&a, &b).pair();
         assert_eq!(
             Withdrawal::check(&wb, NOW, &pair, &[], a_at(2)),
-            Err(below(5))
+            Err(below(6))
         );
+    }
+
+    #[test]
+    fn a_forgery_is_refused_for_its_signature_and_asks_no_floor() {
+        enum Check {
+            Offer,
+            Friendship,
+            Withdrawal,
+        }
+        let (a, b, x) = (Who::new(1), Who::new(2), Who::new(5));
+        // `a`'s real certificate is epoch 0, below a floor of 1. A junk
+        // one is the same with its identity signature broken.
+        let mut junk = Who::new(1);
+        let sig = Envelope::open(&junk.cert).unwrap().sig;
+        let at = junk.cert.windows(64).position(|w| w == sig).unwrap();
+        junk.cert[at] ^= 1;
+        let forge = |unsigned, dev: &DeviceKey, domain| {
+            signed::seal(unsigned, |body| dev.sign(domain, body))
+        };
+        let accepted_by = |ob: &[u8], dev: &DeviceKey| {
+            let acceptance = Acceptance {
+                offer: Sha256::digest(ob).into(),
+                from: b.id.public(),
+                time: T + 60,
+                cert: b.cert.clone(),
+            };
+            Friendship::encode(ob, &forge(acceptance.unsigned(), dev, ACCEPT_DOMAIN))
+        };
+        let pair = offer(&a, &b).pair();
+        let under_junk = forge(offer(&junk, &b).unsigned(), &junk.dev, OFFER_DOMAIN);
+        let replayed = forge(offer(&a, &b).unsigned(), &x.dev, OFFER_DOMAIN);
+        let genuine = offer(&a, &b).sign(&a.dev).unwrap();
+        let cases = [
+            (
+                "an offer under a junk cert",
+                Check::Offer,
+                under_junk.clone(),
+            ),
+            (
+                "an offer under a replayed cert",
+                Check::Offer,
+                replayed.clone(),
+            ),
+            (
+                "a friendship whose offer is under a junk cert",
+                Check::Friendship,
+                accepted_by(&under_junk, &b.dev),
+            ),
+            (
+                "a friendship whose offer is under a replayed cert",
+                Check::Friendship,
+                accepted_by(&replayed, &b.dev),
+            ),
+            (
+                "a genuine offer below its floor with a forged acceptance",
+                Check::Friendship,
+                accepted_by(&genuine, &x.dev),
+            ),
+            (
+                "a withdrawal under a junk cert",
+                Check::Withdrawal,
+                forge(
+                    withdrawal(&junk, pair).unsigned(),
+                    &junk.dev,
+                    WITHDRAW_DOMAIN,
+                ),
+            ),
+            (
+                "a withdrawal under a replayed cert",
+                Check::Withdrawal,
+                forge(withdrawal(&a, pair).unsigned(), &x.dev, WITHDRAW_DOMAIN),
+            ),
+        ];
+        let asked = std::cell::Cell::new(0);
+        let a_at_1 = |k: &PublicKey| {
+            asked.set(asked.get() + 1);
+            u64::from(*k == a.id.public())
+        };
+        let mut failures = vec![];
+        for (name, check, bytes) in &cases {
+            let (step, results) = match check {
+                Check::Offer => (5, vec![Offer::check(bytes, NOW, &[], a_at_1).map(drop)]),
+                Check::Friendship => (
+                    5,
+                    vec![Friendship::check(bytes, NOW, &[], a_at_1).map(drop)],
+                ),
+                Check::Withdrawal => (
+                    6,
+                    vec![
+                        Withdrawal::parse(bytes, NOW, a_at_1).map(drop),
+                        Withdrawal::check(bytes, NOW, &pair, &[], a_at_1).map(drop),
+                    ],
+                ),
+            };
+            let forged = Err(Refused {
+                step,
+                error: Error::BadSignature,
+            });
+            for got in results {
+                if got != forged {
+                    failures.push(format!("{name}: {got:?}"));
+                }
+            }
+            if asked.replace(0) != 0 {
+                failures.push(format!("{name}: asked a floor"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]

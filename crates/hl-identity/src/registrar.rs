@@ -300,7 +300,8 @@ impl DeviceRevocation {
     /// `time` says: the epoch has no time in it, and a device that was
     /// reset could otherwise sign one dated inside its old certificate's
     /// window and revoke the devices enrolled after the reset. One the
-    /// identity signed always passes.
+    /// identity signed always passes. Call it on a revocation
+    /// [`DeviceRevocation::parse`] returned, whose signatures it trusts.
     pub fn check_signer_floor(&self, floor: u64) -> Result<(), Error> {
         match &self.signer_cert {
             None => Ok(()),
