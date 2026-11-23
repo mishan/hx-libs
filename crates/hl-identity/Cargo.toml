@@ -3,7 +3,7 @@ rust-version.workspace = true
 name = "hl-identity"
 version = "0.1.0"
 edition = "2021"
-license = "GPL-2.0-or-later"
+license = "MIT OR Apache-2.0"
 description = "Hotline identity objects: keys, device certificates, user cards, attestations, login proofs, signed and sealed messages"
 publish = false
 
