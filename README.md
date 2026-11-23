@@ -42,8 +42,10 @@ cargo test -p hxsession --features hxsession/hope
 cargo test -p hxhope -p hxsession --features hxsession/zstd
 ```
 
-CI also runs clippy with each feature and builds the wasm32 crates
-(`.github/workflows/ci.yml`).
+CI also runs clippy with `hxsession/hope` and with `hxsession/zstd`, and
+builds the wasm32 crates (`.github/workflows/ci.yml`). `hxsession`'s
+`rig` feature runs `tests/rig.rs` against GtkHx's Docker rig of real
+servers, which CI does not have.
 
 ## License
 
