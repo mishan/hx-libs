@@ -4329,6 +4329,8 @@ mod hope {
             .unwrap();
         record[10] ^= 1;
         s.feed(&record, T0);
+        // What still arrives after says nothing more.
+        s.feed(&record, T0);
         assert!(matches!(
             &events(&mut s)[..],
             [Event::Closed(Closed::Protocol(_))]
