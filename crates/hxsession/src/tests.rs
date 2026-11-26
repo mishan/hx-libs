@@ -4214,6 +4214,102 @@ mod hope {
         ));
     }
 
+    /// Through step 2 with the guest's login, under `cipher`: the server's
+    /// handshake and step 2's fields, and the session waiting on its reply.
+    fn to_step2(
+        cipher: Option<Cipher>,
+    ) -> (
+        Session,
+        HopeServer,
+        hxhope::server::Server,
+        hxhope::server::Step2,
+        u32,
+    ) {
+        let mut s = Session::with_hope(Config::guest("me"), offer(cipher, None), random(), T0);
+        let mut srv = HopeServer::new();
+        s.feed(SERVER_MAGIC, T0);
+        let step1 = srv.hear(&mut s).remove(0);
+        let (hs, reply) =
+            hxhope::server::answer(&policy(), &step1.buf, [7; 64], step1.trans).unwrap();
+        srv.say(&mut s, &reply);
+        let step2 = srv.hear(&mut s).remove(0);
+        let fields = hs.step2(&step2.buf).unwrap();
+        (s, srv, hs, fields, step2.trans)
+    }
+
+    /// A wrong password agrees no keys, so the server refuses it in the
+    /// clear: the session reads the refusal, however its bytes arrive,
+    /// rather than garbage through a transport that never began.
+    #[test]
+    fn a_wrong_hope_password_is_refused_in_the_clear() {
+        for cipher in [None, Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+            let (mut s, _, hs, fields, trans) = to_step2(cipher);
+            assert!(hs.accept(&fields, b"not the password", random()).is_err());
+            for b in server(TASK, trans, 1, &[(tag::TASK_ERROR, b"Login failed.")]) {
+                s.feed(&[b], T0);
+            }
+            assert_eq!(
+                events(&mut s),
+                [Event::Closed(Closed::LoginRefused(Some(
+                    "Login failed.".into()
+                )))],
+                "{cipher:?}"
+            );
+        }
+    }
+
+    /// A reply in the clear that is not a refusal, whatever else its flag
+    /// says, leaves the transport where it is: read through it, it is
+    /// nonsense, and never a login in the clear.
+    #[test]
+    fn only_a_refusal_in_the_clear_takes_the_transport() {
+        for cipher in [Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+            let (mut s, _, _, _, trans) = to_step2(cipher);
+            let mut reply = login_reply(Some(190), None);
+            reply[4..8].copy_from_slice(&trans.to_be_bytes());
+            reply[8..12].copy_from_slice(&2u32.to_be_bytes());
+            s.feed(&reply, T0);
+            assert!(s.server().is_none(), "{cipher:?}: logged in in the clear");
+        }
+    }
+
+    /// Part of the reply to step 2, short of its header, is a transaction
+    /// begun: a connection that ends there was cut off.
+    #[test]
+    fn a_step2_reply_cut_short_is_mid_transaction() {
+        let (mut s, ..) = to_step2(Some(Cipher::Blowfish));
+        assert!(!s.mid_transaction());
+        s.feed(&[0], T0);
+        assert!(s.mid_transaction());
+    }
+
+    /// A reply that agrees runs through the transport from its first byte,
+    /// however few of them arrive at a time.
+    #[test]
+    fn a_hope_login_reply_in_pieces_runs_through_the_transport() {
+        for cipher in [None, Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+            let (mut s, mut srv, hs, fields, _) = to_step2(cipher);
+            let (t, _) = hs.accept(&fields, b"", random()).unwrap();
+            srv.transport = Some(t);
+            let wire = srv
+                .transport
+                .as_mut()
+                .unwrap()
+                .encode(&login_reply(Some(190), None))
+                .unwrap();
+            for piece in wire.chunks(3) {
+                s.feed(piece, T0);
+            }
+            srv.say(&mut s, &server(0x6a, 0, 0, &[(tag::BODY, b"hello")]));
+            let heard = events(&mut s);
+            assert!(
+                heard.iter().any(|e| matches!(e, Event::Chat { .. })),
+                "{cipher:?}: {heard:?}"
+            );
+            assert!(!s.is_closed(), "{cipher:?}");
+        }
+    }
+
     #[test]
     fn a_hope_transport_that_stops_making_sense_closes() {
         let mut s = Session::with_hope(
