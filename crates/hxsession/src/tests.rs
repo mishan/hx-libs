@@ -4214,6 +4214,77 @@ mod hope {
         ));
     }
 
+    /// Through step 2 with the guest's login, under `cipher`: the server's
+    /// handshake and step 2's fields, and the session waiting on its reply.
+    fn to_step2(
+        cipher: Option<Cipher>,
+    ) -> (
+        Session,
+        HopeServer,
+        hxhope::server::Server,
+        hxhope::server::Step2,
+        u32,
+    ) {
+        let mut s = Session::with_hope(Config::guest("me"), offer(cipher, None), random(), T0);
+        let mut srv = HopeServer::new();
+        s.feed(SERVER_MAGIC, T0);
+        let step1 = srv.hear(&mut s).remove(0);
+        let (hs, reply) =
+            hxhope::server::answer(&policy(), &step1.buf, [7; 64], step1.trans).unwrap();
+        srv.say(&mut s, &reply);
+        let step2 = srv.hear(&mut s).remove(0);
+        let fields = hs.step2(&step2.buf).unwrap();
+        (s, srv, hs, fields, step2.trans)
+    }
+
+    /// A wrong password agrees no keys, so the server refuses it in the
+    /// clear: the session reads the refusal, however its bytes arrive,
+    /// rather than garbage through a transport that never began.
+    #[test]
+    fn a_wrong_hope_password_is_refused_in_the_clear() {
+        for cipher in [None, Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+            let (mut s, _, hs, fields, trans) = to_step2(cipher);
+            assert!(hs.accept(&fields, b"not the password", random()).is_err());
+            for b in server(TASK, trans, 1, &[(tag::TASK_ERROR, b"Login failed.")]) {
+                s.feed(&[b], T0);
+            }
+            assert_eq!(
+                events(&mut s),
+                [Event::Closed(Closed::LoginRefused(Some(
+                    "Login failed.".into()
+                )))],
+                "{cipher:?}"
+            );
+        }
+    }
+
+    /// A reply that agrees runs through the transport from its first byte,
+    /// however few of them arrive at a time.
+    #[test]
+    fn a_hope_login_reply_in_pieces_runs_through_the_transport() {
+        for cipher in [None, Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+            let (mut s, mut srv, hs, fields, _) = to_step2(cipher);
+            let (t, _) = hs.accept(&fields, b"", random()).unwrap();
+            srv.transport = Some(t);
+            let wire = srv
+                .transport
+                .as_mut()
+                .unwrap()
+                .encode(&login_reply(Some(190), None))
+                .unwrap();
+            for piece in wire.chunks(3) {
+                s.feed(piece, T0);
+            }
+            srv.say(&mut s, &server(0x6a, 0, 0, &[(tag::BODY, b"hello")]));
+            let heard = events(&mut s);
+            assert!(
+                heard.iter().any(|e| matches!(e, Event::Chat { .. })),
+                "{cipher:?}: {heard:?}"
+            );
+            assert!(!s.is_closed(), "{cipher:?}");
+        }
+    }
+
     #[test]
     fn a_hope_transport_that_stops_making_sense_closes() {
         let mut s = Session::with_hope(

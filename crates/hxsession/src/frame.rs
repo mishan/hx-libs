@@ -18,7 +18,7 @@
 use hxproto::HL_HDR_LEN;
 
 /// The fixed part of a frame before its data: type, trans, flag, len, len2.
-const HEAD_LEN: usize = 20;
+pub(crate) const HEAD_LEN: usize = 20;
 
 /// The largest transaction accepted, data included. A frame that claims
 /// more is a desync or a hostile server, not a message.

@@ -979,7 +979,16 @@ pub struct Session {
     negotiated: Option<hope::Negotiated>,
     transport: Option<hope::Transport>,
     before_transport: Vec<u8>,
+    /// The reply to step 2 as it arrives, until its header says whether
+    /// it came through the transport or, refusing, in the clear.
+    step2_reply: Option<Vec<u8>>,
     tap: bool,
+}
+
+/// Whether `head`, a frame's header, is an error reply to `trans`.
+fn refused_in_clear(head: &[u8], trans: u32) -> bool {
+    let word = |at: usize| u32::from_be_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
+    head[1] == 1 && word(4) == trans && word(8) != 0
 }
 
 impl Session {
@@ -1020,6 +1029,7 @@ impl Session {
             negotiated: None,
             transport: None,
             before_transport: Vec::new(),
+            step2_reply: None,
             tap: false,
         }
     }
@@ -1126,6 +1136,22 @@ impl Session {
     pub fn feed(&mut self, bytes: &[u8], now_ms: u64) {
         self.clock(now_ms);
         self.clocked = true;
+        let held;
+        let mut bytes = bytes;
+        if let Some(reply) = self.step2_reply.as_mut() {
+            reply.extend_from_slice(bytes);
+            if reply.len() < frame::HEAD_LEN {
+                self.clocked = false;
+                return;
+            }
+            held = self.step2_reply.take().unwrap_or_default();
+            // A wrong password agrees no keys, so a server refuses it in
+            // the clear.
+            if refused_in_clear(&held, self.login_trans) {
+                self.transport = None;
+            }
+            bytes = &held;
+        }
         match self.transport.as_mut() {
             None => self.feed_clocked(bytes),
             Some(t) => {
@@ -2826,6 +2852,7 @@ impl Session {
                 self.before_transport.extend_from_slice(&step2);
                 self.stamp_sent();
                 self.transport = Some(transport);
+                self.step2_reply = Some(Vec::new());
                 self.negotiated = Some(negotiated);
                 self.state = State::Login;
             }
