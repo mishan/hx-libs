@@ -877,6 +877,7 @@ pub enum Event {
     /// the session acts on it, in plaintext whatever the transport: for a
     /// protocol trace.
     Received(Vec<u8>),
+    /// The session is over, and why: the last event, and only once.
     Closed(Closed),
 }
 
@@ -3059,6 +3060,11 @@ impl Session {
     }
 
     fn close(&mut self, why: Closed) {
+        // Bytes a closed session is still fed are past the reason it
+        // already gave.
+        if self.state == State::Closed {
+            return;
+        }
         self.state = State::Closed;
         self.pending.clear();
         self.proving = false;
