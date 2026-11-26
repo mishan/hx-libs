@@ -988,7 +988,9 @@ pub struct Session {
 /// Whether `head`, a frame's header, is an error reply to `trans`.
 fn refused_in_clear(head: &[u8], trans: u32) -> bool {
     let word = |at: usize| u32::from_be_bytes([head[at], head[at + 1], head[at + 2], head[at + 3]]);
-    head[1] == 1 && word(4) == trans && word(8) != 0
+    // The error bit alone, as `Transaction::is_error` reads it: a reply
+    // in the clear that is not a refusal must never take the transport.
+    head[1] == 1 && word(4) == trans && word(8) & 1 != 0
 }
 
 impl Session {
@@ -1115,6 +1117,7 @@ impl Session {
         !self.reader.is_idle()
             || (self.state == State::Magic && !self.magic.is_empty())
             || self.transport.as_ref().is_some_and(|t| !t.idle())
+            || self.step2_reply.as_ref().is_some_and(|r| !r.is_empty())
     }
 
     /// When [`Session::tick`] next has something to do.

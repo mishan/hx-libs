@@ -4258,6 +4258,31 @@ mod hope {
         }
     }
 
+    /// A reply in the clear that is not a refusal, whatever else its flag
+    /// says, leaves the transport where it is: read through it, it is
+    /// nonsense, and never a login in the clear.
+    #[test]
+    fn only_a_refusal_in_the_clear_takes_the_transport() {
+        for cipher in [Some(Cipher::Blowfish), Some(Cipher::ChaCha20Poly1305)] {
+            let (mut s, _, _, _, trans) = to_step2(cipher);
+            let mut reply = login_reply(Some(190), None);
+            reply[4..8].copy_from_slice(&trans.to_be_bytes());
+            reply[8..12].copy_from_slice(&2u32.to_be_bytes());
+            s.feed(&reply, T0);
+            assert!(s.server().is_none(), "{cipher:?}: logged in in the clear");
+        }
+    }
+
+    /// Part of the reply to step 2, short of its header, is a transaction
+    /// begun: a connection that ends there was cut off.
+    #[test]
+    fn a_step2_reply_cut_short_is_mid_transaction() {
+        let (mut s, ..) = to_step2(Some(Cipher::Blowfish));
+        assert!(!s.mid_transaction());
+        s.feed(&[0], T0);
+        assert!(s.mid_transaction());
+    }
+
     /// A reply that agrees runs through the transport from its first byte,
     /// however few of them arrive at a time.
     #[test]
