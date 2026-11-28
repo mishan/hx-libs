@@ -49,7 +49,7 @@ servers, which CI does not have.
 
 ## License
 
-GPL-2.0-or-later (`LICENSE`), except `hl-identity`, which is licensed
-under either of MIT or Apache-2.0 at your option
-(`crates/hl-identity/LICENSE-MIT`, `crates/hl-identity/LICENSE-APACHE`),
-so any implementation can use it.
+GPL-2.0-or-later (`LICENSE`), except `hl-identity` and `hl-delegation`,
+which are licensed under either of MIT or Apache-2.0 at your option (each
+crate's `LICENSE-MIT` and `LICENSE-APACHE`), so any implementation can use
+them.
