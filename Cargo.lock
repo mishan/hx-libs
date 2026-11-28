@@ -527,6 +527,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hl-delegation"
+version = "0.1.0"
+
+[[package]]
 name = "hl-identity"
 version = "0.1.0"
 dependencies = [

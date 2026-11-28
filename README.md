@@ -15,7 +15,7 @@ dependencies.
 | `hxcrypto` | The crypto behind HOPE, the secure login: HMAC and the legacy hashes, Blowfish OFB-64, ChaCha20-Poly1305 and its keys. |
 | `hxhope` | HOPE itself, with no I/O of its own: the handshake as a client or a server plays it, and the cipher and compression it agrees, as a codec between a connection and its socket. |
 | `hxsession` | A client session over the classic control connection: handshake, login, agreement, replies matched to requests, the keep-alive, and the server's pushes as events. It does no I/O of its own, so the same session runs over a TCP socket, a WebSocket to a relay, or a test's script. |
-| `hl-identity` | Hotline-ng's identity objects: keys, device certificates, user cards, attestations, login proofs, registrar records, signed and sealed messages, server key handovers and friendship objects, in deterministic CBOR with domain-separated Ed25519, and no transport. Its specifications are hxd-ng's, and its test vectors, in `crates/hl-identity/vectors/`, are what other implementations check against. |
+| `hl-identity` | Hotline-ng's identity objects: keys, device certificates, user cards, attestations, login proofs, registrar records, signed and sealed messages, server key handovers and friendship objects, in deterministic CBOR with domain-separated Ed25519, and no transport. Its specifications are hxd-ng's, and its test vectors, in `crates/hl-identity/vectors/`, are what other implementations check against. hl-delegation builds on it to give agents narrow, revocable authority (its specification is in `crates/hl-delegation/docs/`). |
 
 ## Features and targets
 
@@ -49,7 +49,7 @@ servers, which CI does not have.
 
 ## License
 
-GPL-2.0-or-later (`LICENSE`), except `hl-identity`, which is licensed
-under either of MIT or Apache-2.0 at your option
-(`crates/hl-identity/LICENSE-MIT`, `crates/hl-identity/LICENSE-APACHE`),
-so any implementation can use it.
+GPL-2.0-or-later (`LICENSE`), except `hl-identity` and `hl-delegation`,
+which are licensed under either of MIT or Apache-2.0 at your option (each
+crate's `LICENSE-MIT` and `LICENSE-APACHE`), so any implementation can use
+them.

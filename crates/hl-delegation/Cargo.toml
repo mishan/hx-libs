@@ -1,0 +1,8 @@
+[package]
+rust-version.workspace = true
+name = "hl-delegation"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Delegating narrow, revocable authority to agents over hl-identity: scopes, grants and their verification"
+publish = false
